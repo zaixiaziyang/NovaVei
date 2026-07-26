@@ -44,20 +44,20 @@ regex = "1"
 walkdir = "2"
 axum = "0.8.4"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream", "system-proxy", "json"] }
-sha2 = "0.10"
-aes-gcm = "0.10.3"
+sha2 = "0.11"
+aes-gcm = "0.11.0"
 argon2 = "0.6.0-rc.8"
-getrandom = "0.2"
+getrandom = "0.4"
 tokio = { version = "1.52", features = ["macros", "net", "rt", "sync", "time", "io-util"] }
 tower = { version = "0.5", features = ["util"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["json"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging"] }
-rfd = { version = "0.16", default-features = false }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging"] }
+rfd = { version = "0.17", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
