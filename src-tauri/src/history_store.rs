@@ -15,6 +15,7 @@ const SCHEMA_VERSION: i64 = 6;
 const SECURE_SETTINGS_MIGRATION_KEY: &str = "settings_dpapi_v1_compacted";
 const MESSAGES_DPAPI_MIGRATION_KEY: &str = "messages_dpapi_v1_compacted";
 const SEGMENT_SUMMARIES_DPAPI_MIGRATION_KEY: &str = "segment_summaries_dpapi_v1_compacted";
+const PRIVATE_EVENT_FIELDS_DPAPI_MIGRATION_KEY: &str = "private_event_fields_dpapi_v1_compacted";
 pub const MAX_SESSION_GOAL_TEXT_CHARS: usize = 600;
 /// Default number of newest messages returned for first UI paint.
 pub const DEFAULT_UI_MESSAGE_PAGE_SIZE: usize = 80;
@@ -763,6 +764,27 @@ impl HistoryStore {
             .map_err(|error| format!("count history messages: {error}"))
     }
 
+    /// Count messages for every session in one database round trip.
+    ///
+    /// Startup needs only the counts to decide whether an in-memory session
+    /// projection is complete. Opening a separate SQLite connection for every
+    /// saved session turns that metadata-only path into an N+1 query pattern.
+    /// Sessions without messages are intentionally absent from the map and
+    /// callers should treat them as zero.
+    pub fn load_message_counts(&self) -> Result<HashMap<String, i64>, String> {
+        let connection = self.open()?;
+        let mut statement = connection
+            .prepare("SELECT session_id, COUNT(*) FROM messages GROUP BY session_id")
+            .map_err(|error| format!("prepare history message counts: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| format!("query history message counts: {error}"))?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|error| format!("read history message counts: {error}"))
+    }
+
     /// True when the session has at least one user-authored message.
     pub fn has_user_message(&self, session_id: &str) -> Result<bool, String> {
         let connection = self.open()?;
@@ -1004,7 +1026,16 @@ impl HistoryStore {
             .optional()
             .map_err(|error| format!("read segment summary encryption migration marker: {error}"))?
             .is_some_and(|value| value == "1");
-        if messages_completed && summaries_completed {
+        let private_fields_completed = connection
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = ?1",
+                params![PRIVATE_EVENT_FIELDS_DPAPI_MIGRATION_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("read private event encryption migration marker: {error}"))?
+            .is_some_and(|value| value == "1");
+        if messages_completed && summaries_completed && private_fields_completed {
             return Ok(false);
         }
 
@@ -1122,6 +1153,10 @@ impl HistoryStore {
             }
         }
 
+        if !private_fields_completed {
+            migrate_private_event_fields(&transaction)?;
+        }
+
         if !messages_completed {
             transaction
                 .execute(
@@ -1142,6 +1177,17 @@ impl HistoryStore {
                 )
                 .map_err(|error| {
                     format!("write segment summary encryption migration marker: {error}")
+                })?;
+        }
+        if !private_fields_completed {
+            transaction
+                .execute(
+                    "INSERT INTO schema_meta(key, value) VALUES(?1, '1')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![PRIVATE_EVENT_FIELDS_DPAPI_MIGRATION_KEY],
+                )
+                .map_err(|error| {
+                    format!("write private event encryption migration marker: {error}")
                 })?;
         }
         transaction
@@ -1950,6 +1996,7 @@ impl HistoryStore {
             .map_err(|error| format!("load history terminal event: {error}"))?;
         payload
             .map(|payload| {
+                let payload = unprotect_stored_transcript_text(&payload)?;
                 serde_json::from_str(&payload)
                     .map_err(|error| format!("parse history terminal event: {error}"))
             })
@@ -1990,8 +2037,10 @@ impl HistoryStore {
         // metadata is always renderer-originated and therefore must never
         // bypass its strict shape/relationship validation.
         let stored_payload = sanitize_run_started_context_trim(stored_payload);
-        let payload_json = serde_json::to_string(&stored_payload)
-            .map_err(|error| format!("serialize event: {error}"))?;
+        let payload_json = protect_stored_transcript_text(
+            &serde_json::to_string(&stored_payload)
+                .map_err(|error| format!("serialize event: {error}"))?,
+        )?;
         let prior_terminal = terminal
             && !request_id.is_empty()
             && transaction
@@ -2033,8 +2082,10 @@ impl HistoryStore {
                 let permission_id = string_field(permission, &["id"])
                     .unwrap_or_else(|| format!("permission:{request_id}:{now_ms}"));
                 let tool_name = string_field(permission, &["toolName", "tool_name"]);
-                let request_json = serde_json::to_string(permission)
-                    .map_err(|error| format!("serialize permission request: {error}"))?;
+                let request_json = protect_stored_transcript_text(
+                    &serde_json::to_string(permission)
+                        .map_err(|error| format!("serialize permission request: {error}"))?,
+                )?;
                 transaction
                     .execute(
                         "INSERT INTO permission_requests(id, turn_id, session_id, tool_name, request_json, requested_at)
@@ -2051,7 +2102,11 @@ impl HistoryStore {
             } else {
                 event_type
             };
-            let error = stored_payload.get("error").and_then(Value::as_str);
+            let error = stored_payload
+                .get("error")
+                .and_then(Value::as_str)
+                .map(protect_stored_transcript_text)
+                .transpose()?;
             transaction
                 .execute(
                     "UPDATE turns SET status=?1, finished_at=?2, error=COALESCE(?3,error), usage_json=COALESCE(?4,usage_json) WHERE id=?5",
@@ -2099,9 +2154,19 @@ impl HistoryStore {
         let arguments = object
             .get("arguments")
             .or_else(|| object.get("args"))
-            .map(Value::to_string);
-        let result = object.get("result").map(Value::to_string);
-        let error = object.get("error").and_then(Value::as_str);
+            .map(Value::to_string)
+            .map(|value| protect_stored_transcript_text(&value))
+            .transpose()?;
+        let result = object
+            .get("result")
+            .map(Value::to_string)
+            .map(|value| protect_stored_transcript_text(&value))
+            .transpose()?;
+        let error = object
+            .get("error")
+            .and_then(Value::as_str)
+            .map(protect_stored_transcript_text)
+            .transpose()?;
         let started_at = (event_type != "tool_result").then_some(now_ms);
         let finished_at = (event_type == "tool_result").then_some(now_ms);
         connection
@@ -2159,6 +2224,7 @@ impl HistoryStore {
         for row in event_rows {
             let (id, turn_id, sequence, event_type, payload_json, created_at) =
                 row.map_err(|error| format!("read history context event: {error}"))?;
+            let payload_json = unprotect_stored_transcript_text(&payload_json)?;
             let payload = serde_json::from_str::<Value>(&payload_json)
                 .map_err(|error| format!("parse history context event {id}: {error}"))?;
             let turn = turns
@@ -2247,6 +2313,151 @@ impl HistoryStore {
             .map_err(|error| format!("resolve permission request: {error}"))?;
         Ok(())
     }
+}
+
+/// Encrypt durable event/tool/permission/error fields that older releases
+/// stored as plaintext. The caller owns one transaction and writes the marker
+/// only after every table has been migrated, so a failed pass remains safe to
+/// retry on the next startup or portable unlock.
+fn migrate_private_event_fields(transaction: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    {
+        let mut statement = transaction
+            .prepare("SELECT id, payload_json FROM turn_events")
+            .map_err(|error| format!("prepare legacy event scan: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("query legacy events: {error}"))?;
+        let mut updates = Vec::new();
+        for row in rows {
+            let (id, payload) = row.map_err(|error| format!("read legacy event: {error}"))?;
+            if crate::secret_store::is_protected_transcript_text(&payload) {
+                continue;
+            }
+            let protected = protect_stored_transcript_text(&payload)?;
+            if protected != payload {
+                updates.push((id, protected));
+            }
+        }
+        drop(statement);
+        for (id, payload) in updates {
+            transaction
+                .execute(
+                    "UPDATE turn_events SET payload_json = ?1 WHERE id = ?2",
+                    params![payload, id],
+                )
+                .map_err(|error| format!("encrypt legacy event: {error}"))?;
+        }
+    }
+
+    {
+        let mut statement = transaction
+            .prepare("SELECT id, arguments_json, result_json, error FROM tool_calls")
+            .map_err(|error| format!("prepare legacy tool scan: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(|error| format!("query legacy tools: {error}"))?;
+        let mut updates = Vec::new();
+        for row in rows {
+            let (id, arguments, result, error) =
+                row.map_err(|error| format!("read legacy tool: {error}"))?;
+            let protected_arguments =
+                protect_optional_stored_transcript_text(arguments.as_deref())?;
+            let protected_result = protect_optional_stored_transcript_text(result.as_deref())?;
+            let protected_error = protect_optional_stored_transcript_text(error.as_deref())?;
+            if protected_arguments != arguments
+                || protected_result != result
+                || protected_error != error
+            {
+                updates.push((id, protected_arguments, protected_result, protected_error));
+            }
+        }
+        drop(statement);
+        for (id, arguments, result, error) in updates {
+            transaction
+                .execute(
+                    "UPDATE tool_calls SET arguments_json = ?1, result_json = ?2, error = ?3 WHERE id = ?4",
+                    params![arguments, result, error, id],
+                )
+                .map_err(|error| format!("encrypt legacy tool: {error}"))?;
+        }
+    }
+
+    {
+        let mut statement = transaction
+            .prepare("SELECT id, request_json FROM permission_requests")
+            .map_err(|error| format!("prepare legacy permission scan: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("query legacy permissions: {error}"))?;
+        let mut updates = Vec::new();
+        for row in rows {
+            let (id, request) = row.map_err(|error| format!("read legacy permission: {error}"))?;
+            if crate::secret_store::is_protected_transcript_text(&request) {
+                continue;
+            }
+            let protected = protect_stored_transcript_text(&request)?;
+            if protected != request {
+                updates.push((id, protected));
+            }
+        }
+        drop(statement);
+        for (id, request) in updates {
+            transaction
+                .execute(
+                    "UPDATE permission_requests SET request_json = ?1 WHERE id = ?2",
+                    params![request, id],
+                )
+                .map_err(|error| format!("encrypt legacy permission: {error}"))?;
+        }
+    }
+
+    {
+        let mut statement = transaction
+            .prepare("SELECT id, error FROM turns WHERE error IS NOT NULL")
+            .map_err(|error| format!("prepare legacy turn error scan: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("query legacy turn errors: {error}"))?;
+        let mut updates = Vec::new();
+        for row in rows {
+            let (id, error) = row.map_err(|error| format!("read legacy turn error: {error}"))?;
+            if crate::secret_store::is_protected_transcript_text(&error) {
+                continue;
+            }
+            let protected = protect_stored_transcript_text(&error)?;
+            if protected != error {
+                updates.push((id, protected));
+            }
+        }
+        drop(statement);
+        for (id, error) in updates {
+            transaction
+                .execute(
+                    "UPDATE turns SET error = ?1 WHERE id = ?2",
+                    params![error, id],
+                )
+                .map_err(|error| format!("encrypt legacy turn error: {error}"))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn protect_optional_stored_transcript_text(value: Option<&str>) -> Result<Option<String>, String> {
+    value.map(protect_stored_transcript_text).transpose()
 }
 
 /// Protect transcript text for durable storage.
@@ -2509,8 +2720,9 @@ fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
 /// Terminal event JSON is an internal audit record. A malformed legacy value
 /// must not prevent the transcript itself from loading.
 fn thinking_from_terminal_payload(payload_json: &str) -> Option<String> {
-    serde_json::from_str::<Value>(payload_json)
+    unprotect_stored_transcript_text(payload_json)
         .ok()
+        .and_then(|payload_json| serde_json::from_str::<Value>(&payload_json).ok())
         .and_then(|payload| display_safe_terminal_thinking(&payload))
 }
 
@@ -3116,8 +3328,171 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        #[cfg(windows)]
+        assert!(crate::secret_store::is_protected_transcript_text(
+            &stored_event
+        ));
+        let stored_event = unprotect_stored_transcript_text(&stored_event).unwrap();
         assert!(stored_event.contains("explicitly-retained-tool-content"));
         drop(connection);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn non_redacted_tool_payloads_are_encrypted_at_rest_and_round_trip() {
+        let (store, path) = test_store();
+        let session = StoredSession {
+            id: "session-encrypted-tools".to_string(),
+            title: "encrypted".to_string(),
+            cwd: "C:\\workspace".to_string(),
+            updated_at: 1,
+            provider_id: "embedded".to_string(),
+            model: String::new(),
+            selected_model_json: None,
+            pinned_at: None,
+            archived_at: None,
+            share_enabled: false,
+            share_token: None,
+            share_created_at: None,
+            share_updated_at: None,
+            redact_tool_content: false,
+        };
+        store
+            .replace_snapshot(std::slice::from_ref(&session), &[], &HashMap::new())
+            .unwrap();
+        store
+            .upsert_turn(
+                &session.id,
+                "conversation-encrypted-tools",
+                "turn-encrypted-tools",
+                "request-encrypted-tools",
+                "running",
+                None,
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+        store
+            .append_event(
+                &json!({
+                    "type": "tool_result",
+                    "sessionId": session.id,
+                    "turnId": "turn-encrypted-tools",
+                    "requestId": "request-encrypted-tools",
+                    "sequence": 1,
+                    "toolCall": {
+                        "id": "tool-encrypted-tools",
+                        "name": "Read",
+                        "arguments": {"path": ".env", "token": "tool-argument-secret-value"},
+                        "result": "tool-result-secret-value",
+                        "status": "completed"
+                    }
+                }),
+                2,
+            )
+            .unwrap();
+        store
+            .append_event(
+                &json!({
+                    "type": "permission_requested",
+                    "sessionId": session.id,
+                    "turnId": "turn-encrypted-tools",
+                    "requestId": "request-encrypted-tools",
+                    "sequence": 2,
+                    "permission": {
+                        "id": "permission-encrypted-tools",
+                        "toolName": "Bash",
+                        "command": "curl -H 'Authorization: permission-secret-value'"
+                    }
+                }),
+                3,
+            )
+            .unwrap();
+        store
+            .append_event(
+                &json!({
+                    "type": "error",
+                    "sessionId": session.id,
+                    "turnId": "turn-encrypted-tools",
+                    "requestId": "request-encrypted-tools",
+                    "error": "provider rejected key turn-error-secret-value"
+                }),
+                4,
+            )
+            .unwrap();
+
+        // At rest, none of the durable event/tool/permission/error columns may
+        // retain plaintext once the platform envelope is available.
+        #[cfg(windows)]
+        {
+            let connection = store.open().unwrap();
+            let mut statement = connection
+                .prepare("SELECT payload_json FROM turn_events WHERE session_id = 'session-encrypted-tools'")
+                .unwrap();
+            let payloads = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(!payloads.is_empty());
+            for payload in &payloads {
+                assert!(crate::secret_store::is_protected_transcript_text(payload));
+                assert!(!payload.contains("secret-value"));
+            }
+            let (arguments, result): (Option<String>, Option<String>) = connection
+                .query_row(
+                    "SELECT arguments_json, result_json FROM tool_calls WHERE id = 'tool-encrypted-tools'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            for column in [arguments, result] {
+                let value = column.expect("non-redacted tool columns should persist");
+                assert!(crate::secret_store::is_protected_transcript_text(&value));
+                assert!(!value.contains("secret-value"));
+            }
+            let request_json: String = connection
+                .query_row(
+                    "SELECT request_json FROM permission_requests WHERE id = 'permission-encrypted-tools'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(crate::secret_store::is_protected_transcript_text(
+                &request_json
+            ));
+            assert!(!request_json.contains("secret-value"));
+            let turn_error: Option<String> = connection
+                .query_row(
+                    "SELECT error FROM turns WHERE id = 'turn-encrypted-tools'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let turn_error = turn_error.expect("terminal error should persist");
+            assert!(crate::secret_store::is_protected_transcript_text(
+                &turn_error
+            ));
+            assert!(!turn_error.contains("secret-value"));
+        }
+
+        // Round trip: replay still surfaces the retained tool content.
+        let context = store.load_context(&session.id).unwrap();
+        let serialized = serde_json::to_string(&context).unwrap();
+        assert!(serialized.contains("tool-result-secret-value"));
+        let terminal = store
+            .load_terminal_event("request-encrypted-tools")
+            .unwrap()
+            .expect("terminal event should load");
+        assert_eq!(
+            terminal.get("error").and_then(Value::as_str),
+            Some("provider rejected key turn-error-secret-value")
+        );
+        drop(store);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
         let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
@@ -4234,6 +4609,57 @@ mod tests {
             share_updated_at: None,
             redact_tool_content: true,
         }
+    }
+
+    #[test]
+    fn load_message_counts_groups_sessions_without_loading_transcripts() {
+        let (store, path) = test_store();
+        let session_a = sample_session("message-count-a", "A");
+        let session_b = sample_session("message-count-b", "B");
+        let empty_session = sample_session("message-count-empty", "empty");
+        let messages = vec![
+            StoredMessage {
+                id: "message-count-a1".to_string(),
+                session_id: session_a.id.clone(),
+                role: "user".to_string(),
+                content: "first".to_string(),
+                created_at: 1,
+                turn_id: None,
+            },
+            StoredMessage {
+                id: "message-count-b1".to_string(),
+                session_id: session_b.id.clone(),
+                role: "user".to_string(),
+                content: "second".to_string(),
+                created_at: 2,
+                turn_id: None,
+            },
+            StoredMessage {
+                id: "message-count-b2".to_string(),
+                session_id: session_b.id.clone(),
+                role: "assistant".to_string(),
+                content: "third".to_string(),
+                created_at: 3,
+                turn_id: None,
+            },
+        ];
+        store
+            .replace_snapshot(
+                &[session_a.clone(), session_b.clone(), empty_session.clone()],
+                &messages,
+                &HashMap::new(),
+            )
+            .unwrap();
+
+        let counts = store.load_message_counts().unwrap();
+
+        assert_eq!(counts.get(&session_a.id), Some(&1));
+        assert_eq!(counts.get(&session_b.id), Some(&2));
+        assert_eq!(counts.get(&empty_session.id), None);
+        drop(store);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
     }
 
     #[test]

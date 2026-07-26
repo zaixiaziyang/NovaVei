@@ -48,4 +48,12 @@ scripts/             可公开的打包与发布检查脚本
 
 - GitHub Actions 使用固定 SHA 的第三方 Action，并以最小 `contents: read` 权限运行。
 - Dependabot 覆盖 npm、Cargo 与 GitHub Actions。
-- 首次发布时，将目标 GitHub 仓库添加为 `origin`，然后执行 `git push -u origin main`。
+- 许可证为 [MIT](./LICENSE)。
+- 目标仓库为 [zaixiaziyang/NovaVei](https://github.com/zaixiaziyang/NovaVei)。若远端已有初始 `LICENSE` 提交，先获取并合并其历史，再正常推送；不要以无保护的强推覆盖它。
+
+```powershell
+git remote add origin https://github.com/zaixiaziyang/NovaVei.git
+git fetch origin
+git merge --allow-unrelated-histories origin/main
+git push -u origin main
+```

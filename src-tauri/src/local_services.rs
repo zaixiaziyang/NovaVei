@@ -7128,16 +7128,37 @@ fn bound_cron_output_text(mut text: String) -> String {
     text
 }
 
+/// Stop a scheduled shell job and every process it spawned.
+///
+/// `taskkill` is resolved from `%SystemRoot%\System32` rather than by bare
+/// program name: `CreateProcess` searches the application directory before
+/// `PATH`, so a bare name would let a `taskkill.exe` dropped beside the
+/// executable receive this termination request. Keep the direct kill as the
+/// fallback whenever the system helper cannot be located or started, matching
+/// the Agent/terminal shell path.
 fn terminate_process_tree(child: &mut std::process::Child) {
     #[cfg(windows)]
     {
-        let pid = child.id();
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let taskkill = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+            .join("System32")
+            .join("taskkill.exe");
+        let mut terminated_tree = false;
+        if taskkill.is_file() {
+            let pid = child.id();
+            let mut killer = Command::new(taskkill);
+            killer
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            configure_hidden_console_process(&mut killer);
+            terminated_tree = killer.status().is_ok();
+        }
+        if !terminated_tree {
+            let _ = child.kill();
+        }
     }
     #[cfg(not(windows))]
     {

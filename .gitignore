@@ -14,6 +14,7 @@
 *.spec.*
 /scripts/*
 !/scripts/copy-portable.mjs
+!/scripts/portable-packaging-audit.mjs
 !/scripts/release-smoke-checklist.mjs
 /*.cmd
 

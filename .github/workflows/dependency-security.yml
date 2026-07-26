@@ -1,6 +1,9 @@
 name: Dependency security
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
   schedule:
     # Monday 03:17 Asia/Shanghai (Sunday 19:17 UTC).

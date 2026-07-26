@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 pub const PORTABLE_MARKER_FILE: &str = "novavei-portable.json";
 pub const PORTABLE_DATA_DIRECTORY: &str = "novavei";
+const INSTANCE_LOCK_FILE: &str = ".novavei-instance.lock";
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -142,6 +143,42 @@ pub fn portable_application_dir() -> Option<PathBuf> {
 /// action while still keeping every write under the executable's sibling root.
 pub fn portable_marker_valid() -> bool {
     !is_portable() || layout().marker_valid
+}
+
+/// Held for the process lifetime; dropping it releases the exclusive lock.
+pub struct InstanceLock {
+    _file: fs::File,
+}
+
+/// Two processes sharing one data root would race the SQLite WAL files and
+/// the WebView2 profile. Windows enforces this through an exclusive
+/// share-mode open of a lock file inside the resolved root; the handle stays
+/// open until process exit, so even a killed process releases it. On other
+/// platforms the open is best-effort advisory.
+pub fn acquire_instance_lock() -> Result<InstanceLock, String> {
+    let root = application_data_dir();
+    // Installed mode may run before anything created the data directory.
+    fs::create_dir_all(&root)
+        .map_err(|_| "create application data directory failed".to_string())?;
+    let path = root.join(INSTANCE_LOCK_FILE);
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0);
+    }
+    match options.open(&path) {
+        Ok(file) => Ok(InstanceLock { _file: file }),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Err(
+            "another NovaVei instance is already using this data folder, or the folder is read-only"
+                .to_string(),
+        ),
+        Err(_) => Err(
+            "another NovaVei instance is already using this data folder, or it is not writable"
+                .to_string(),
+        ),
+    }
 }
 
 fn resolve_current_layout() -> StorageLayout {

@@ -57,9 +57,9 @@ function sessionKey(sessionId?: string) {
  * must never make the current Composer a Stop button or receive its events.
  */
 export class PiRuntimeController implements PiRuntimePublicApi {
-  readonly ready: Promise<void>;
+  ready: Promise<void>;
 
-  private readonly transport: PiRuntimeTransport | null;
+  private transport: PiRuntimeTransport | null;
   private readonly states = new Map<string, PiRuntimeState>();
   private readonly listeners = new Set<StateListener>();
   private readonly sessionStateListeners = new Set<PiSessionRunStateListener>();
@@ -70,6 +70,9 @@ export class PiRuntimeController implements PiRuntimePublicApi {
   private readonly cancellations = new Map<string, Promise<void>>();
   private selectedSessionKey = FALLBACK_SESSION_KEY;
   private unsubscribeTransport: (() => void) | null = null;
+  private deferredTransportReady:
+    | { resolve: () => void; reject: (error: unknown) => void }
+    | undefined;
 
   constructor(
     transport: PiRuntimeTransport | null = createDefaultPiTransport(),
@@ -84,6 +87,39 @@ export class PiRuntimeController implements PiRuntimePublicApi {
       this.acceptEvent(event),
     );
     this.unsubscribeTransport = unsubscribe;
+  }
+
+  /** Hold submissions until a lazily loaded transport either connects or fails. */
+  deferTransport() {
+    if (this.transport || this.deferredTransportReady) return;
+    this.ready = new Promise<void>((resolve, reject) => {
+      this.deferredTransportReady = { resolve, reject };
+    });
+  }
+
+  /**
+   * Attach the heavyweight embedded Pi transport after the shell has painted.
+   * The controller starts safely without a transport, then `submit()` waits
+   * for this connection whenever loading is already in progress.
+   */
+  async attachTransport(transport: PiRuntimeTransport | null) {
+    if (!transport || this.transport) return this.ready;
+    this.transport = transport;
+    try {
+      await this.connect();
+      this.deferredTransportReady?.resolve();
+      this.deferredTransportReady = undefined;
+    } catch (error) {
+      this.transport = null;
+      this.failDeferredTransport(error);
+      throw error;
+    }
+  }
+
+  /** Reject a deferred connection when its dynamic module cannot load. */
+  failDeferredTransport(error: unknown) {
+    this.deferredTransportReady?.reject(error);
+    this.deferredTransportReady = undefined;
   }
 
   private stateFor(key: string) {

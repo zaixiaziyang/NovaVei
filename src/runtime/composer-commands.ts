@@ -1,10 +1,5 @@
 import { manualContextCompactionFromNativePayload } from "./pi/context";
 import { SESSION_GOAL_UPDATED_EVENT } from "./types";
-import {
-  listCouncilCommandChoices,
-  resolveChatCharacter,
-  resolveCouncilExpert,
-} from "./workflows";
 
 type Invoke = <T = unknown>(
   command: string,
@@ -460,6 +455,7 @@ export function installComposerCommands(
             selector: selectorForChoice(skill.name, skill.name),
           }));
       } else {
+        const { listCouncilCommandChoices } = await import("./workflows");
         const library = await listCouncilCommandChoices(invoke);
         const entries =
           kind === "expert" ? library.experts : library.characters;
@@ -660,6 +656,7 @@ export function installComposerCommands(
             commandError(
               "用法：/expert <专家名称或 ID> <任务>；含空格的名称请用双引号包住",
             );
+          const { resolveCouncilExpert } = await import("./workflows");
           const expert = await resolveCouncilExpert(invoke, parsed.name);
           return {
             text: expertInstruction(expert, parsed.task),
@@ -671,6 +668,7 @@ export function installComposerCommands(
             commandError(
               "用法：/character <角色名称或 ID> <任务>；含空格的名称请用双引号包住",
             );
+          const { resolveChatCharacter } = await import("./workflows");
           const character = await resolveChatCharacter(invoke, parsed.name);
           return {
             text: characterInstruction(character, parsed.task),

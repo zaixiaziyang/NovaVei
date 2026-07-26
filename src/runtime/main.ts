@@ -6,11 +6,9 @@ import { installBrowser } from "./browser";
 import { installTranscriptNavigation } from "./chat-navigation";
 import { installComposerCommands } from "./composer-commands";
 import { createDomPiRuntime } from "./dom";
-import { createEmbeddedPiTransport } from "./embedded";
 import { installGoals } from "./goals";
 import { installHistorySearch } from "./history-search";
 import { installNativeShell } from "./host";
-import { installLocalServices } from "./local-services";
 import { installPermissionPicker } from "./permission-picker";
 import { installStorageModeSettings } from "./portable-mode";
 import { installPortableStorageGate } from "./portable-storage";
@@ -20,7 +18,6 @@ import {
 } from "./shell-chrome";
 import type { PiRuntimePublicApi } from "./types";
 import { installWorkbench } from "./workbench";
-import { installPiWorkflows } from "./workflows";
 
 // Ownership map (TypeScript entry owns runtime wiring; HTML owns visual chrome):
 // - installAppDialogs / installPermissionPicker / installNativeShell /
@@ -37,6 +34,43 @@ function toast(message: string) {
   target.textContent = message;
   target.classList.add("show");
   window.setTimeout(() => target.classList.remove("show"), 2200);
+}
+
+/**
+ * The embedded Agent and the optional Workflow/Local Services surfaces are
+ * large modules. Defer them until the first paint so the initial chat shell
+ * and transcript can become interactive sooner. Secondary-feature failures
+ * must never prevent the primary Agent transport from being attached.
+ */
+function installDeferredRuntimeAfterFirstPaint(
+  controller: PiRuntimeController,
+) {
+  let started = false;
+  const load = async () => {
+    if (started) return;
+    started = true;
+    void import("./embedded")
+      .then(async ({ createEmbeddedPiTransport }) => {
+        const embedded = createEmbeddedPiTransport();
+        window.__novaveiPiEmbedded = embedded;
+        await controller.attachTransport(embedded);
+      })
+      .catch((error) => {
+        controller.failDeferredTransport(error);
+        console.warn("[NovaVei] embedded runtime initialization failed", error);
+      });
+    void Promise.all([import("./workflows"), import("./local-services")])
+      .then(([workflowsModule, localServicesModule]) => {
+        workflowsModule.installPiWorkflows();
+        localServicesModule.installLocalServices();
+      })
+      .catch((error) =>
+        console.warn("[NovaVei] deferred feature initialization failed", error),
+      );
+  };
+  window.requestAnimationFrame(() => {
+    window.setTimeout(() => void load(), 0);
+  });
 }
 
 /**
@@ -185,12 +219,11 @@ async function install() {
   // confirmation itself is deliberately performed by the native host
   // immediately before run.
   installPermissionPicker();
-  // Install the concrete Pi host before the controller subscribes. The
-  // transport owns the Agent and provider stream; Tauri remains its
-  // capability boundary. No separate agent process is started.
-  const embedded = createEmbeddedPiTransport();
-  window.__novaveiPiEmbedded = embedded;
-  const controller = new PiRuntimeController(embedded);
+  // Let the lightweight shell render before parsing the embedded Agent and
+  // workflow modules. The controller gains that transport immediately after
+  // first paint; Tauri remains its capability boundary and no sidecar starts.
+  const controller = new PiRuntimeController(null);
+  controller.deferTransport();
   installOverlayAccessibility();
   const runtime = createDomPiRuntime(controller);
   window.__novaveiPiRuntime = runtime as PiRuntimePublicApi;
@@ -204,8 +237,7 @@ async function install() {
   installWorkbench();
   installBrowser();
   installComposerAttachments();
-  installPiWorkflows();
-  installLocalServices();
+  installDeferredRuntimeAfterFirstPaint(controller);
   installComposerSubmitBridge(runtime);
   void controller.ready.catch((error) => {
     console.warn("[NovaVei Pi] transport initialization failed", error);

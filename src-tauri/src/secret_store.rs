@@ -694,6 +694,20 @@ fn replace_portable_key_file(
     let parent = path
         .parent()
         .ok_or_else(|| "portable storage configuration path is invalid".to_string())?;
+    // This file is the only holder of the wrapped data key: losing it makes
+    // the whole portable database unreadable. Keep the previous generation as
+    // a sibling backup before the atomic replace so an interrupted rewrite
+    // (power loss on removable media) always leaves one recoverable copy.
+    if path.is_file() {
+        let backup = parent.join(format!(
+            "{}.bak",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("portable.json")
+        ));
+        fs::copy(path, &backup)
+            .map_err(|_| "back up portable storage configuration failed".to_string())?;
+    }
     let mut random = [0_u8; 8];
     getrandom::getrandom(&mut random)
         .map_err(|_| "generate portable storage temporary name failed".to_string())?;

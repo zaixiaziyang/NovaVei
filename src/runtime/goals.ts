@@ -355,6 +355,10 @@ export function installGoals() {
   let goalError = "";
   let operation = 0;
 
+  const runtimeRenderKey = (state: PiRuntimeSnapshot) =>
+    `${state.requestId ?? ""}:${state.sessionId ?? ""}:${state.status}`;
+  let lastRuntimeRenderKey = runtimeRenderKey(lastState);
+
   const goalForActiveSession = () =>
     activeSessionId ? activeGoal : transientGoal;
 
@@ -588,7 +592,10 @@ export function installGoals() {
   });
 
   const unsubscribe = runtime.subscribe((state) => {
+    const nextRenderKey = runtimeRenderKey(state);
     lastState = state;
+    if (nextRenderKey === lastRuntimeRenderKey) return;
+    lastRuntimeRenderKey = nextRenderKey;
     render();
   });
 

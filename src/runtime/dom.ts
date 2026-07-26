@@ -25,6 +25,7 @@ import type {
 type UnknownRecord = Record<string, unknown>;
 
 export const LIVE_MARKDOWN_RENDER_INTERVAL_MS = 80;
+const LIVE_CHROME_RENDER_INTERVAL_MS = 250;
 
 export function liveMarkdownRenderDelay(
   lastRenderedAt: number,
@@ -243,6 +244,12 @@ type LiveTurnContext = {
   presentation: AssistantPresentation;
   requestId?: string;
   turnId?: string;
+  publishedUser?: {
+    content: string;
+    requestId?: string;
+    turnId?: string;
+    status: PiRuntimeState["status"];
+  };
 };
 
 function reasoningLabel(value: PiReasoningLevel | undefined) {
@@ -3203,6 +3210,8 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
   let pendingLiveAssistantNode: HTMLElement | null = null;
   let pendingLiveAssistantTimer: number | undefined;
   let lastLiveAssistantRenderedAt = 0;
+  let lastLiveChromeRenderedAt = 0;
+  let lastRenderedStreamEvent: PiRuntimeState["lastEvent"];
   const planConfirmationCards = new PlanConfirmationCards();
   const planConfirmationContexts = new Map<
     string,
@@ -3576,16 +3585,34 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       (state.requestId
         ? presentationsByRequest.get(state.requestId)
         : undefined) ?? turn.presentation;
-    publishLiveTranscriptMessage({
-      id: turn.userMessageId,
-      sessionId: turn.sessionId,
-      role: "user",
-      content: turn.displayText || state.prompt || "[附件]",
-      createdAt: turn.createdAt,
-      requestId: turn.requestId,
-      turnId: turn.turnId,
-      status: state.status,
-    });
+    const userContent = turn.displayText || state.prompt || "[附件]";
+    const publishedUser = turn.publishedUser;
+    if (
+      !publishedUser ||
+      publishedUser.content !== userContent ||
+      publishedUser.requestId !== turn.requestId ||
+      publishedUser.turnId !== turn.turnId ||
+      publishedUser.status !== state.status
+    ) {
+      const published = publishLiveTranscriptMessage({
+        id: turn.userMessageId,
+        sessionId: turn.sessionId,
+        role: "user",
+        content: userContent,
+        createdAt: turn.createdAt,
+        requestId: turn.requestId,
+        turnId: turn.turnId,
+        status: state.status,
+      });
+      if (published) {
+        turn.publishedUser = {
+          content: userContent,
+          requestId: turn.requestId,
+          turnId: turn.turnId,
+          status: state.status,
+        };
+      }
+    }
     publishLiveTranscriptMessage({
       id: turn.assistantMessageId,
       sessionId: turn.sessionId,
@@ -3761,17 +3788,44 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       if (state.requestId) syncLiveTranscriptFromState(state);
       return;
     }
+    const streamEvent = state.lastEvent;
+    const hasNewStreamEvent = streamEvent !== lastRenderedStreamEvent;
+    lastRenderedStreamEvent = streamEvent;
+
     // Thinking changes neither run chrome nor the visible answer. Skip the
     // expensive transcript, dock, and permission refreshes; the shared frame
-    // coalescer below updates the disclosure at most once per paint.
+    // coalescer below updates the disclosure at most once per paint. Checking
+    // event identity prevents a later non-stream action from inheriting this
+    // fast path through the reducer's retained `lastEvent` field.
     if (
-      state.lastEvent?.type === "thinking_delta" &&
+      hasNewStreamEvent &&
+      streamEvent?.type === "thinking_delta" &&
       state.requestId === activeRequestId &&
       activeNode?.isConnected
     ) {
       renderLiveAssistantText(state.assistantText, state.thinkingText, false);
       return;
     }
+
+    // Text deltas still update the cached live transcript and Markdown source,
+    // but status chrome and the run dock do not need token-level DOM writes.
+    // Refresh those surfaces at a human-visible cadence while keeping tool,
+    // permission, cancellation, and terminal events immediate.
+    if (
+      hasNewStreamEvent &&
+      streamEvent?.type === "text_delta" &&
+      state.requestId === activeRequestId &&
+      activeNode?.isConnected &&
+      Date.now() - lastLiveChromeRenderedAt < LIVE_CHROME_RENDER_INTERVAL_MS
+    ) {
+      syncLiveTranscriptFromState(state);
+      renderLiveAssistantText(state.assistantText, state.thinkingText, false);
+      activeNode.dataset.piSource = stripPlanProtocolBlocks(
+        state.assistantText,
+      );
+      return;
+    }
+    lastLiveChromeRenderedAt = Date.now();
     updateRunChrome(state, contextInspector);
     const liveTurn = state.requestId ? liveTurnForState(state) : undefined;
     if (state.requestId && state.requestId !== activeRequestId) {

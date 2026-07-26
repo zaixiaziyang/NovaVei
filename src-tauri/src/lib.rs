@@ -165,9 +165,23 @@ pub fn run() {
     if let Err(error) = storage::initialize() {
         // There is no trustworthy data root for diagnostics yet. Fail closed
         // instead of allowing a linked portable directory to redirect writes.
-        eprintln!("NovaVei storage initialization failed: {error}");
+        // A windowed executable has no visible stderr, so the reason must be
+        // surfaced through a native dialog (read-only USB media is the most
+        // common trigger for a portable package).
+        report_fatal_startup_error(&error);
         return;
     }
+    // A second process sharing the same data root would race the SQLite WAL
+    // files and the WebView2 profile. Hold an exclusive lock file inside the
+    // resolved root for the process lifetime; a portable copy launched twice
+    // (or an installed build started twice) fails closed with a clear message.
+    let _instance_lock = match storage::acquire_instance_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            report_fatal_startup_error(&error);
+            return;
+        }
+    };
     // Diagnostics initialization is intentionally best-effort: the desktop
     // shell must remain usable even when a local log directory is unavailable.
     let _ = diagnostics::initialize();
@@ -411,6 +425,26 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running NovaVei");
+}
+
+/// Startup failures happen before any WebView exists, and a
+/// `windows_subsystem = "windows"` executable has no console. Without a
+/// native dialog a portable user on read-only media sees the process exit
+/// silently. stderr is still written for terminal launches and CI.
+#[cfg(feature = "desktop")]
+fn report_fatal_startup_error(error: &str) {
+    eprintln!("NovaVei startup failed: {error}");
+    #[cfg(windows)]
+    {
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("NovaVei 无法启动")
+            .set_description(format!(
+                "NovaVei 无法启动：{error}\n\n如果这是便携版，请确认其所在文件夹可写（未写保护、非只读介质），且没有另一个 NovaVei 正在使用同一数据目录。"
+            ))
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    }
 }
 
 #[cfg(test)]

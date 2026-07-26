@@ -894,6 +894,21 @@ impl AppState {
                 }
             }
         };
+        // Session startup needs only message counts; fetching one count per
+        // record opens a SQLite connection for every historical session. Load
+        // the complete count projection once so long local histories do not
+        // make first paint scale with the number of conversations.
+        let stored_message_counts = if portable_unlock_required {
+            HashMap::new()
+        } else {
+            match history.load_message_counts() {
+                Ok(counts) => counts,
+                Err(error) => {
+                    storage_errors.push(format!("load session message counts: {error}"));
+                    HashMap::new()
+                }
+            }
+        };
         let stored_goals = if portable_unlock_required {
             HashMap::new()
         } else {
@@ -925,13 +940,7 @@ impl AppState {
             // Startup loads metadata and counts only. Transcript pages are
             // fetched on demand via sessions_get so large corpora stay off the
             // AppState hot path.
-            let message_count = match history.count_messages(&record.id) {
-                Ok(count) => count,
-                Err(error) => {
-                    storage_errors.push(format!("count messages for {}: {error}", record.id));
-                    0
-                }
-            };
+            let message_count = stored_message_counts.get(&record.id).copied().unwrap_or(0);
             let messages_empty = message_count == 0;
             sessions.insert(
                 record.id.clone(),
@@ -1078,7 +1087,20 @@ impl AppState {
             // Do not block the shell when migration fails; diagnostics retain the event.
             if state.storage_recovery.is_ready() {
                 match state.history.encrypt_legacy_transcripts_once() {
-                    Ok(_) => {}
+                    Ok(true) => {
+                        // The migration has replaced plaintext rows after the
+                        // initial startup compaction. Vacuum once more so the
+                        // old SQLite/WAL pages do not retain those values.
+                        if state.history.secure_compact_after_protection().is_err() {
+                            diagnostics::record_event(
+                                "storage",
+                                "transcript_encryption_compaction_failed",
+                                "failure",
+                                None,
+                            );
+                        }
+                    }
+                    Ok(false) => {}
                     Err(error) => {
                         let _ = error;
                         diagnostics::record_event(
@@ -1390,11 +1412,12 @@ fn load_session_projection(
     let goals = history
         .load_session_goals()
         .map_err(|_| "read portable session goals failed".to_string())?;
+    let message_counts = history
+        .load_message_counts()
+        .map_err(|_| "read portable session message counts failed".to_string())?;
     let mut sessions = HashMap::new();
     for record in stored_sessions {
-        let message_count = history
-            .count_messages(&record.id)
-            .map_err(|_| "read portable session message counts failed".to_string())?;
+        let message_count = message_counts.get(&record.id).copied().unwrap_or(0);
         let messages_empty = message_count == 0;
         let last_run = run_summaries.get(&record.id);
         let goal = goals.get(&record.id).and_then(session_goal_from_stored);
@@ -1535,6 +1558,61 @@ fn portable_machine_identity() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Removable drives regularly change letters between hosts and even between
+/// plug-ins on one host. For scope comparison only, treat `E:\NovaVei` and
+/// `F:\NovaVei` as the same portable folder; the machine identity check still
+/// distinguishes computers. UNC and relative keys keep exact comparison.
+fn drive_agnostic_scope_key(key: &str) -> &str {
+    let bytes = key.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        &key[2..]
+    } else {
+        key
+    }
+}
+
+fn workspace_drive_letter(path: &str) -> Option<char> {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        Some(bytes[0].to_ascii_uppercase() as char)
+    } else {
+        None
+    }
+}
+
+/// Rewrite a project entry's path from the portable drive's previous letter
+/// to its current one. The remap is deliberately conservative: an entry moves
+/// only when its saved path is no longer reachable while the same path on the
+/// current portable drive exists, so fixed-disk projects that legitimately
+/// share the old letter are never rewritten.
+fn remap_project_entry_drive(entry: &mut Value, previous_drive: char, current_drive: char) {
+    let Some(object) = entry.as_object_mut() else {
+        return;
+    };
+    let Some(path) = object.get("path").and_then(Value::as_str) else {
+        return;
+    };
+    if workspace_drive_letter(path) != Some(previous_drive) {
+        return;
+    }
+    if canonical_workdir(path).is_ok() {
+        return;
+    }
+    let remapped: String = current_drive.to_string() + &path[1..];
+    if canonical_workdir(&remapped).is_err() {
+        return;
+    }
+    object.insert("path".to_string(), Value::String(remapped));
+}
+
 fn portable_project_scope_matches(
     value: Option<&Value>,
     root_key: &str,
@@ -1556,7 +1634,7 @@ fn portable_project_scope_matches(
     else {
         return false;
     };
-    if saved_root_key != root_key {
+    if drive_agnostic_scope_key(&saved_root_key) != drive_agnostic_scope_key(root_key) {
         return false;
     }
     match (
@@ -1591,15 +1669,58 @@ fn reconcile_portable_projects_at_startup(settings: &mut HashMap<String, Value>)
         &root_key,
         machine.as_deref(),
     );
+    let saved_scope_root = settings
+        .get(PORTABLE_PROJECT_SCOPE)
+        .and_then(Value::as_object)
+        .and_then(|scope| scope.get("root"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let mut entries = if scope_matches {
-        settings
+        let mut entries = settings
             .get("projects")
             .and_then(Value::as_object)
             .and_then(|projects| projects.get("entries"))
             .and_then(Value::as_array)
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // The portable drive may have received a different letter on this
+        // host. Project paths that lived on the old portable drive are moved
+        // to the new letter; paths on other drives are untouched.
+        if let Some(previous_drive) = saved_scope_root.as_deref().and_then(workspace_drive_letter) {
+            if let Some(current_drive) = workspace_drive_letter(&root) {
+                if previous_drive != current_drive {
+                    for entry in &mut entries {
+                        remap_project_entry_drive(entry, previous_drive, current_drive);
+                    }
+                }
+            }
+        }
+        entries
     } else {
+        // A different machine (or an unrecognized scope) starts from a clean
+        // list, but the carried entries are preserved under a backup key so a
+        // false-negative scope check never destroys the user's project list.
+        let previous_entries = settings
+            .get("projects")
+            .and_then(Value::as_object)
+            .and_then(|projects| projects.get("entries"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !previous_entries.is_empty() {
+            settings.insert(
+                // This key remains native-only. Preserve rather than discard
+                // the prior list so a false-negative scope check (machine
+                // rename or unusual drive setup) never destroys user data.
+                "__portableProjectScopeBackup".to_string(),
+                json!({
+                    "version": PORTABLE_PROJECT_SCOPE_VERSION,
+                    "savedAt": now_ms(),
+                    "previousScope": settings.get(PORTABLE_PROJECT_SCOPE).cloned(),
+                    "entries": previous_entries,
+                }),
+            );
+        }
         Vec::new()
     };
     if !has_portable_scope {
@@ -2034,24 +2155,34 @@ pub fn portable_storage_status() -> crate::secret_store::PortableStorageStatus {
 
 /// Unlock or initialize the password-protected portable data root, then
 /// hydrate the durable state that was intentionally withheld during startup.
+/// Argon2 derivation, legacy-row re-encryption, and the follow-up VACUUM can
+/// take seconds on removable media, so the work runs on a blocking thread
+/// instead of the main event loop.
 #[tauri::command(rename_all = "camelCase")]
-pub fn portable_storage_unlock(
+pub async fn portable_storage_unlock(
     state: State<'_, Arc<AppState>>,
     password: String,
     recovery: Option<crate::secret_store::PortableRecoverySetup>,
 ) -> Result<crate::secret_store::PortableStorageStatus, String> {
-    state.unlock_portable_storage(&password, recovery)
+    let state = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || state.unlock_portable_storage(&password, recovery))
+        .await
+        .map_err(|_| "portable storage unlock did not complete".to_string())?
 }
 
 /// Recover a portable data key from all three custom recovery answers, then
 /// set a new password wrapper before hydrating the encrypted projection.
+/// Runs on a blocking thread for the same reason as the password unlock.
 #[tauri::command(rename_all = "camelCase")]
-pub fn portable_storage_recover(
+pub async fn portable_storage_recover(
     state: State<'_, Arc<AppState>>,
     answers: Vec<String>,
     new_password: String,
 ) -> Result<crate::secret_store::PortableStorageStatus, String> {
-    state.recover_portable_storage(&answers, &new_password)
+    let state = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || state.recover_portable_storage(&answers, &new_password))
+        .await
+        .map_err(|_| "portable storage recovery did not complete".to_string())?
 }
 
 /// Return the closed health DTO before a renderer reads sessions or settings.
@@ -16915,9 +17046,16 @@ mod tests {
             r"e:\novavei\release",
             Some("OLD-PC"),
         ));
+        // A removable drive that received a different letter on the same
+        // machine is still the same portable folder.
+        assert!(portable_project_scope_matches(
+            Some(&scope),
+            r"f:\novavei\release",
+            Some("old-pc"),
+        ));
         assert!(!portable_project_scope_matches(
             Some(&scope),
-            r"F:\NovaVei\release",
+            r"e:\другой\release",
             Some("old-pc"),
         ));
         assert!(!portable_project_scope_matches(
@@ -16930,6 +17068,47 @@ mod tests {
             r"E:\NovaVei\release",
             Some("new-pc"),
         ));
+    }
+
+    #[test]
+    fn drive_agnostic_scope_keys_strip_only_drive_prefixes() {
+        assert_eq!(drive_agnostic_scope_key(r"e:\novavei"), r"\novavei");
+        assert_eq!(drive_agnostic_scope_key(r"f:\novavei"), r"\novavei");
+        assert_eq!(
+            drive_agnostic_scope_key(r"\\server\share\novavei"),
+            r"\\server\share\novavei"
+        );
+        assert_eq!(drive_agnostic_scope_key("relative"), "relative");
+        assert_eq!(workspace_drive_letter(r"e:\novavei"), Some('E'));
+        assert_eq!(workspace_drive_letter(r"\\server\share"), None);
+    }
+
+    #[test]
+    fn drive_remap_only_moves_entries_that_exist_on_the_new_drive() {
+        let temp = std::env::temp_dir();
+        let temp_display = path_for_display(&temp);
+        let Some(drive) = workspace_drive_letter(&temp_display) else {
+            return;
+        };
+        // The path exists on the current drive; pretend the scope recorded a
+        // previous letter that no longer exists so the remap must fire.
+        let previous: char = if drive == 'Q' { 'R' } else { 'Q' };
+        let stale = format!("{previous}{}", &temp_display[1..]);
+        let mut entry = json!({ "path": stale });
+        remap_project_entry_drive(&mut entry, previous, drive);
+        assert_eq!(
+            entry.get("path").and_then(Value::as_str),
+            Some(temp_display.as_str()),
+            "an unreachable old-drive path should move to the reachable current drive"
+        );
+
+        // A path on an unrelated drive letter is never rewritten.
+        let mut unrelated = json!({ "path": r"C:\Windows" });
+        remap_project_entry_drive(&mut unrelated, previous, drive);
+        assert_eq!(
+            unrelated.get("path").and_then(Value::as_str),
+            Some(r"C:\Windows")
+        );
     }
 
     fn test_state() -> (AppState, PathBuf) {

@@ -10,6 +10,7 @@ const expectedFileNames = [
   "NovaVei-portable.manifest.json",
   "novavei-portable.json",
 ];
+export { expectedFileNames };
 
 function safePortableVersion(value) {
   const version = String(value ?? "").trim();
