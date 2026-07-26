@@ -1,0 +1,76 @@
+# Local-only planning, design, and test material.
+/整体构建/
+/Tauri/
+/UNFINISHED_TASKS.md
+/FEATURE_GAP_ROADMAP.md
+/PI_INTEGRATION_PLAN.md
+/docs/superpowers/
+/.agents/
+/.superpowers/
+/tests/
+/test/
+/coverage/
+*.test.*
+*.spec.*
+/scripts/*
+!/scripts/copy-portable.mjs
+!/scripts/release-smoke-checklist.mjs
+/*.cmd
+
+# Dependency installations and generated build output.
+/node_modules/
+/dist/
+/release/
+/src-tauri/target/
+/src-tauri/gen/
+/.vite/
+/.cache/
+/cache/
+/tmp/
+/.tmp/
+/_tmp_*
+
+# User data, local service state, and WebView profiles.
+/.novavei/
+/novavei/
+/.grok/
+/logs/
+/src-tauri/.mcp-integration-check/
+# Prevent accidental personal-name or email-address icon drops from being staged.
+/src-tauri/icons/*@*
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Credentials, signing material, and machine-specific configuration.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.token
+*.secret
+credentials*.json
+service-account*.json
+auth.json
+config.toml
+.git-credentials
+.netrc
+!.example.json
+*.local
+*.local.json
+
+# Editor and OS metadata.
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

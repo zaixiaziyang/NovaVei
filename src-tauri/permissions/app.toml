@@ -1,0 +1,282 @@
+[[permission]]
+identifier = "allow-system-info"
+description = "Allow reading system info"
+commands.allow = ["system_info"]
+
+[[permission]]
+identifier = "allow-diagnostics-export"
+description = "Allow a user-triggered, native picker-only diagnostics export"
+commands.allow = ["diagnostics_export"]
+
+[[permission]]
+identifier = "allow-storage-recovery-status"
+description = "Allow checking whether the durable NovaVei store recovered before enabling writes"
+commands.allow = ["storage_recovery_status", "app_health"]
+
+[[permission]]
+identifier = "allow-portable-storage-unlock"
+description = "Allow explicit initialization, unlocking, and recovery of password-protected portable storage"
+commands.allow = ["portable_storage_status", "portable_storage_unlock", "portable_storage_recover"]
+
+[[permission]]
+identifier = "allow-storage-mode-switch"
+description = "Allow reading and scheduling the installed or portable storage mode for the next launch"
+commands.allow = ["storage_mode_status", "storage_mode_set"]
+
+[[permission]]
+identifier = "allow-sessions-list"
+description = "Allow listing sessions"
+commands.allow = ["sessions_list"]
+
+[[permission]]
+identifier = "allow-sessions-create"
+description = "Allow creating sessions"
+commands.allow = ["sessions_create"]
+
+[[permission]]
+identifier = "allow-workspace-picker"
+description = "Allow the native folder picker to approve a workspace"
+commands.allow = ["workspace_pick", "workspace_pick_files"]
+
+[[permission]]
+identifier = "allow-workspace-reveal"
+description = "Allow a user-triggered reveal of an already-approved project root in the system file manager"
+commands.allow = ["workspace_reveal"]
+
+[[permission]]
+identifier = "allow-providers-list"
+description = "Allow listing providers"
+commands.allow = ["providers_list"]
+
+[[permission]]
+identifier = "allow-provider-test"
+description = "Allow a native, non-billable provider model-list probe"
+commands.allow = ["provider_test"]
+
+[[permission]]
+identifier = "allow-provider-models-fetch"
+description = "Allow native discovery of bounded model metadata for a saved provider"
+commands.allow = ["provider_models_fetch"]
+
+[[permission]]
+identifier = "allow-provider-draft"
+description = "Allow native validation and non-billable model-catalogue checks for an unsaved provider connection draft"
+commands.allow = ["provider_draft_prepare", "provider_draft_test", "provider_draft_models_fetch"]
+
+[[permission]]
+identifier = "allow-provider-import"
+description = "Allow a user-picked provider JSON export to be previewed and explicitly applied"
+commands.allow = ["provider_import_preview", "provider_import_apply"]
+
+[[permission]]
+identifier = "allow-full-permission-confirm"
+description = "Allow an operating-system confirmation to mint one short-lived, exact-run Full-access grant"
+commands.allow = ["full_permission_confirm"]
+
+[[permission]]
+identifier = "allow-agent-runtime"
+description = "Allow the embedded Pi runtime to start, cancel, report a turn, and read enabled local Skills"
+commands.allow = ["agent_run", "agent_cancel", "agent_emit_event", "proxy_transport_info", "agent_skills_list", "agent_skills_read"]
+
+[[permission]]
+identifier = "allow-agent-permission"
+description = "Allow the UI permission broker to answer a tool request"
+commands.allow = ["agent_permission"]
+
+[[permission]]
+identifier = "allow-subagent-runtime"
+description = "Allow lifecycle management for parent-authorized read-only subagent tasks"
+commands.allow = [
+  "subagent_task_start",
+  "subagent_tasks_list",
+  "subagent_task_get",
+  "subagent_task_finish",
+  "subagent_task_cancel"
+]
+
+[[permission]]
+identifier = "allow-worktree-subagent-runtime"
+description = "Allow explicit review lifecycle commands for isolated Git-worktree child tasks"
+commands.allow = [
+  "worktree_task_start",
+  "worktree_task_finish",
+  "worktree_task_review_get",
+  "worktree_task_apply",
+  "worktree_task_discard"
+]
+
+[[permission]]
+identifier = "allow-sessions-get"
+description = "Allow reading messages for a session"
+commands.allow = ["sessions_get", "sessions_is_blank"]
+
+[[permission]]
+identifier = "allow-session-goals"
+description = "Allow reading and updating the bounded local goal for a durable session"
+commands.allow = ["session_goal_get", "session_goal_set", "session_goal_progress_update"]
+
+[[permission]]
+identifier = "allow-settings"
+description = "Allow loading and saving local NovaVei settings"
+commands.allow = [
+  "settings_load_all",
+  "provider_runtime_config",
+  "settings_save_providers",
+  "settings_save_system",
+  "settings_save_projects",
+  "workspace_register_project",
+  "settings_save_mcp",
+  "settings_save_agents"
+]
+
+[[permission]]
+identifier = "allow-mcp-runtime"
+description = "Allow using native MCP servers selected from protected local settings"
+commands.allow = [
+  "mcp_list_tools",
+  "mcp_call_tool",
+  "mcp_runtime_status",
+  "mcp_test_server",
+  "mcp_stop_server",
+  "mcp_restart_server"
+]
+
+[[permission]]
+identifier = "allow-mcp-registry"
+description = "Allow read-only discovery through the official MCP Registry"
+commands.allow = [
+  "mcp_registry_list",
+  "mcp_registry_get",
+  "mcp_registry_remote_draft"
+]
+
+[[permission]]
+identifier = "allow-local-services"
+description = "Allow local Skills, durable Memory, and scoped Cron management"
+commands.allow = [
+  "skills_list",
+  "skills_read",
+  "skills_enable",
+  "skills_disable",
+  "skills_install_pick",
+  "memory_create",
+  "memory_agent_create",
+  "memory_read",
+  "memory_list",
+  "memory_update",
+  "memory_delete",
+  "memory_search",
+  "memory_stats",
+  "memory_clear",
+  "memory_organize",
+  "memory_export",
+  "memory_usage_export",
+  "knowledge_base_pick_folder",
+  "knowledge_base_list",
+  "knowledge_base_set_enabled",
+  "knowledge_base_refresh",
+  "knowledge_base_remove",
+  "knowledge_base_search",
+  "knowledge_base_read",
+  "knowledge_base_agent_begin",
+  "knowledge_base_agent_search",
+  "knowledge_base_agent_read",
+  "cron_schedule_validate",
+  "cron_list",
+  "cron_upsert",
+  "cron_set_enabled",
+  "cron_delete",
+  "cron_runs",
+  "cron_run_now"
+]
+
+[[permission]]
+identifier = "allow-skills-catalog"
+description = "Allow explicit discovery and confirmed installation from the official ClawHub Skills catalog"
+commands.allow = [
+  "skills_catalog_list",
+  "skills_catalog_search",
+  "skills_catalog_detail",
+  "skills_catalog_install"
+]
+
+[[permission]]
+identifier = "allow-chat-history"
+description = "Allow local conversation history operations"
+commands.allow = [
+  "workspace_paths_status",
+  "sessions_relocate_workspace",
+  "sessions_relocate_workspace_cancel",
+  "chat_history_get",
+  "chat_history_search",
+  "session_metadata_search",
+  "chat_history_trace_get",
+  "chat_history_rename",
+  "chat_history_set_pinned",
+  "chat_history_set_model",
+  "chat_history_set_archived",
+  "chat_history_bulk_set_archived",
+  "chat_history_branch",
+  "chat_history_delete",
+  "chat_history_bulk_delete",
+  "history_context_load"
+]
+
+[[permission]]
+identifier = "allow-context-compaction"
+description = "Allow an explicit, recoverable local context compaction for the active session"
+commands.allow = [
+  "history_context_compaction_source_load",
+  "session_context_compaction_set",
+  "session_context_compaction_clear"
+]
+
+[[permission]]
+identifier = "allow-composer-media"
+description = "Allow session-bound native composer media staging, loading, and cleanup"
+commands.allow = [
+  "composer_pick_attachments",
+  "composer_stage_pasted_image",
+  "composer_media_load",
+  "composer_media_discard"
+]
+
+[[permission]]
+identifier = "allow-workspace-tools"
+description = "Allow workspace-scoped file and shell operations"
+commands.allow = [
+  "fs_read_text",
+  "fs_grep",
+  "fs_write_text",
+  "fs_edit_text",
+  "fs_delete",
+  "fs_list",
+  "workspace_capability_issue",
+  "shell_run",
+  "shell_cancel"
+]
+
+[[permission]]
+identifier = "allow-global-read"
+description = "Allow the Agent's read-only GlobalRead command for absolute files outside the project"
+commands.allow = ["fs_read_global_text"]
+
+[[permission]]
+identifier = "allow-proxy-server-info"
+description = "Allow reading and retrying redacted provider proxy availability"
+commands.allow = ["proxy_runtime_status", "proxy_runtime_retry"]
+
+[[permission]]
+identifier = "allow-browser-runtime"
+description = "Allow the NovaVei main renderer to control the isolated side browser and Agent browser tools"
+commands.allow = [
+  "browser_open",
+  "browser_layout",
+  "browser_back",
+  "browser_reload",
+  "browser_status",
+  "browser_agent_navigate",
+  "browser_agent_snapshot",
+  "browser_agent_click",
+  "browser_agent_type"
+]

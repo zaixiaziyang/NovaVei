@@ -1,0 +1,55 @@
+name: Dependency security
+
+on:
+  pull_request:
+  schedule:
+    # Monday 03:17 Asia/Shanghai (Sunday 19:17 UTC).
+    - cron: "17 19 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  npm-production-audit:
+    name: npm production dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 24.18.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.18.0
+
+      - name: Use npm 11.16.0
+        run: npm install --global npm@11.16.0
+
+      - name: Audit production dependencies from the committed lockfile
+        run: npm audit --package-lock-only --omit=dev --audit-level=high
+
+      - name: Audit the complete build lockfile
+        run: npm audit --package-lock-only --audit-level=high
+
+  rustsec-audit:
+    name: RustSec advisory audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Scan the committed Rust lockfile
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: src-tauri

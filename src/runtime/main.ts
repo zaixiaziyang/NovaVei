@@ -1,0 +1,225 @@
+import { PiRuntimeController } from "./controller";
+import { installOverlayAccessibility } from "./accessibility";
+import { installAppDialogs } from "./app-dialogs";
+import { installComposerAttachments } from "./attachments";
+import { installBrowser } from "./browser";
+import { installTranscriptNavigation } from "./chat-navigation";
+import { installComposerCommands } from "./composer-commands";
+import { createDomPiRuntime } from "./dom";
+import { createEmbeddedPiTransport } from "./embedded";
+import { installGoals } from "./goals";
+import { installHistorySearch } from "./history-search";
+import { installNativeShell } from "./host";
+import { installLocalServices } from "./local-services";
+import { installPermissionPicker } from "./permission-picker";
+import { installStorageModeSettings } from "./portable-mode";
+import { installPortableStorageGate } from "./portable-storage";
+import {
+  getComposerModelLabel,
+  getComposerPermissionLabel,
+} from "./shell-chrome";
+import type { PiRuntimePublicApi } from "./types";
+import { installWorkbench } from "./workbench";
+import { installPiWorkflows } from "./workflows";
+
+// Ownership map (TypeScript entry owns runtime wiring; HTML owns visual chrome):
+// - installAppDialogs / installPermissionPicker / installNativeShell /
+//   installComposerSubmitBridge: this file
+// - permission picker DOM markup: index.html; wiring: permission-picker.ts
+// - durable history + DPAPI transcripts: native backend (history_store / secret_store)
+
+function toast(message: string) {
+  const target = document.getElementById("toast");
+  if (!target) {
+    console.warn("[NovaVei Pi]", message);
+    return;
+  }
+  target.textContent = message;
+  target.classList.add("show");
+  window.setTimeout(() => target.classList.remove("show"), 2200);
+}
+
+/**
+ * The visual shell is still an HTML-first design surface.  Keep its submit
+ * interception in the TypeScript entry rather than in an injected inline
+ * Tauri bridge, so design-sync tooling can retain one stable module entry.
+ */
+function installComposerSubmitBridge(runtime: PiRuntimePublicApi) {
+  const form = document.getElementById("composerForm");
+  const input = document.getElementById(
+    "composerInput",
+  ) as HTMLTextAreaElement | null;
+  if (!(form instanceof HTMLFormElement) || !input) return;
+  if (form.dataset.novaveiPiSubmitBound === "true") return;
+  form.dataset.novaveiPiSubmitBound = "true";
+  const commands = installComposerCommands({ form, input });
+  let commandPreparation: Promise<unknown> | undefined;
+
+  form.addEventListener(
+    "submit",
+    (event) => {
+      // The design HTML also provides a browser-preview submit handler.  A
+      // capture listener makes the real desktop path win without changing the
+      // preview's standalone behavior.
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      const state = runtime.getState();
+      if (
+        [
+          "starting",
+          "running",
+          "waiting_permission",
+          "cancelling",
+          "cancel_failed",
+        ].includes(state.status)
+      ) {
+        // Enter must have the same safe meaning as the visible send control
+        // while a turn is active: stop it (or retry a failed stop), never
+        // silently replace its active request with a new prompt.
+        if (state.status !== "cancelling") {
+          void runtime
+            .cancel()
+            .catch((error) =>
+              toast(error instanceof Error ? error.message : String(error)),
+            );
+        }
+        return;
+      }
+      const providerState = form.dataset.novaveiProviderState;
+      if (
+        providerState &&
+        providerState !== "ready" &&
+        providerState !== "preview"
+      ) {
+        if (providerState === "loading") {
+          // A disabled button does not dispatch a synthetic click, so Enter
+          // needs its own feedback while the provider catalog is loading.
+          toast(
+            document.documentElement.lang.toLowerCase().startsWith("en")
+              ? "Loading provider settings. Please wait."
+              : "正在读取供应商设置，请稍候",
+          );
+          return;
+        }
+        // Delegate to the Composer's provider-aware click handler so the
+        // keyboard path opens the same Settings → Providers recovery route.
+        (
+          document.getElementById("btnSend") as HTMLButtonElement | null
+        )?.click();
+        return;
+      }
+      const text = input.value.trim();
+      const hasAttachments =
+        window.__novaveiComposerAttachments?.has?.() === true;
+      if (!text && !hasAttachments) {
+        toast("先输入内容或添加附件");
+        return;
+      }
+      if (commandPreparation) return;
+      const preparation = commands
+        .prepare(text || "请分析所附文件。")
+        .then((command) => {
+          if (!command) return undefined;
+          if ("handled" in command) {
+            input.value = "";
+            // Keep the slash-menu projection and its ARIA state in sync after
+            // a local-only command completes without starting a Pi turn.
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            toast(command.message);
+            return undefined;
+          }
+          return runtime.submit({
+            ...command,
+            permission: getComposerPermissionLabel(),
+            model: getComposerModelLabel(),
+          });
+        })
+        .catch((error) =>
+          toast(error instanceof Error ? error.message : String(error)),
+        );
+      commandPreparation = preparation;
+      void preparation.finally(() => {
+        if (commandPreparation === preparation) commandPreparation = undefined;
+      });
+    },
+    true,
+  );
+
+  // Ctrl/Cmd+Enter submits (or stops) from the composer textarea. Plain Enter
+  // remains a newline so multi-line prompts stay easy to write.
+  input.addEventListener(
+    "keydown",
+    (event) => {
+      if (
+        event.key !== "Enter" ||
+        !(event.ctrlKey || event.metaKey) ||
+        event.isComposing
+      )
+        return;
+      if (event.altKey || event.shiftKey) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (typeof form.requestSubmit === "function") {
+        form.requestSubmit();
+        return;
+      }
+      form.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+    },
+    true,
+  );
+}
+
+async function install() {
+  // The gate intentionally precedes every stateful runtime bridge. A locked
+  // portable drive must not hydrate sessions/settings or start an agent until
+  // the password-derived key is available in native memory.
+  if (!(await installPortableStorageGate())) return;
+  // Shared confirm / prompt / error dialogs must bind before any feature that
+  // might open them. Also exposes window.__novaveiDialogs for the large HTML
+  // surface that cannot import modules directly.
+  installAppDialogs();
+  installStorageModeSettings();
+  // The permission picker owns its own popover interactions; Full
+  // confirmation itself is deliberately performed by the native host
+  // immediately before run.
+  installPermissionPicker();
+  // Install the concrete Pi host before the controller subscribes. The
+  // transport owns the Agent and provider stream; Tauri remains its
+  // capability boundary. No separate agent process is started.
+  const embedded = createEmbeddedPiTransport();
+  window.__novaveiPiEmbedded = embedded;
+  const controller = new PiRuntimeController(embedded);
+  installOverlayAccessibility();
+  const runtime = createDomPiRuntime(controller);
+  window.__novaveiPiRuntime = runtime as PiRuntimePublicApi;
+  (
+    window as Window & { __novaveiPiController?: PiRuntimeController }
+  ).__novaveiPiController = controller;
+  installNativeShell();
+  installTranscriptNavigation();
+  installHistorySearch();
+  installGoals();
+  installWorkbench();
+  installBrowser();
+  installComposerAttachments();
+  installPiWorkflows();
+  installLocalServices();
+  installComposerSubmitBridge(runtime);
+  void controller.ready.catch((error) => {
+    console.warn("[NovaVei Pi] transport initialization failed", error);
+  });
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener(
+    "DOMContentLoaded",
+    () => {
+      void install();
+    },
+    { once: true },
+  );
+} else {
+  void install();
+}

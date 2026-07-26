@@ -1,0 +1,68 @@
+[package]
+name = "novavei-agent"
+version = "0.1.0"
+description = "NovaVei desktop shell (Luminous Quiet)"
+authors = ["NovaVei"]
+edition = "2021"
+rust-version = "1.85"
+
+[lib]
+name = "novavei_agent_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# Keep the desktop runtime on normal builds while allowing the native unit
+# tests to avoid loading the Wry/WebView2 event-loop stack.
+default = ["desktop"]
+desktop = [
+    "tauri/wry",
+    "tauri/unstable",
+    "tauri/compression",
+    "tauri/common-controls-v6",
+    "tauri/dynamic-acl",
+    "tauri/x11",
+    "tauri/dbus",
+]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# `test` provides tauri::test::mock_builder without pulling in the production
+# Wry runtime. The package's default `desktop` feature above restores the
+# complete Tauri default desktop feature set for ordinary builds.
+tauri = { version = "2", default-features = false, features = ["test"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+parking_lot = "0.12"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+globset = "0.4"
+regex = "1"
+walkdir = "2"
+axum = "0.8.4"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream", "system-proxy", "json"] }
+sha2 = "0.10"
+aes-gcm = "0.10.3"
+argon2 = "0.6.0-rc.8"
+getrandom = "0.2"
+tokio = { version = "1.52", features = ["macros", "net", "rt", "sync", "time", "io-util"] }
+tower = { version = "0.5", features = ["util"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["json"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging"] }
+rfd = { version = "0.16", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
