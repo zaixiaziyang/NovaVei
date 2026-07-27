@@ -11547,9 +11547,7 @@ fn validate_picked_workspace_files(
             Some(workdir),
             "selected file",
         )?;
-        let relative = path
-            .strip_prefix(workdir)
-            .map_err(|_| "selected file is outside the session workspace".to_string())?;
+        let relative = workspace_relative_path(&path, workdir, "selected file")?;
         let logical = relative
             .to_str()
             .filter(|value| !value.is_empty())
@@ -12276,21 +12274,7 @@ fn open_regular_file_no_follow(path: &Path, label: &str) -> Result<fs::File, Str
 /// The later handle checks remain necessary because a hostile process can
 /// still change a path after this inspection.
 fn reject_workspace_path_links(path: &Path, workdir: &Path, label: &str) -> Result<(), String> {
-    // Windows canonicalization commonly returns a verbatim `\\?\` root while
-    // a native picker returns the ordinary drive/UNC spelling. Normalize only
-    // that lexical representation for the prefix check; the original path is
-    // still opened with no-follow and resolved before and after the open.
-    #[cfg(windows)]
-    let comparable_path = PathBuf::from(path_for_display(path));
-    #[cfg(windows)]
-    let comparable_workdir = PathBuf::from(path_for_display(workdir));
-    #[cfg(not(windows))]
-    let comparable_path = path;
-    #[cfg(not(windows))]
-    let comparable_workdir = workdir;
-    let relative = comparable_path
-        .strip_prefix(comparable_workdir)
-        .map_err(|_| format!("{label} is outside the session workspace"))?;
+    let relative = workspace_relative_path(path, workdir, label)?;
     let mut component = workdir.to_path_buf();
     for part in relative.components() {
         match part {
@@ -12307,6 +12291,39 @@ fn reject_workspace_path_links(path: &Path, workdir: &Path, label: &str) -> Resu
         }
     }
     Ok(())
+}
+
+/// Return a component-aware workspace-relative path after reconciling the
+/// equivalent Windows spellings that `canonicalize` and native file pickers
+/// can produce. The fallback is comparison-only: callers still perform their
+/// no-follow, reparse-point, opened-handle, and post-open checks using the
+/// original paths.
+fn workspace_relative_path(path: &Path, workdir: &Path, label: &str) -> Result<PathBuf, String> {
+    if let Ok(relative) = path.strip_prefix(workdir) {
+        return Ok(relative.to_path_buf());
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows filesystems compare ordinary drive and UNC paths without
+        // case sensitivity, while `Path::strip_prefix` can observe a raw
+        // canonical root beside an ordinary picker path. Normalize only for
+        // comparison and retain component boundaries to prevent sibling roots
+        // such as `C:\workspace-other` from matching `C:\workspace`.
+        let comparable_path = PathBuf::from(normalize_windows_workspace_path_key(
+            &path_for_display(path),
+        ));
+        let comparable_workdir = PathBuf::from(normalize_windows_workspace_path_key(
+            &path_for_display(workdir),
+        ));
+        comparable_path
+            .strip_prefix(&comparable_workdir)
+            .map(Path::to_path_buf)
+            .map_err(|_| format!("{label} is outside the session workspace"))
+    }
+
+    #[cfg(not(windows))]
+    Err(format!("{label} is outside the session workspace"))
 }
 
 /// Open a regular file from a checked handle. Both the lexical path and the
@@ -12328,8 +12345,8 @@ fn open_checked_regular_file(
         ));
     }
     let canonical = fs::canonicalize(path).map_err(|error| format!("resolve {label}: {error}"))?;
-    if required_root.is_some_and(|root| !canonical.starts_with(root)) {
-        return Err(format!("{label} is outside the session workspace"));
+    if let Some(root) = required_root {
+        workspace_relative_path(&canonical, root, label)?;
     }
 
     // Open the original lexical name rather than its resolved spelling. This
@@ -12351,8 +12368,8 @@ fn open_checked_regular_file(
     // The opened descriptor is never read until the root check has passed.
     let resolved_after_open =
         fs::canonicalize(path).map_err(|error| format!("resolve opened {label}: {error}"))?;
-    if required_root.is_some_and(|root| !resolved_after_open.starts_with(root)) {
-        return Err(format!("{label} is outside the session workspace"));
+    if let Some(root) = required_root {
+        workspace_relative_path(&resolved_after_open, root, label)?;
     }
     Ok((resolved_after_open, file, opened_metadata))
 }
@@ -12661,9 +12678,10 @@ pub async fn composer_pick_attachments(
                 "only UTF-8 workspace files and safe image/audio/video attachments are supported"
                     .to_string()
             })?;
-            let relative = path.strip_prefix(&canonical_workdir).map_err(|_| {
-                "text attachments must stay inside the session workspace".to_string()
-            })?;
+            let relative = workspace_relative_path(&path, &canonical_workdir, "text attachment")
+                .map_err(|_| {
+                    "text attachments must stay inside the session workspace".to_string()
+                })?;
             let logical = relative
                 .to_str()
                 .filter(|value| !value.is_empty())
@@ -21958,6 +21976,20 @@ mod tests {
         assert!(validate_picked_workspace_files(&canonical, vec![outside.clone()]).is_err());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_file(outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn workspace_relative_path_reconciles_verbatim_and_picker_paths() {
+        let root = PathBuf::from(r"\\?\C:\workspace");
+        let selected = PathBuf::from(r"C:\WORKSPACE\nested\file.txt");
+        let sibling = PathBuf::from(r"C:\workspace-other\file.txt");
+
+        assert_eq!(
+            workspace_relative_path(&selected, &root, "selected file").unwrap(),
+            PathBuf::from(r"nested\file.txt")
+        );
+        assert!(workspace_relative_path(&sibling, &root, "selected file").is_err());
     }
 
     #[test]

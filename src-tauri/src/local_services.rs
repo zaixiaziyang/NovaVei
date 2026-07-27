@@ -38,6 +38,13 @@ use crate::secret_store::{
     unprotect_portable_local_service_text, unprotect_settings,
 };
 
+fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    Sha256::digest(bytes.as_ref())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 const DATABASE_FILE: &str = "local-services.sqlite3";
 const SKILLS_DIRECTORY: &str = "skills";
 const STAGING_DIRECTORY: &str = ".staging";
@@ -2230,7 +2237,7 @@ fn verify_catalog_file(file: &ClawHubFile, bytes: &[u8]) -> Result<(), String> {
             file.path
         ));
     }
-    let actual = format!("{:x}", Sha256::digest(bytes));
+    let actual = sha256_hex(bytes);
     if !actual.eq_ignore_ascii_case(&file.sha256) {
         return Err(format!(
             "ClawHub file {} did not match its advertised SHA-256 hash",
@@ -5094,7 +5101,7 @@ fn scan_knowledge_base_file(
         extension,
         size_bytes,
         modified_at,
-        content_hash: format!("{:x}", Sha256::digest(content.as_bytes())),
+        content_hash: sha256_hex(content.as_bytes()),
         content,
     }))
 }
@@ -6482,7 +6489,7 @@ fn show_native_cron_confirmation(
     // private, target-bound approval capability above.
     let response = unsafe {
         MessageBoxW(
-            0,
+            std::ptr::null_mut(),
             description.as_ptr(),
             title.as_ptr(),
             MB_OKCANCEL | MB_ICONWARNING,
@@ -6580,7 +6587,7 @@ fn cron_native_confirmation_description(
         "prompt" => {
             let payload = serde_json::from_value::<PromptCronPayload>(payload.clone())
                 .map_err(|_| "stored Prompt Cron payload is invalid".to_string())?;
-            let prompt_digest = format!("{:x}", Sha256::digest(payload.prompt.as_bytes()));
+            let prompt_digest = sha256_hex(payload.prompt.as_bytes());
             let workdir = payload
                 .workdir
                 .as_deref()
@@ -6604,7 +6611,7 @@ fn cron_native_confirmation_description(
         "shell" => {
             let payload = serde_json::from_value::<ShellCronPayload>(payload.clone())
                 .map_err(|_| "stored Shell Cron payload is invalid".to_string())?;
-            let command_digest = format!("{:x}", Sha256::digest(payload.command.as_bytes()));
+            let command_digest = sha256_hex(payload.command.as_bytes());
             Ok(format!(
                 "{action} this Shell Cron job?\n\nName: {name}\nSchedule: {schedule}\nWorkdir: {}\n\nIt runs the following command with your current Windows user permissions:\n\n{}\n\nExact command SHA-256: {command_digest}\n\nChoose OK only if this exact command, schedule, and workdir are expected.{save_notice}",
                 native_cron_dialog_preview(&payload.workdir, 512),
@@ -6615,7 +6622,7 @@ fn cron_native_confirmation_description(
             let payload = serde_json::from_value::<HttpCronPayload>(payload.clone())
                 .map_err(|_| "stored HTTP Cron payload is invalid".to_string())?;
             let request_digest = serde_json::to_vec(&payload)
-                .map(|encoded| format!("{:x}", Sha256::digest(encoded)))
+                .map(sha256_hex)
                 .map_err(|_| "serialize HTTP Cron confirmation request".to_string())?;
             let body_bytes = payload.body.as_deref().map_or(0, str::len);
             Ok(format!(
@@ -8773,12 +8780,20 @@ mod tests {
     }
 
     #[test]
+    fn sha256_hex_preserves_lowercase_64_character_digest_format() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
     fn clawhub_catalog_verifies_exact_file_hashes_and_reports_redirects() {
         let bytes = b"verified Skill file";
         let file = ClawHubFile {
             path: "SKILL.md".to_string(),
             size: bytes.len() as u64,
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: sha256_hex(bytes),
         };
         assert!(verify_catalog_file(&file, bytes).is_ok());
         assert!(verify_catalog_file(&file, b"changed Skill file")
@@ -9685,7 +9700,7 @@ mod tests {
     #[test]
     fn cron_prompt_confirmation_discloses_review_metadata_without_prompt_text_or_credentials() {
         let prompt = "Summarize this private value: test-credential-marker";
-        let prompt_digest = format!("{:x}", Sha256::digest(prompt.as_bytes()));
+        let prompt_digest = sha256_hex(prompt.as_bytes());
         let description = cron_native_confirmation_description(
             CronDangerousOperation::Enable,
             "prompt",

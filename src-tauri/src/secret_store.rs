@@ -175,7 +175,7 @@ pub fn unlock_portable_storage(
                 "portable recovery questions are required when creating portable data".to_string()
             })?;
             let mut key = [0_u8; PORTABLE_KEY_BYTES];
-            getrandom::getrandom(&mut key)
+            getrandom::fill(&mut key)
                 .map_err(|_| "generate portable storage key failed".to_string())?;
             let config = new_portable_key_file(&key, password, &recovery)?;
             fs::create_dir_all(crate::storage::application_data_dir())
@@ -232,7 +232,7 @@ pub fn recover_portable_storage(
     };
     let key = unwrap_recovery_key(&config, answers)?;
     let mut password_salt = [0_u8; PORTABLE_SALT_BYTES];
-    getrandom::getrandom(&mut password_salt)
+    getrandom::fill(&mut password_salt)
         .map_err(|_| "generate portable storage salt failed".to_string())?;
     let mut password_key = derive_portable_key(new_password.as_bytes(), &password_salt)?;
     config.password_salt = hex_encode(&password_salt);
@@ -625,9 +625,9 @@ fn new_portable_key_file(
     validate_recovery_setup(recovery)?;
     let mut password_salt = [0_u8; PORTABLE_SALT_BYTES];
     let mut recovery_salt = [0_u8; PORTABLE_SALT_BYTES];
-    getrandom::getrandom(&mut password_salt)
+    getrandom::fill(&mut password_salt)
         .map_err(|_| "generate portable storage salt failed".to_string())?;
-    getrandom::getrandom(&mut recovery_salt)
+    getrandom::fill(&mut recovery_salt)
         .map_err(|_| "generate portable storage salt failed".to_string())?;
     let mut password_key = derive_portable_key(password.as_bytes(), &password_salt)?;
     let mut recovery_key = derive_recovery_key(&recovery.answers, &recovery_salt)?;
@@ -709,7 +709,7 @@ fn replace_portable_key_file(
             .map_err(|_| "back up portable storage configuration failed".to_string())?;
     }
     let mut random = [0_u8; 8];
-    getrandom::getrandom(&mut random)
+    getrandom::fill(&mut random)
         .map_err(|_| "generate portable storage temporary name failed".to_string())?;
     let temporary = parent.join(format!(".portable-{}.tmp", hex_encode(&random)));
     let write_result = (|| -> Result<(), String> {
@@ -787,14 +787,15 @@ fn encrypt_portable_bytes(
 ) -> Result<String, String> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|_| "initialize portable storage encryption failed".to_string())?;
-    let mut nonce = [0_u8; PORTABLE_NONCE_BYTES];
-    getrandom::getrandom(&mut nonce)
+    let mut nonce_bytes = [0_u8; PORTABLE_NONCE_BYTES];
+    getrandom::fill(&mut nonce_bytes)
         .map_err(|_| "generate portable storage nonce failed".to_string())?;
+    let nonce = Nonce::from(nonce_bytes);
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|_| "encrypt portable storage data failed".to_string())?;
-    let mut payload = Vec::with_capacity(nonce.len().saturating_add(ciphertext.len()));
-    payload.extend_from_slice(&nonce);
+    let mut payload = Vec::with_capacity(nonce_bytes.len().saturating_add(ciphertext.len()));
+    payload.extend_from_slice(&nonce_bytes);
     payload.extend_from_slice(&ciphertext);
     Ok(hex_encode(&payload))
 }
@@ -809,11 +810,12 @@ fn decrypt_portable_bytes(
     }
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|_| "initialize portable storage encryption failed".to_string())?;
+    let nonce_bytes: [u8; PORTABLE_NONCE_BYTES] = payload[..PORTABLE_NONCE_BYTES]
+        .try_into()
+        .map_err(|_| "portable storage ciphertext is invalid".to_string())?;
+    let nonce = Nonce::from(nonce_bytes);
     cipher
-        .decrypt(
-            Nonce::from_slice(&payload[..PORTABLE_NONCE_BYTES]),
-            &payload[PORTABLE_NONCE_BYTES..],
-        )
+        .decrypt(&nonce, &payload[PORTABLE_NONCE_BYTES..])
         .map_err(|_| "portable storage password is incorrect or data is damaged".to_string())
 }
 
@@ -828,7 +830,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
-    if value.is_empty() || value.len() % 2 != 0 {
+    if value.is_empty() || !value.len().is_multiple_of(2) {
         return Err("invalid DPAPI ciphertext".to_string());
     }
     let bytes = value.as_bytes();
@@ -1044,6 +1046,24 @@ mod tests {
         let last = tampered.len() - 1;
         tampered[last] = if tampered[last] == b'0' { b'1' } else { b'0' };
         assert!(decrypt_portable_bytes(&key, std::str::from_utf8(&tampered).unwrap()).is_err());
+    }
+
+    #[test]
+    fn portable_envelope_preserves_the_existing_nonce_ciphertext_layout() {
+        // NIST AES-256-GCM vector: a 12-byte nonce followed by ciphertext and
+        // authentication tag. Portable data created before the dependency
+        // upgrade uses this exact byte layout.
+        let key = [0_u8; PORTABLE_KEY_BYTES];
+        let encoded = concat!(
+            "000000000000000000000000",
+            "cea7403d4d606b6e074ec5d3baf39d18",
+            "d0d1c8a799996bf0265b98b5d48ab919"
+        );
+
+        assert_eq!(
+            decrypt_portable_bytes(&key, encoded).unwrap(),
+            vec![0_u8; 16]
+        );
     }
 
     #[test]
