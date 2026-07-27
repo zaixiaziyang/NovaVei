@@ -21970,7 +21970,9 @@ mod tests {
         fs::write(&inside, "hello").unwrap();
         fs::write(&outside, "outside").unwrap();
         let canonical = canonical_workdir(&root.display().to_string()).unwrap();
-        let selected = validate_picked_workspace_files(&canonical, vec![fs::canonicalize(&inside).unwrap()]).unwrap();
+        let selected =
+            validate_picked_workspace_files(&canonical, vec![fs::canonicalize(&inside).unwrap()])
+                .unwrap();
         assert_eq!(selected[0].path, "nested/file.txt");
         assert_eq!(selected[0].name, "file.txt");
         assert!(validate_picked_workspace_files(&canonical, vec![outside.clone()]).is_err());
