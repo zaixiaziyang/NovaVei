@@ -44,6 +44,14 @@ pub struct HistoryDiagnosticsSummary {
     pub latest_turn_started_at: Option<i64>,
 }
 
+/// SQLite INTEGER values are signed. Counts must never be negative, so decode
+/// them as `i64` and reject malformed database contents instead of relying on
+/// a lossy or version-specific unsigned conversion.
+fn nonnegative_sqlite_count(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    let count: i64 = row.get(index)?;
+    u64::try_from(count).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, count))
+}
+
 #[derive(Clone, Debug)]
 pub struct StoredSession {
     pub id: String,
@@ -194,7 +202,7 @@ impl HistoryStore {
         let connection = self.open()?;
         let session_count = connection
             .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
-                row.get::<_, u64>(0)
+                nonnegative_sqlite_count(row, 0)
             })
             .map_err(|error| format!("count diagnostic sessions: {error}"))?;
         let (turn_count, oldest_turn_started_at, latest_turn_started_at) = connection
@@ -203,7 +211,7 @@ impl HistoryStore {
                 [],
                 |row| {
                     Ok((
-                        row.get::<_, u64>(0)?,
+                        nonnegative_sqlite_count(row, 0)?,
                         row.get::<_, Option<i64>>(1)?,
                         row.get::<_, Option<i64>>(2)?,
                     ))
@@ -215,7 +223,7 @@ impl HistoryStore {
             .map_err(|error| format!("prepare diagnostic turn statuses: {error}"))?;
         let statuses = statement
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+                Ok((row.get::<_, String>(0)?, nonnegative_sqlite_count(row, 1)?))
             })
             .map_err(|error| format!("query diagnostic turn statuses: {error}"))?;
         let mut turn_status_counts = BTreeMap::new();
