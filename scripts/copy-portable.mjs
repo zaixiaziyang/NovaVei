@@ -8,7 +8,6 @@ const root = path.resolve(path.dirname(scriptPath), "..");
 const expectedFileNames = [
   "NovaVei-portable.exe",
   "NovaVei-portable.manifest.json",
-  "novavei-portable.json",
 ];
 export { expectedFileNames };
 
@@ -60,7 +59,6 @@ export function stagePortablePackage({
   try {
     const dest = path.join(stagingDir, expectedFileNames[0]);
     const manifestPath = path.join(stagingDir, expectedFileNames[1]);
-    const portableMarkerPath = path.join(stagingDir, expectedFileNames[2]);
     fs.copyFileSync(source, dest, fs.constants.COPYFILE_EXCL);
     const st = fs.statSync(dest);
     const sha256 = createHash("sha256")
@@ -73,7 +71,10 @@ export function stagePortablePackage({
       sizeBytes: st.size,
       sha256,
       runtime: "embedded-webview-pi",
-      storageMode: "portable",
+      // A portable-capable EXE starts in the installed storage mode. The user
+      // explicitly enables EXE-adjacent encrypted storage from Settings, which
+      // creates the marker only for the following launch.
+      storageMode: "installed",
       sidecars: [],
       createdAt,
     };
@@ -82,12 +83,6 @@ export function stagePortablePackage({
       `${JSON.stringify(manifest, null, 2)}\n`,
       "utf8",
     );
-    fs.writeFileSync(
-      portableMarkerPath,
-      `${JSON.stringify({ schemaVersion: 1, mode: "portable" }, null, 2)}\n`,
-      "utf8",
-    );
-
     const stagedEntries = fs.readdirSync(stagingDir, { withFileTypes: true });
     const stagedNames = stagedEntries.map((entry) => entry.name).sort();
     const expectedNames = [...expectedFileNames].sort();
@@ -103,7 +98,6 @@ export function stagePortablePackage({
       outDir,
       executablePath: path.join(outDir, expectedFileNames[0]),
       manifestPath: path.join(outDir, expectedFileNames[1]),
-      markerPath: path.join(outDir, expectedFileNames[2]),
       sizeBytes: st.size,
       sha256,
     };
@@ -139,7 +133,7 @@ function main() {
   console.log("size_mb:", (result.sizeBytes / 1024 / 1024).toFixed(2));
   console.log("sha256:", result.sha256);
   console.log("manifest:", result.manifestPath);
-  console.log("portable_marker:", result.markerPath);
+  console.log("first_launch_storage_mode:", "installed");
 }
 
 if (

@@ -285,7 +285,17 @@ export type LiveTranscriptMessage = {
   sessionId: string;
   role: "user" | "assistant";
   content: string;
+  /**
+   * Provider reasoning is kept alongside the optimistic assistant projection
+   * so a virtual-transcript rebuild cannot make an already-visible thinking
+   * disclosure disappear before durable history catches up.
+   */
+  thinking?: string;
+  /** Renderer-visible tool summary for this assistant turn. */
+  tools?: readonly PiToolState[];
   createdAt: number;
+  /** Terminal display time; unlike createdAt this is stable once assigned. */
+  finishedAt?: number;
   requestId?: string;
   turnId?: string;
   model?: string;
@@ -314,7 +324,9 @@ export type PiRuntimePublicApi = {
   submit(
     input: Omit<PiRunInput, "requestId">,
   ): Promise<PiRunResult | undefined>;
-  cancel(): Promise<void>;
+  /** A direct stop pauses queued prompts; the Composer stop button opts into
+   * continuing the next prompt after the current cancellation settles. */
+  cancel(options?: { resumeQueuedPrompt?: boolean }): Promise<void>;
   answerPermission(decision: PermissionDecision): Promise<void>;
   answerPlanConfirmation(
     decision: PiPlanConfirmationDecision,

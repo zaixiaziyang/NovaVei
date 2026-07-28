@@ -665,13 +665,15 @@ function installServiceStyles() {
   if (document.getElementById("novaveiLocalServicesStyles")) return;
   const style = element("style", { id: "novaveiLocalServicesStyles" });
   style.textContent = `
-    .novavei-service-status { margin: 0; color: var(--subtle); font-size: 12px; line-height: 1.45; }
+    .novavei-service-status { margin: 0; color: var(--subtle); font-size: var(--text-sm); line-height: 1.45; }
     .novavei-service-status[data-service-status="error"] { color: var(--danger); }
     .novavei-service-status[data-service-status="success"] { color: var(--success); }
     #overlaySkills .overlay-body, #overlayMcp .overlay-body { display: flex; overflow: hidden; }
+    #overlaySkills .hub-grid, #overlayMcp .hub-grid { flex: 1 1 auto; min-width: 0; }
     .novavei-service-hub { display: flex; flex: 1 1 auto; flex-direction: column; gap: 12px; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+    .novavei-skills-hub, .novavei-mcp-hub { grid-column: 1 / -1; width: 100%; }
     .novavei-service-panel { min-width: 0; min-height: 0; }
-    .novavei-service-panel-heading { margin: 0; color: var(--text); font-size: 13px; font-weight: 650; letter-spacing: -.01em; }
+    .novavei-service-panel-heading { margin: 0; color: var(--text); font-size: var(--text-base); font-weight: 650; letter-spacing: -.01em; }
     .novavei-skills-workbench { display: grid; flex: 1 1 440px; grid-template-columns: minmax(236px, .78fr) minmax(0, 1.42fr); min-height: 360px; overflow: hidden; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--glass); box-shadow: var(--shadow-sm); }
     .novavei-skills-local-panel, .novavei-skills-store-panel { display: flex; flex-direction: column; gap: 12px; min-width: 0; min-height: 0; padding: 14px; }
     .novavei-skills-local-panel { border-right: 1px solid var(--line); background: color-mix(in srgb, var(--panel-deep) 72%, transparent); }
@@ -684,72 +686,72 @@ function installServiceStyles() {
     .novavei-mcp-workbench { display: grid; grid-template-columns: minmax(220px, 300px) minmax(0, 1fr); min-height: 340px; overflow: hidden; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--glass); box-shadow: var(--shadow-sm); }
     .novavei-mcp-server-panel { display: flex; flex-direction: column; min-width: 0; min-height: 0; border-right: 1px solid var(--line); background: color-mix(in srgb, var(--panel-deep) 72%, transparent); }
     .novavei-mcp-server-panel > header { display: grid; gap: 3px; padding: 13px 14px 10px; border-bottom: 1px solid var(--line); }
-    .novavei-mcp-server-panel > header small { color: var(--subtle); font-size: 11px; line-height: 1.4; }
+    .novavei-mcp-server-panel > header small { color: var(--subtle); font-size: var(--text-xs); line-height: 1.4; }
     .novavei-mcp-server-list { display: grid; align-content: start; gap: 7px; min-height: 0; overflow: auto; padding: 9px; }
-    .novavei-mcp-list-item { display: grid; grid-template-columns: 8px minmax(0, 1fr); align-items: start; gap: 9px; width: 100%; min-height: 64px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--control); color: var(--muted); text-align: left; transition: border-color 160ms var(--ease-out), background-color 160ms var(--ease-out), color 160ms var(--ease-out); }
+    .novavei-mcp-list-item { display: grid; grid-template-columns: 8px minmax(0, 1fr); align-items: start; gap: 9px; width: 100%; min-height: 64px; padding: 10px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--control); color: var(--muted); text-align: left; transition: border-color 160ms var(--ease-out), background-color 160ms var(--ease-out), color 160ms var(--ease-out); }
     .novavei-mcp-list-item:hover:not(:disabled) { border-color: var(--line-strong); background: var(--hover); color: var(--text); }
     .novavei-mcp-list-item.is-selected { border-color: var(--blue-line); background: var(--blue-soft); color: var(--text); box-shadow: inset 3px 0 0 var(--blue); }
     .novavei-mcp-list-item:focus-visible { outline: 3px solid var(--blue-strong); outline-offset: -1px; }
-    .novavei-mcp-list-status { width: 8px; height: 8px; margin-top: 4px; border-radius: 999px; background: var(--subtle); }
+    .novavei-mcp-list-status { width: 8px; height: 8px; margin-top: 4px; border-radius: var(--r-pill); background: var(--subtle); }
     .novavei-mcp-list-status.is-ready { background: var(--success); box-shadow: 0 0 8px color-mix(in srgb, var(--success) 55%, transparent); }
     .novavei-mcp-list-status.is-starting { background: var(--warn); box-shadow: 0 0 8px color-mix(in srgb, var(--warn) 48%, transparent); }
     .novavei-mcp-list-status.is-error { background: var(--danger); }
     .novavei-mcp-list-copy { display: grid; gap: 3px; min-width: 0; }
     .novavei-mcp-list-copy strong, .novavei-mcp-list-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .novavei-mcp-list-copy strong { color: var(--text); font-size: 12px; }
-    .novavei-mcp-list-copy small { color: var(--subtle); font-size: 11px; }
+    .novavei-mcp-list-copy strong { color: var(--text); font-size: var(--text-sm); }
+    .novavei-mcp-list-copy small { color: var(--subtle); font-size: var(--text-xs); }
     .novavei-mcp-detail-panel { min-width: 0; min-height: 0; overflow: auto; padding: 14px; }
     .novavei-mcp-detail-panel > .hub-card { min-height: 100%; }
     .novavei-mcp-registry { margin: 0; }
     .pill.danger { background: color-mix(in srgb, var(--danger) 18%, var(--glass)); color: var(--danger); }
     .novavei-service-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
-    .novavei-service-preview { max-height: 300px; overflow: auto; margin: 8px 0 0; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--code-bg); color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; font: 11.5px/1.5 var(--mono); }
-    .novavei-service-details { margin-top: 4px; color: var(--muted); font-size: 12px; }
+    .novavei-service-preview { max-height: 300px; overflow: auto; margin: 8px 0 0; padding: 10px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--code-bg); color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; font: 11.5px/1.5 var(--mono); }
+    .novavei-service-details { margin-top: 4px; color: var(--muted); font-size: var(--text-sm); }
     .novavei-service-details > summary { cursor: pointer; color: var(--blue-strong); }
     .novavei-service-list { display: grid; gap: 10px; }
     .novavei-service-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
     .novavei-service-row > div { min-width: 0; display: grid; gap: 3px; }
     .novavei-service-row small { overflow-wrap: anywhere; }
-    .novavei-service-note { margin: 0; color: var(--subtle); font-size: 12px; line-height: 1.45; }
-    .novavei-catalog-heading { grid-column: 1 / -1; margin: 8px 0 -2px; color: var(--text); font-size: 13px; font-weight: 650; letter-spacing: -.01em; }
+    .novavei-service-note { margin: 0; color: var(--subtle); font-size: var(--text-sm); line-height: 1.45; }
+    .novavei-catalog-heading { grid-column: 1 / -1; margin: 8px 0 -2px; color: var(--text); font-size: var(--text-base); font-weight: 650; letter-spacing: -.01em; }
     .novavei-catalog-toolbar, .novavei-catalog-detail { grid-column: 1 / -1; display: grid; gap: 10px; }
     .novavei-catalog-toolbar { padding: 12px; border: 1px solid var(--line); border-radius: var(--r-sm); background: color-mix(in srgb, var(--glass) 82%, transparent); }
-    .novavei-catalog-toolbar > p { margin: 0; color: var(--subtle); font-size: 12px; line-height: 1.45; }
+    .novavei-catalog-toolbar > p { margin: 0; color: var(--subtle); font-size: var(--text-sm); line-height: 1.45; }
     .novavei-catalog-form { display: flex; align-items: end; gap: 8px; flex-wrap: wrap; }
-    .novavei-catalog-field { min-width: min(100%, 260px); flex: 1 1 260px; display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
-    .novavei-catalog-field input { min-width: 0; width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: 10px; background: var(--input-deep); color: var(--text); padding: 8px 10px; }
+    .novavei-catalog-field { min-width: min(100%, 260px); flex: 1 1 260px; display: grid; gap: 6px; color: var(--muted); font-size: var(--text-sm); }
+    .novavei-catalog-field input { min-width: 0; width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--input-deep); color: var(--text); padding: 8px 10px; }
     .novavei-catalog-meta { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 0; }
-    .novavei-catalog-risk { display: grid; gap: 6px; margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--code-bg); color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .novavei-catalog-risk { display: grid; gap: 6px; margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--code-bg); color: var(--muted); font-size: var(--text-sm); line-height: 1.45; }
     .novavei-catalog-risk[data-risk="blocked"] { border-color: color-mix(in srgb, var(--danger) 62%, var(--line)); color: var(--danger); }
     .novavei-catalog-risk[data-risk="warning"] { border-color: color-mix(in srgb, var(--warning, #F0B429) 55%, var(--line)); }
-    .novavei-catalog-source { color: var(--blue-strong); font-size: 12px; overflow-wrap: anywhere; }
+    .novavei-catalog-source { color: var(--blue-strong); font-size: var(--text-sm); overflow-wrap: anywhere; }
     .novavei-catalog-section-status { grid-column: 1 / -1; }
     .novavei-service-dialog { width: min(640px, calc(100vw - 32px)); max-height: min(760px, calc(100dvh - 32px)); overflow: auto; padding: 0; color: var(--text); border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--glass-strong); box-shadow: var(--shadow-md); }
     .novavei-service-dialog::backdrop { background: rgb(7 11 20 / 62%); }
     .novavei-service-dialog-body { display: grid; gap: 12px; padding: 18px; }
-    .novavei-service-dialog h2 { margin: 0; font-size: 16px; }
-    .novavei-service-dialog textarea { width: 100%; min-height: 170px; resize: vertical; box-sizing: border-box; border: 1px solid var(--line); border-radius: 10px; background: var(--input-deep); padding: 10px 12px; color: var(--text); font: 12px/1.5 var(--mono); }
+    .novavei-service-dialog h2 { margin: 0; font-size: var(--text-xl); }
+    .novavei-service-dialog textarea { width: 100%; min-height: 170px; resize: vertical; box-sizing: border-box; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--input-deep); padding: 10px 12px; color: var(--text); font: 12px/1.5 var(--mono); }
     .novavei-service-dialog .field { padding: 12px; }
-    .novavei-service-dialog [role="alert"] { min-height: 1.35em; margin: 0; color: var(--danger); font-size: 12px; }
+    .novavei-service-dialog [role="alert"] { min-height: 1.35em; margin: 0; color: var(--danger); font-size: var(--text-sm); }
     .novavei-mcp-editor { width: min(720px, calc(100vw - 32px)); }
     .novavei-mcp-editor .field { display: grid; gap: 7px; }
     .novavei-mcp-editor input:not([type="checkbox"]), .novavei-mcp-editor select { width: 100%; box-sizing: border-box; }
     .novavei-mcp-editor textarea { min-height: 112px; }
     .novavei-mcp-editor [hidden] { display: none !important; }
     .novavei-mcp-required { color: var(--danger); }
-    .novavei-mcp-toggle { display: flex; align-items: flex-start; gap: 9px; color: var(--text); font-size: 13px; line-height: 1.45; }
+    .novavei-mcp-toggle { display: flex; align-items: flex-start; gap: 9px; color: var(--text); font-size: var(--text-base); line-height: 1.45; }
     .novavei-mcp-toggle input { margin-top: 2px; accent-color: var(--blue-strong); }
-    .novavei-mcp-warning { margin: 0; padding: 10px 12px; border: 1px solid var(--warning, var(--line-strong)); border-radius: 10px; background: var(--code-bg); color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .novavei-mcp-warning { margin: 0; padding: 10px 12px; border: 1px solid var(--warning, var(--line-strong)); border-radius: var(--r-sm); background: var(--code-bg); color: var(--muted); font-size: var(--text-sm); line-height: 1.5; }
     .novavei-mcp-registry { grid-column: 1 / -1; display: grid; gap: 10px; margin-top: 6px; padding: 14px; border: 1px solid var(--line); border-radius: var(--r-sm); background: color-mix(in srgb, var(--glass) 84%, transparent); }
     .novavei-mcp-registry > h3, .novavei-mcp-registry > p { margin: 0; }
-    .novavei-mcp-registry > h3 { color: var(--text); font-size: 14px; }
+    .novavei-mcp-registry > h3 { color: var(--text); font-size: var(--text-md); }
     .novavei-mcp-registry-form { display: flex; align-items: end; flex-wrap: wrap; gap: 8px; }
-    .novavei-mcp-registry-form label { min-width: min(100%, 260px); flex: 1 1 260px; display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
-    .novavei-mcp-registry-form input { min-width: 0; width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: 10px; background: var(--input-deep); color: var(--text); padding: 8px 10px; }
+    .novavei-mcp-registry-form label { min-width: min(100%, 260px); flex: 1 1 260px; display: grid; gap: 6px; color: var(--muted); font-size: var(--text-sm); }
+    .novavei-mcp-registry-form input { min-width: 0; width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--input-deep); color: var(--text); padding: 8px 10px; }
     .novavei-mcp-registry-results, .novavei-mcp-registry-detail, .novavei-mcp-registry-inputs { display: grid; gap: 8px; }
-    .novavei-mcp-registry-item { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--code-bg); }
+    .novavei-mcp-registry-item { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--code-bg); }
     .novavei-mcp-registry-item small, .novavei-mcp-registry-detail small { overflow-wrap: anywhere; }
-    .novavei-mcp-registry-inputs { margin: 0; padding-left: 18px; color: var(--subtle); font-size: 12px; }
+    .novavei-mcp-registry-inputs { margin: 0; padding-left: 18px; color: var(--subtle); font-size: var(--text-sm); }
     .novavei-mcp-registry-package { display: grid; gap: 4px; padding: 8px 0; border-top: 1px solid var(--line); }
     .novavei-mcp-registry-package:first-of-type { border-top: 0; }
     .novavei-cron-editor { width: min(720px, calc(100vw - 32px)); }
@@ -758,9 +760,9 @@ function installServiceStyles() {
     .novavei-cron-editor textarea { min-height: 108px; }
     .novavei-cron-editor [hidden] { display: none !important; }
     .novavei-cron-required { color: var(--danger); }
-    .novavei-cron-toggle { display: flex; align-items: flex-start; gap: 9px; color: var(--text); font-size: 13px; line-height: 1.45; }
+    .novavei-cron-toggle { display: flex; align-items: flex-start; gap: 9px; color: var(--text); font-size: var(--text-base); line-height: 1.45; }
     .novavei-cron-toggle input { margin-top: 2px; accent-color: var(--blue-strong); }
-    .novavei-cron-warning { margin: 0; padding: 10px 12px; border: 1px solid var(--warning, var(--line-strong)); border-radius: 10px; background: var(--code-bg); color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .novavei-cron-warning { margin: 0; padding: 10px 12px; border: 1px solid var(--warning, var(--line-strong)); border-radius: var(--r-sm); background: var(--code-bg); color: var(--muted); font-size: var(--text-sm); line-height: 1.5; }
     @media (max-width: 760px) {
       #overlaySkills .overlay-body, #overlayMcp .overlay-body { overflow: auto; }
       .novavei-service-hub { flex: 0 0 auto; overflow: visible; }

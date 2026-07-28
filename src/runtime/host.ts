@@ -9,18 +9,23 @@
 
 import { renderComposerMessageMedia } from "./attachments";
 import { requestAppChoice } from "./app-dialogs";
-import { createAssistantThinkingPanel } from "./dom";
-import { renderMarkdown } from "./markdown";
-import { displayPath, pathKey, pathName } from "./path-display";
 import {
-  planConfirmationsFromText,
-  PlanConfirmationCards,
-  stripPlanProtocolBlocks,
-} from "./plan-confirmation";
+  createAssistantThinkingPanel,
+  renderAssistantThinkingTools,
+} from "./dom";
+import { renderMarkdown } from "./markdown";
+import {
+  applyFullMessageTimestampPreference,
+  formatMessageTimestamp,
+  normalizeFullMessageTimestampPreference,
+} from "./message-time";
+import { displayPath, pathKey, pathName } from "./path-display";
+import { stripPlanProtocolBlocks } from "./plan-confirmation";
 import type {
   LiveTranscriptMessage,
   PiReasoningLevel,
   PiRuntimeSnapshot,
+  PiToolState,
 } from "./types";
 
 type UnknownRecord = Record<string, unknown>;
@@ -28,10 +33,6 @@ type Invoke = <T = unknown>(
   command: string,
   args?: Record<string, unknown>,
 ) => Promise<T>;
-
-// Historical cards are deliberately presentation-only: their original live
-// confirmation and opaque continuation grant expire with the renderer run.
-const historicalPlanCards = new PlanConfirmationCards();
 
 export type SessionSummary = {
   id: string;
@@ -170,6 +171,7 @@ type MessageRecord = {
   finishedAt?: number;
   endedAt?: number;
   thinking?: string;
+  tools?: PiToolState[];
 };
 
 type SessionsGetPage = {
@@ -248,6 +250,37 @@ function optionalNumber(...candidates: unknown[]): number | undefined {
   return undefined;
 }
 
+function normalizeMessageTool(
+  value: unknown,
+  index: number,
+): PiToolState | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as Record<string, unknown>;
+  const id =
+    optionalString(raw.id, raw.toolCallId, raw.tool_call_id) ??
+    `message-tool-${index}`;
+  const name = optionalString(raw.name, raw.toolName, raw.tool_name) ?? "工具";
+  return {
+    id,
+    name,
+    arguments: raw.arguments ?? raw.args ?? raw.input,
+    result: raw.result ?? raw.output,
+    error: optionalString(raw.error, raw.toolError, raw.tool_error),
+    status: optionalString(raw.status),
+    startedAt: optionalNumber(raw.startedAt, raw.started_at),
+    finishedAt: optionalNumber(raw.finishedAt, raw.finished_at),
+  };
+}
+
+function normalizeMessageTools(value: unknown): PiToolState[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const tools = value
+    .slice(0, 128)
+    .map(normalizeMessageTool)
+    .filter((tool): tool is PiToolState => Boolean(tool));
+  return tools.length ? tools : undefined;
+}
+
 function normalizeMessageRecord(value: unknown): MessageRecord {
   if (!value || typeof value !== "object") return {};
   const raw = value as Record<string, unknown>;
@@ -271,13 +304,16 @@ function normalizeMessageRecord(value: unknown): MessageRecord {
     finishedAt: optionalNumber(raw.finishedAt, raw.finished_at),
     endedAt: optionalNumber(raw.endedAt, raw.ended_at),
     thinking: optionalString(raw.thinking),
+    tools: normalizeMessageTools(raw.tools),
   };
 }
 
 /** Accept legacy MessageRecord[] or the paged {messages,totalCount,hasMoreBefore} shape. */
 function parseSessionsGetResponse(value: unknown): SessionsGetPage {
   if (Array.isArray(value)) {
-    const messages = value.map(normalizeMessageRecord);
+    const messages = sortedTranscriptMessages(
+      value.map(normalizeMessageRecord),
+    );
     return {
       messages,
       totalCount: messages.length,
@@ -287,7 +323,7 @@ function parseSessionsGetResponse(value: unknown): SessionsGetPage {
   if (value && typeof value === "object") {
     const raw = value as Record<string, unknown>;
     const messages = Array.isArray(raw.messages)
-      ? raw.messages.map(normalizeMessageRecord)
+      ? sortedTranscriptMessages(raw.messages.map(normalizeMessageRecord))
       : [];
     const totalCount =
       optionalNumber(raw.totalCount, raw.total_count) ?? messages.length;
@@ -323,6 +359,58 @@ function stableMessageId(message: MessageRecord): string {
     hash = (hash * 33) ^ content.charCodeAt(index);
   }
   return ["legacy", role, String(createdAt), String(hash >>> 0)].join(":");
+}
+
+function transcriptRole(message: MessageRecord) {
+  return optionalString(message.role)?.toLowerCase() ?? "";
+}
+
+function transcriptTurnKey(message: MessageRecord) {
+  const turnId = optionalString(message.turnId);
+  if (turnId) return `turn:${turnId}`;
+  const requestId = optionalString(message.requestId);
+  if (requestId) return `request:${requestId}`;
+  const id = optionalString(message.liveId, message.id);
+  if (!id) return undefined;
+  const live = id.match(/^live:(?:user|assistant):(.+)$/);
+  if (live?.[1]) return `live:${live[1]}`;
+  const assistant = id.match(/^assistant:(.+)$/);
+  if (assistant?.[1]) return `request:${assistant[1]}`;
+  return undefined;
+}
+
+function compareTranscriptMessages(left: MessageRecord, right: MessageRecord) {
+  const leftTurn = transcriptTurnKey(left);
+  const rightTurn = transcriptTurnKey(right);
+  const leftRole = transcriptRole(left);
+  const rightRole = transcriptRole(right);
+  if (leftTurn && leftTurn === rightTurn && leftRole !== rightRole) {
+    if (leftRole === "user") return -1;
+    if (rightRole === "user") return 1;
+  }
+  const time = (left.createdAt ?? 0) - (right.createdAt ?? 0);
+  if (time) return time;
+  if (leftRole !== rightRole) {
+    if (leftRole === "user") return -1;
+    if (rightRole === "user") return 1;
+  }
+  return stableMessageId(left).localeCompare(stableMessageId(right));
+}
+
+function sortedTranscriptMessages(messages: readonly MessageRecord[]) {
+  return [...messages].sort(compareTranscriptMessages);
+}
+
+function transcriptOrderChanged(
+  previous: MessageRecord | undefined,
+  next: MessageRecord,
+) {
+  if (!previous) return true;
+  return (
+    transcriptTurnKey(previous) !== transcriptTurnKey(next) ||
+    transcriptRole(previous) !== transcriptRole(next) ||
+    previous.createdAt !== next.createdAt
+  );
 }
 
 /** Pixels from the top of the transcript that count as "near the start". */
@@ -367,7 +455,7 @@ function createSessionMessagePageState(
   history?: unknown,
 ): SessionMessagePageState {
   return {
-    messages,
+    messages: sortedTranscriptMessages(messages),
     totalCount,
     hasMoreBefore,
     domStart: defaultDomStart(messages.length),
@@ -423,12 +511,7 @@ function mergeServerPageWithLive(
   for (const live of provisional) {
     if (!consumed.has(live)) merged.push(live);
   }
-  return merged.sort((left, right) => {
-    const time = (left.createdAt ?? 0) - (right.createdAt ?? 0);
-    if (time) return time;
-    if (left.role === right.role) return 0;
-    return left.role === "user" ? -1 : 1;
-  });
+  return sortedTranscriptMessages(merged);
 }
 
 type HistoryMessageDefaults = {
@@ -1856,7 +1939,7 @@ function renderHistory(
       history,
     );
   if (!options.pageState) {
-    pageState.messages = messages;
+    pageState.messages = sortedTranscriptMessages(messages);
     pageState.hasMoreBefore = Boolean(options.hasMoreBefore);
     pageState.domStart = defaultDomStart(messages.length);
     pageState.history = history;
@@ -1932,6 +2015,63 @@ function historyMessageTime(value: unknown) {
   return Number.isNaN(date.getTime()) ? undefined : date;
 }
 
+/**
+ * Only rebuild the virtual transcript when the renderer-facing live
+ * projection actually changed. In particular, a terminal state can be
+ * observed again while the DOM is rebinding after a window render; rebuilding
+ * that identical row would synchronously emit the same render event again.
+ */
+function liveProjectionChanged(
+  previous: MessageRecord | undefined,
+  next: MessageRecord,
+) {
+  if (!previous) return true;
+  return (
+    previous.liveId !== next.liveId ||
+    previous.role !== next.role ||
+    previous.content !== next.content ||
+    previous.createdAt !== next.createdAt ||
+    previous.requestId !== next.requestId ||
+    previous.turnId !== next.turnId ||
+    previous.status !== next.status ||
+    previous.prompt !== next.prompt ||
+    previous.model !== next.model ||
+    previous.reasoning !== next.reasoning ||
+    previous.thinking !== next.thinking ||
+    messageToolsSignature(previous.tools) !==
+      messageToolsSignature(next.tools) ||
+    previous.finishedAt !== next.finishedAt
+  );
+}
+
+function messageToolsSignature(tools: readonly PiToolState[] | undefined) {
+  if (!tools?.length) return "";
+  return tools
+    .map((tool) =>
+      [
+        tool.id,
+        tool.name,
+        tool.status,
+        tool.startedAt ?? "",
+        tool.finishedAt ?? "",
+        tool.error ?? "",
+        messageToolValueSignature(tool.arguments),
+        messageToolValueSignature(tool.result),
+      ].join("\u001f"),
+    )
+    .join("\u001e");
+}
+
+function messageToolValueSignature(value: unknown) {
+  if (value === undefined) return "";
+  try {
+    const json = JSON.stringify(value);
+    return json ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
 function appendHistoryMessage(
   message: MessageRecord,
   sessionId: string,
@@ -2003,6 +2143,7 @@ function appendHistoryMessage(
   const actions = document.createElement("div");
   actions.className = "msg-actions";
   const trace = historyActionButton("trace", "查看轨迹");
+  trace.setAttribute("aria-expanded", "false");
   if (!persistedMessageId || !turnId) {
     trace.disabled = true;
     trace.textContent = "轨迹不可用";
@@ -2029,7 +2170,7 @@ function appendHistoryMessage(
   );
   if (finished) {
     ended.dateTime = finished.toISOString();
-    ended.textContent = finished.toLocaleTimeString([], { hour12: false });
+    ended.textContent = formatMessageTimestamp(finished);
   } else {
     ended.textContent = "—";
     ended.title = "该历史回复未保存结束时间";
@@ -2043,18 +2184,24 @@ function appendHistoryMessage(
     ended,
   );
   const thinking = typeof message.thinking === "string" ? message.thinking : "";
-  if (thinking.trim())
-    article.append(who, createAssistantThinkingPanel(thinking), text, actions);
-  else article.append(who, text, actions);
-  const historyPlanRequestId = `history:${id}`;
-  for (const plan of planConfirmationsFromText(content, historyPlanRequestId)) {
-    historicalPlanCards.render(
-      article,
-      historyPlanRequestId,
-      plan,
-      () => "recorded",
-    );
-    historicalPlanCards.setStatus(historyPlanRequestId, plan.id, "recorded");
+  const tools = message.tools ?? [];
+  const thinkingPanel = createAssistantThinkingPanel(thinking);
+  if (thinking.trim() || tools.length) {
+    if (tools.length) thinkingPanel.hidden = false;
+    article.append(who, thinkingPanel, text, actions);
+    if (tools.length) {
+      renderAssistantThinkingTools(article, tools);
+    } else if (persistedMessageId && turnId) {
+      const thinkingTrace = historyActionButton("trace", "查看详情");
+      thinkingTrace.setAttribute("aria-expanded", "false");
+      renderAssistantThinkingTools(article, [], {
+        forceVisible: true,
+        emptyText: "点击查看本回复调用轨迹",
+        detailButton: thinkingTrace,
+      });
+    }
+  } else {
+    article.append(who, text, actions);
   }
   axis.appendChild(article);
 }
@@ -3350,12 +3497,24 @@ export function installNativeShell(): NativeShellApi | undefined {
           )
         : -1;
       if (fresh.length > 0) {
-        pageState.messages = [...fresh, ...pageState.messages];
+        pageState.messages = sortedTranscriptMessages([
+          ...fresh,
+          ...pageState.messages,
+        ]);
         // A configured page may be larger than the DOM window. Keep the
         // visible anchor inside that window rather than rendering only the
         // freshly prepended rows and losing the reader's place.
+        const sortedAnchorIndex = scrollAnchor
+          ? pageState.messages.findIndex(
+              (message) => stableMessageId(message) === scrollAnchor.messageId,
+            )
+          : -1;
         const newAnchorIndex =
-          anchorIndex >= 0 ? fresh.length + anchorIndex : fresh.length;
+          sortedAnchorIndex >= 0
+            ? sortedAnchorIndex
+            : anchorIndex >= 0
+              ? fresh.length + anchorIndex
+              : fresh.length;
         const maxStart = Math.max(
           0,
           pageState.messages.length - MAX_DOM_MESSAGES,
@@ -3642,18 +3801,23 @@ export function installNativeShell(): NativeShellApi | undefined {
       ...(message.reasoning !== undefined
         ? { reasoning: message.reasoning }
         : {}),
+      ...(message.thinking !== undefined ? { thinking: message.thinking } : {}),
+      ...(message.tools !== undefined
+        ? { tools: normalizeMessageTools(message.tools) ?? [] }
+        : {}),
+      ...(message.finishedAt !== undefined
+        ? { finishedAt: message.finishedAt }
+        : {}),
     };
     const index = pageState.messages.findIndex(
       (candidate) => candidate.liveId === liveId,
     );
     const inserted = index < 0;
+    const previous = inserted ? undefined : pageState.messages[index];
+    const projectionChanged = liveProjectionChanged(previous, next);
+    const orderChanged = transcriptOrderChanged(previous, next);
     if (inserted) {
       pageState.messages.push(next);
-      pageState.messages.sort((left, right) => {
-        const time = (left.createdAt ?? 0) - (right.createdAt ?? 0);
-        if (time) return time;
-        return left.role === "user" ? -1 : 1;
-      });
       pageState.domStart = defaultDomStart(pageState.messages.length);
     } else {
       const previous = pageState.messages[index];
@@ -3667,6 +3831,8 @@ export function installNativeShell(): NativeShellApi | undefined {
         createdAt: previous.createdAt ?? next.createdAt,
       };
     }
+    if (inserted || orderChanged)
+      pageState.messages = sortedTranscriptMessages(pageState.messages);
     pageState.totalCount = Math.max(
       pageState.totalCount,
       pageState.messages.length,
@@ -3683,7 +3849,9 @@ export function installNativeShell(): NativeShellApi | undefined {
       persistedSessionRunStatus(message.status) !== undefined;
 
     if (
-      (inserted || terminalAssistantUpdate) &&
+      (inserted ||
+        orderChanged ||
+        (terminalAssistantUpdate && projectionChanged)) &&
       activeSessionView?.sessionId === targetSessionId &&
       activeSessionView?.epoch === sessionViewEpoch &&
       sessionId === targetSessionId
@@ -3735,6 +3903,16 @@ export function installNativeShell(): NativeShellApi | undefined {
         } catch {
           // ignore storage failures
         }
+      }
+      const fullMessageTimestamp =
+        system.showFullMessageTimestamp ??
+        system.show_full_message_timestamp ??
+        system.messageTimestampFormat ??
+        system.message_timestamp_format;
+      if (fullMessageTimestamp !== undefined) {
+        applyFullMessageTimestampPreference(
+          normalizeFullMessageTimestampPreference(fullMessageTimestamp),
+        );
       }
     }
     sessions = Array.isArray(result)

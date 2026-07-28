@@ -7,6 +7,7 @@ type ConversationMessage = {
   id: string;
   role: "user" | "assistant";
   text: string;
+  normalizedText: string;
   createdAt?: number;
 };
 
@@ -169,7 +170,7 @@ function messageFromValue(value: unknown): ConversationMessage | undefined {
           Number.isFinite(source.created_at)
         ? source.created_at
         : undefined;
-  return { id, role, text, createdAt };
+  return { id, role, text, normalizedText: normalize(text), createdAt };
 }
 
 function pageFromValue(value: unknown): ConversationPage | undefined {
@@ -255,35 +256,35 @@ function installStyles() {
       position: sticky; top: 8px; z-index: 22; display: grid;
       grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center;
       margin: 8px 10px; padding: 8px; border: 1px solid var(--line);
-      border-radius: 12px; background: color-mix(in srgb, var(--card) 94%, transparent);
+      border-radius: var(--r-surface); background: var(--glass-strong);
       box-shadow: var(--shadow-sm); backdrop-filter: blur(12px);
     }
     .novavei-conversation-find[hidden] { display: none; }
     .novavei-conversation-find-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
     .novavei-conversation-find input {
       min-width: 0; height: 34px; padding: 0 10px; border: 1px solid var(--line);
-      border-radius: 8px; color: var(--text); background: var(--input, var(--card));
+      border-radius: var(--r-control); color: var(--text); background: var(--input-deep);
       font: inherit;
     }
     .novavei-conversation-find input:focus-visible,
     .novavei-conversation-find button:focus-visible {
-      outline: 2px solid rgb(107 181 255 / 80%); outline-offset: 2px;
+      outline: 2px solid var(--focus-ring); outline-offset: 2px;
     }
     .novavei-conversation-find-actions { display: inline-flex; flex-wrap: wrap; gap: 5px; align-items: center; justify-content: flex-end; }
     .novavei-conversation-find button {
-      min-height: 32px; border: 1px solid var(--line); border-radius: 8px;
+      min-height: 32px; border: 1px solid var(--line); border-radius: var(--r-control);
       padding: 0 9px; color: var(--text); background: transparent; cursor: pointer;
-      font: inherit; font-size: 12px;
+      font: inherit; font-size: var(--text-sm);
     }
     .novavei-conversation-find button:hover:not(:disabled) { background: var(--hover); }
     .novavei-conversation-find button:disabled { opacity: .48; cursor: default; }
     .novavei-conversation-find button[hidden] { display: none; }
     .novavei-conversation-find-status {
-      grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.35;
+      grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: var(--text-sm); line-height: 1.35;
     }
     [data-novavei-conversation-find-current="true"] {
       outline: 2px solid color-mix(in srgb, var(--blue-strong, #6bb5ff) 78%, transparent);
-      outline-offset: 4px; border-radius: 10px;
+      outline-offset: 4px; border-radius: var(--r-sm);
     }
     @media (max-width: 620px) {
       .novavei-conversation-find { grid-template-columns: 1fr; }
@@ -513,7 +514,12 @@ export function installConversationFind() {
           if (!node.dataset.messageId) node.dataset.messageId = id;
           const text = cleanText(node.textContent);
           return text
-            ? ({ id, role, text } satisfies ConversationMessage)
+            ? ({
+                id,
+                role,
+                text,
+                normalizedText: normalize(text),
+              } satisfies ConversationMessage)
             : undefined;
         })
         .filter((message): message is ConversationMessage => Boolean(message));
@@ -628,7 +634,7 @@ export function installConversationFind() {
       if (!conversation || !isCurrent(sessionId, serial)) return;
       const needle = normalize(query);
       const matches = conversation.messages.filter((message) =>
-        normalize(message.text).includes(needle),
+        message.normalizedText.includes(needle),
       );
       const preferredIndex = options.preferredMatchId
         ? matches.findIndex((match) => match.id === options.preferredMatchId)
@@ -779,7 +785,7 @@ export function installConversationFind() {
         return;
       const needle = normalize(query);
       const matches = conversation.messages.filter((message) =>
-        normalize(message.text).includes(needle),
+        message.normalizedText.includes(needle),
       );
       const previousIndex = previousMatchId
         ? matches.findIndex((match) => match.id === previousMatchId)

@@ -357,6 +357,7 @@ export async function requestAppPrompt(
 
   const multiline = options.multiline === true;
   input.hidden = false;
+  input.dataset.multiline = multiline ? "true" : "false";
   if (input instanceof HTMLTextAreaElement) {
     input.rows = multiline ? 5 : 1;
   }
@@ -382,11 +383,22 @@ export async function requestAppPrompt(
       if (finished) return;
       finished = true;
       form.removeEventListener("submit", onSubmit);
+      input.removeEventListener("keydown", onKeyDown);
       cancel.removeEventListener("click", onCancelClick);
       dialog.removeEventListener("cancel", onDialogCancel);
       dialog.removeEventListener("close", onDialogClose);
       if (dialog.open) dialog.close();
       resolve(value);
+    };
+    const onKeyDown = (event: Event) => {
+      if (multiline || !(event instanceof KeyboardEvent)) return;
+      if (event.key !== "Enter" || event.isComposing) return;
+      event.preventDefault();
+      if (typeof form.requestSubmit === "function") {
+        form.requestSubmit(accept);
+      } else {
+        accept.click();
+      }
     };
     const onSubmit = (event: Event) => {
       event.preventDefault();
@@ -426,6 +438,7 @@ export async function requestAppPrompt(
     accept.textContent = options.confirmLabel || defaults.confirmAccept;
     clearError();
     form.addEventListener("submit", onSubmit);
+    input.addEventListener("keydown", onKeyDown);
     cancel.addEventListener("click", onCancelClick);
     dialog.addEventListener("cancel", onDialogCancel);
     dialog.addEventListener("close", onDialogClose);

@@ -3,6 +3,7 @@ import type { ProjectPreferences } from "./host";
 import { notifyTranscriptContentChanged } from "./chat-navigation";
 import { renderComposerMessageMedia } from "./attachments";
 import { renderMarkdown } from "./markdown";
+import { formatMessageTimestamp } from "./message-time";
 import { displayPath } from "./path-display";
 import {
   planExecutionFollowUpText,
@@ -21,6 +22,8 @@ import type {
   PiSessionRunStateListener,
   PiToolState,
 } from "./types";
+
+type QueuedComposerPrompt = Omit<PiRunInput, "requestId">;
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -216,7 +219,7 @@ function permissionLabel() {
 }
 
 function nowLabel(value = new Date()) {
-  return value.toLocaleTimeString([], { hour12: false });
+  return formatMessageTimestamp(value);
 }
 
 const REASONING_LABELS: Record<PiReasoningLevel, string> = {
@@ -244,6 +247,8 @@ type LiveTurnContext = {
   presentation: AssistantPresentation;
   requestId?: string;
   turnId?: string;
+  /** Assigned once when the turn reaches a terminal state. */
+  finishedAt?: number;
   publishedUser?: {
     content: string;
     requestId?: string;
@@ -316,12 +321,12 @@ function safePreview(value: unknown, depth = 0, maxChars = 96): string {
   return displaySnippet(`{ ${fields.join(", ")} }`, maxChars);
 }
 
-function safeRuntimeMessage(value: unknown) {
+function safeRuntimeMessage(value: unknown, maxChars = 160) {
   // Native surfaces normally redact diagnostics before they reach the WebView,
   // but provider/tool errors can still contain echoed credential-like text.
   // Keep the recovery hint useful without making the UI a second disclosure
   // channel for a secret.
-  return safePreview(value, 0, 160)
+  return safePreview(value, 0, maxChars)
     .replace(
       /((?:api[-_ ]?key|authorization|token|secret|password)\s*(?:[:=]|bearer\s+))[^\s,;)}\]]+/gi,
       "$1[redacted]",
@@ -348,7 +353,12 @@ function toolStatus(tool: PiToolState) {
     return "completed";
   if (status === "failed" || status === "error") return "failed";
   if (status === "cancelled" || status === "canceled") return "cancelled";
+  if (status === "interrupted") return "interrupted";
+  if (status === "waiting_permission" || status === "waiting-permission")
+    return "waiting_permission";
+  if (status === "starting" || status === "queued") return status;
   if (status === "running" || status === "executing") return "running";
+  if (status === "unknown") return "unknown";
   return "queued";
 }
 
@@ -360,8 +370,16 @@ function toolStatusLabel(tool: PiToolState) {
       return "失败";
     case "cancelled":
       return "已取消";
+    case "interrupted":
+      return "已中断";
+    case "waiting_permission":
+      return "等待批准";
+    case "starting":
+      return "启动中";
     case "running":
       return "运行中";
+    case "unknown":
+      return "状态未知";
     default:
       return "排队";
   }
@@ -397,9 +415,12 @@ function appendUserMessage(
   window.__novaveiFloorNav?.refresh?.();
 }
 
-async function copyAssistantText(value: string) {
-  const text = value.trim();
-  if (!text) throw new Error("没有可复制内容");
+async function copyTextToClipboard(
+  value: string,
+  options: { trim?: boolean; emptyMessage?: string } = {},
+) {
+  const text = options.trim === false ? value : value.trim();
+  if (!text) throw new Error(options.emptyMessage ?? "没有可复制内容");
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(text);
     return;
@@ -418,6 +439,10 @@ async function copyAssistantText(value: string) {
   }
 }
 
+async function copyAssistantText(value: string) {
+  await copyTextToClipboard(value);
+}
+
 type AssistantMessageOptions = {
   messageId?: string;
   liveMessageId?: string;
@@ -432,27 +457,36 @@ export function createAssistantThinkingPanel(thinkingText = "") {
   const thinkingPanel = document.createElement("section");
   thinkingPanel.className = "assistant-thinking";
   thinkingPanel.dataset.piThinkingPanel = "true";
-  const thinkingContentId = `pi-thinking-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const thinkingBodyId = `pi-thinking-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const thinkingToggle = document.createElement("button");
   thinkingToggle.type = "button";
   thinkingToggle.className = "assistant-thinking-toggle";
   thinkingToggle.dataset.piThinkingToggle = "true";
   thinkingToggle.setAttribute("aria-expanded", "false");
-  thinkingToggle.setAttribute("aria-controls", thinkingContentId);
+  thinkingToggle.setAttribute("aria-controls", thinkingBodyId);
   thinkingToggle.setAttribute("aria-label", "展开思考过程");
   const thinkingLabel = document.createElement("span");
+  thinkingLabel.className = "assistant-thinking-title";
   thinkingLabel.textContent = "思考过程";
   const thinkingChevron = document.createElement("span");
   thinkingChevron.className = "assistant-thinking-chevron";
   thinkingChevron.setAttribute("aria-hidden", "true");
   thinkingToggle.append(thinkingLabel, thinkingChevron);
+  const thinkingBody = document.createElement("div");
+  thinkingBody.className = "assistant-thinking-body";
+  thinkingBody.dataset.piThinkingBody = "true";
+  thinkingBody.id = thinkingBodyId;
+  thinkingBody.hidden = true;
+  thinkingBody.setAttribute("role", "region");
+  thinkingBody.setAttribute("aria-label", "模型思考过程");
+  const thinkingTools = document.createElement("div");
+  thinkingTools.className = "assistant-thinking-tools";
+  thinkingTools.dataset.piThinkingTools = "true";
+  thinkingTools.hidden = true;
   const thinkingContent = document.createElement("div");
-  thinkingContent.className = "assistant-thinking-content";
+  thinkingContent.className = "assistant-thinking-content markdown-body";
   thinkingContent.dataset.piThinkingContent = "true";
-  thinkingContent.id = thinkingContentId;
-  thinkingContent.hidden = true;
-  thinkingContent.setAttribute("role", "region");
-  thinkingContent.setAttribute("aria-label", "模型思考过程");
+  thinkingBody.append(thinkingTools, thinkingContent);
   thinkingToggle.addEventListener("click", () => {
     const expanded = thinkingToggle.getAttribute("aria-expanded") === "true";
     thinkingToggle.setAttribute("aria-expanded", expanded ? "false" : "true");
@@ -460,11 +494,11 @@ export function createAssistantThinkingPanel(thinkingText = "") {
       "aria-label",
       expanded ? "展开思考过程" : "收起思考过程",
     );
-    thinkingContent.hidden = expanded;
+    thinkingBody.hidden = expanded;
   });
-  thinkingPanel.append(thinkingToggle, thinkingContent);
+  thinkingPanel.append(thinkingToggle, thinkingBody);
   thinkingPanel.hidden = !thinkingText.trim();
-  thinkingContent.textContent = thinkingText;
+  renderMarkdown(thinkingContent, thinkingText);
   return thinkingPanel;
 }
 
@@ -612,48 +646,255 @@ function toggleCompletionOnlyAssistantChrome(
 
 const renderedThinkingText = new WeakMap<HTMLElement, string>();
 
-/** Render streamed provider thoughts as plain text to avoid interpreting model output as HTML. */
-function renderAssistantThinking(article: HTMLElement, thinkingText: string) {
+type AssistantThinkingToolsOptions = {
+  forceVisible?: boolean;
+  emptyText?: string;
+  detailButton?: HTMLButtonElement;
+};
+
+function normalizedThinkingTools(
+  tools?: Record<string, PiToolState> | readonly PiToolState[],
+) {
+  if (tools === undefined) return undefined;
+  const entries = Array.isArray(tools) ? [...tools] : Object.values(tools);
+  return entries.sort((left, right) => {
+    const leftTime = left.startedAt ?? Number.MAX_SAFE_INTEGER;
+    const rightTime = right.startedAt ?? Number.MAX_SAFE_INTEGER;
+    return leftTime - rightTime;
+  });
+}
+
+function toolDetailText(value: unknown, maxChars = 560) {
+  return safeRuntimeMessage(value, maxChars);
+}
+
+function toolTimingLabel(tool: PiToolState) {
+  const startedAt =
+    typeof tool.startedAt === "number" && Number.isFinite(tool.startedAt)
+      ? tool.startedAt
+      : undefined;
+  const finishedAt =
+    typeof tool.finishedAt === "number" && Number.isFinite(tool.finishedAt)
+      ? tool.finishedAt
+      : undefined;
+  if (startedAt && finishedAt && finishedAt >= startedAt) {
+    const milliseconds = finishedAt - startedAt;
+    return milliseconds < 1000
+      ? `${milliseconds} ms`
+      : `${(milliseconds / 1000).toFixed(milliseconds < 10_000 ? 1 : 0)} s`;
+  }
+  if (finishedAt) return "已结束";
+  if (startedAt) return "进行中";
+  return "未记录时间";
+}
+
+function appendToolDetail(
+  list: HTMLDListElement,
+  label: string,
+  value: unknown,
+) {
+  if (value === undefined || value === null || value === "") return;
+  const text = toolDetailText(value);
+  if (!text) return;
+  const term = document.createElement("dt");
+  term.textContent = label;
+  const detail = document.createElement("dd");
+  const code = document.createElement("code");
+  code.textContent = text;
+  detail.appendChild(code);
+  list.append(term, detail);
+}
+
+function createThinkingToolDetailRow(tool: PiToolState) {
+  const item = document.createElement("li");
+  const status = toolStatus(tool);
+  item.className = "assistant-thinking-tool-detail";
+  item.dataset.toolStatus = status;
+  const head = document.createElement("div");
+  head.className = "assistant-thinking-tool-detail-head";
+  const title = document.createElement("b");
+  title.textContent = tool.name || "工具";
+  title.title = tool.name || "工具";
+  const meta = document.createElement("small");
+  const argumentSnippet = toolArgumentSummary(tool, 96);
+  const summary = `${toolStatusLabel(tool)} · ${toolTimingLabel(tool)}${
+    argumentSnippet ? ` · ${argumentSnippet}` : ""
+  }`;
+  meta.textContent = displaySnippet(summary, 180);
+  meta.title = summary;
+  head.append(title, meta);
+
+  const details = document.createElement("dl");
+  details.className = "assistant-thinking-tool-detail-grid";
+  appendToolDetail(details, "参数", tool.arguments);
+  appendToolDetail(details, "结果", tool.result);
+  appendToolDetail(details, "错误", tool.error);
+  if (!details.children.length) {
+    const note = document.createElement("p");
+    note.className = "assistant-thinking-tool-detail-empty";
+    note.textContent = "没有更多可显示的调用详情";
+    item.append(head, note);
+    return item;
+  }
+  item.append(head, details);
+  return item;
+}
+
+export function renderAssistantThinkingTools(
+  article: HTMLElement,
+  tools?: Record<string, PiToolState> | readonly PiToolState[],
+  options: AssistantThinkingToolsOptions = {},
+) {
+  const toolsNode = article.querySelector<HTMLElement>(
+    "[data-pi-thinking-tools]",
+  );
+  if (!toolsNode) return;
+  const entries = normalizedThinkingTools(tools);
+  if (entries === undefined) {
+    toolsNode.hidden = true;
+    toolsNode.replaceChildren();
+    return;
+  }
+  if (!entries.length && !options.forceVisible && !options.detailButton) {
+    toolsNode.hidden = true;
+    toolsNode.replaceChildren();
+    return;
+  }
+
+  const wasExpanded =
+    toolsNode
+      .querySelector<HTMLButtonElement>("[data-pi-thinking-tools-toggle]")
+      ?.getAttribute("aria-expanded") === "true";
+  const summary = document.createElement("span");
+  summary.className = "assistant-thinking-tools-summary";
+  const title = document.createElement("b");
+  title.textContent = "调用记录";
+  const count = document.createElement("small");
+  count.textContent =
+    toolSummary(entries) || options.emptyText || "本轮没有工具调用";
+  summary.append(title, count);
+
+  const chips = document.createElement("span");
+  chips.className = "assistant-thinking-tool-chips";
+  const visibleTools = entries.slice(0, 5);
+  for (const tool of visibleTools) {
+    const chip = document.createElement("span");
+    const status = toolStatus(tool);
+    chip.className = "assistant-thinking-tool-chip";
+    chip.dataset.toolStatus = status;
+    const label = `${tool.name || "工具"} · ${toolStatusLabel(tool)}`;
+    chip.textContent = displaySnippet(label, 48);
+    chip.title = label;
+    chips.appendChild(chip);
+  }
+  if (entries.length > visibleTools.length) {
+    const more = document.createElement("span");
+    more.className = "assistant-thinking-tool-chip";
+    more.textContent = `+${entries.length - visibleTools.length}`;
+    chips.appendChild(more);
+  }
+  if (!entries.length) chips.hidden = true;
+
+  const detailsId = `pi-thinking-tools-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const details = document.createElement("ol");
+  details.className = "assistant-thinking-tool-details";
+  details.dataset.piThinkingToolDetails = "true";
+  details.id = detailsId;
+  details.hidden = !wasExpanded;
+  details.setAttribute("aria-label", "工具调用详情");
+  if (entries.length) {
+    details.replaceChildren(...entries.map(createThinkingToolDetailRow));
+  } else {
+    const empty = document.createElement("li");
+    empty.className = "assistant-thinking-tool-detail-empty";
+    empty.textContent = options.emptyText || "本轮没有工具调用";
+    details.appendChild(empty);
+  }
+
+  const detailButton =
+    options.detailButton ??
+    (entries.length
+      ? (() => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "assistant-thinking-tools-action";
+          button.dataset.piThinkingToolsToggle = "true";
+          button.textContent = wasExpanded ? "收起详情" : "查看详情";
+          button.setAttribute("aria-expanded", String(wasExpanded));
+          button.setAttribute("aria-controls", detailsId);
+          button.addEventListener("click", () => {
+            const expanded = button.getAttribute("aria-expanded") === "true";
+            const nextExpanded = !expanded;
+            button.setAttribute("aria-expanded", String(nextExpanded));
+            button.textContent = nextExpanded ? "收起详情" : "查看详情";
+            details.hidden = !nextExpanded;
+          });
+          return button;
+        })()
+      : undefined);
+  if (detailButton) {
+    detailButton.classList.add("assistant-thinking-tools-action");
+    if (!detailButton.hasAttribute("aria-controls"))
+      detailButton.setAttribute("aria-controls", detailsId);
+    if (!detailButton.hasAttribute("aria-expanded"))
+      detailButton.setAttribute("aria-expanded", String(wasExpanded));
+    summary.append(detailButton);
+  }
+
+  toolsNode.replaceChildren(summary, chips, details);
+  toolsNode.hidden = false;
+}
+
+/** Render streamed provider thoughts with the same safe Markdown subset as replies. */
+function renderAssistantThinking(
+  article: HTMLElement,
+  thinkingText: string,
+  tools?: Record<string, PiToolState>,
+) {
   const thinkingPanel = article.querySelector<HTMLElement>(
     "[data-pi-thinking-panel]",
   );
   const thinkingToggle = article.querySelector<HTMLButtonElement>(
     "[data-pi-thinking-toggle]",
   );
+  const thinkingBody = article.querySelector<HTMLElement>(
+    "[data-pi-thinking-body]",
+  );
   const thinkingContent = article.querySelector<HTMLElement>(
     "[data-pi-thinking-content]",
   );
-  if (!thinkingPanel || !thinkingToggle || !thinkingContent) return;
+  if (!thinkingPanel || !thinkingToggle || !thinkingBody || !thinkingContent)
+    return;
 
   const hasThinking = Boolean(thinkingText.trim());
   thinkingPanel.hidden = !hasThinking;
   if (!hasThinking) {
     if (renderedThinkingText.get(thinkingContent))
-      thinkingContent.textContent = "";
+      renderMarkdown(thinkingContent, "");
     renderedThinkingText.delete(thinkingContent);
-    thinkingContent.hidden = true;
+    renderAssistantThinkingTools(article, undefined);
+    thinkingBody.hidden = true;
     thinkingToggle.setAttribute("aria-expanded", "false");
     thinkingToggle.setAttribute("aria-label", "展开思考过程");
     return;
   }
 
+  renderAssistantThinkingTools(article, tools);
   const previous = renderedThinkingText.get(thinkingContent);
   if (previous === thinkingText) return;
-  if (previous !== undefined && thinkingText.startsWith(previous)) {
-    thinkingContent.append(
-      document.createTextNode(thinkingText.slice(previous.length)),
-    );
-  } else {
-    thinkingContent.textContent = thinkingText;
-  }
+  renderMarkdown(thinkingContent, thinkingText);
   renderedThinkingText.set(thinkingContent, thinkingText);
 }
 
-function toolSummary(tools: Record<string, PiToolState>) {
-  const entries = Object.values(tools);
+function toolSummary(
+  tools: Record<string, PiToolState> | readonly PiToolState[],
+) {
+  const entries = Array.isArray(tools) ? tools : Object.values(tools);
   if (!entries.length) return "";
   const running = entries.filter((tool) =>
-    ["running", "queued"].includes(toolStatus(tool)),
+    ["running", "queued", "starting", "waiting_permission"].includes(
+      toolStatus(tool),
+    ),
   ).length;
   const completed = entries.filter(
     (tool) => toolStatus(tool) === "completed",
@@ -662,11 +903,15 @@ function toolSummary(tools: Record<string, PiToolState>) {
   const cancelled = entries.filter(
     (tool) => toolStatus(tool) === "cancelled",
   ).length;
+  const interrupted = entries.filter(
+    (tool) => toolStatus(tool) === "interrupted",
+  ).length;
   const parts = [`${entries.length} 个工具`];
   if (running) parts.push(`${running} 运行中`);
   if (completed) parts.push(`${completed} 完成`);
   if (failed) parts.push(`${failed} 失败`);
   if (cancelled) parts.push(`${cancelled} 已取消`);
+  if (interrupted) parts.push(`${interrupted} 已中断`);
   return parts.join(" · ");
 }
 
@@ -817,6 +1062,16 @@ type SubagentTaskSummary = {
   updatedAt: number;
 };
 
+type SubagentMessageSummary = {
+  id: string;
+  sessionId: string;
+  senderAgentId: string;
+  recipient: string;
+  channel: string;
+  content: string;
+  createdAt: number;
+};
+
 type WorktreeReview = {
   taskId: string;
   baseCommit: string;
@@ -843,6 +1098,38 @@ function subagentTaskSummary(value: unknown): SubagentTaskSummary | undefined {
   if (!id || !sessionId || !title || !status || updatedAt === undefined)
     return undefined;
   return { id, sessionId, title, status, updatedAt };
+}
+
+function subagentMessageSummary(
+  value: unknown,
+): SubagentMessageSummary | undefined {
+  const record = asRecord(value);
+  const id = readString(record, "id");
+  const sessionId = readString(record, "sessionId", "session_id");
+  const senderAgentId = readString(record, "senderAgentId", "sender_agent_id");
+  const recipient = readString(record, "recipient");
+  const channel = readString(record, "channel");
+  const content = readString(record, "content");
+  const createdAt = finiteNumber(record?.createdAt ?? record?.created_at);
+  if (
+    !id ||
+    !sessionId ||
+    !senderAgentId ||
+    !recipient ||
+    !channel ||
+    !content ||
+    createdAt === undefined
+  )
+    return undefined;
+  return {
+    id,
+    sessionId,
+    senderAgentId,
+    recipient,
+    channel,
+    content,
+    createdAt,
+  };
 }
 
 function worktreeReview(value: unknown): WorktreeReview | undefined {
@@ -1004,11 +1291,178 @@ function renderSubagentTasks(
   section.replaceChildren(heading, ...rows);
 }
 
+function renderSubagentMessages(
+  pane: HTMLElement,
+  messages: readonly SubagentMessageSummary[],
+) {
+  const section = pane.querySelector<HTMLElement>("[data-subagent-messages]");
+  if (!section) return;
+  const heading = document.createElement("div");
+  heading.className = "section-head";
+  const title = document.createElement("h4");
+  title.textContent = "子代理消息";
+  const pill = document.createElement("span");
+  pill.className = `pill${messages.length ? "" : " wait"}`;
+  pill.textContent = messages.length ? `${messages.length} 条` : "无消息";
+  heading.append(title, pill);
+  if (!messages.length) {
+    const empty = document.createElement("p");
+    empty.className = "dock-note";
+    empty.textContent = "子代理的进度、阻塞和广播会显示在这里。";
+    section.replaceChildren(heading, empty);
+    return;
+  }
+  const rows = [...messages]
+    .sort((left, right) => right.createdAt - left.createdAt)
+    .slice(0, 8)
+    .map((message) => {
+      const item = document.createElement("div");
+      item.className = "subagent-task";
+      const label = document.createElement("div");
+      label.className = "file-row";
+      const marker = document.createElement("span");
+      marker.setAttribute("aria-hidden", "true");
+      marker.textContent = "·";
+      const sender = document.createElement("strong");
+      sender.textContent = `${message.senderAgentId} → ${message.recipient}`;
+      const channel = document.createElement("span");
+      channel.className = "delta";
+      channel.textContent = message.channel;
+      label.append(marker, sender, channel);
+      const body = document.createElement("p");
+      body.className = "dock-note";
+      body.textContent = displaySnippet(message.content, 220);
+      item.append(label, body);
+      return item;
+    });
+  section.replaceChildren(heading, ...rows);
+}
+
+function createRunRawCopyButton(label: string, value: string) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "btn ghost run-raw-copy";
+  button.textContent = label;
+  button.disabled = !value;
+  button.addEventListener("click", () => {
+    const previousLabel = button.textContent;
+    button.disabled = true;
+    button.textContent = "复制中…";
+    void copyTextToClipboard(value, { trim: false })
+      .then(
+        () => toast("已复制"),
+        (error: unknown) => {
+          console.warn("[NovaVei Pi] copy raw run text failed", error);
+          toast(
+            error instanceof Error && error.message === "没有可复制内容"
+              ? error.message
+              : "复制失败：请检查系统剪贴板",
+          );
+        },
+      )
+      .finally(() => {
+        if (!button.isConnected) return;
+        button.disabled = !value;
+        button.textContent = previousLabel;
+      });
+  });
+  return button;
+}
+
+function runRawBlock(
+  label: string,
+  value: string,
+  emptyLabel: string,
+  copyLabel: string,
+) {
+  const item = document.createElement("div");
+  item.className = "run-raw-item";
+  const head = document.createElement("div");
+  head.className = "run-raw-head";
+  const title = document.createElement("strong");
+  title.textContent = label;
+  head.append(title, createRunRawCopyButton(copyLabel, value));
+  const body = document.createElement("pre");
+  body.className = "run-raw-body";
+  body.tabIndex = 0;
+  body.setAttribute("aria-label", label);
+  if (value) {
+    body.textContent = value;
+  } else {
+    body.dataset.empty = "true";
+    body.textContent = emptyLabel;
+  }
+  item.append(head, body);
+  return item;
+}
+
+function renderRunRawSection(pane: HTMLElement, state: PiRuntimeState) {
+  const section = pane.querySelector<HTMLElement>("[data-run-raw]");
+  if (!section) return;
+  const heading = document.createElement("div");
+  heading.className = "section-head";
+  const title = document.createElement("h4");
+  title.textContent = "原始请求 / 回复";
+  const pill = document.createElement("span");
+  const request = state.prompt ?? "";
+  const response = state.assistantText ?? "";
+  const hasRequest = request.length > 0;
+  const hasResponse = response.length > 0;
+  pill.className = `pill${state.requestId && (hasRequest || hasResponse) ? "" : " wait"}`;
+  pill.textContent = !state.requestId
+    ? "待命"
+    : hasRequest && hasResponse
+      ? "可查看"
+      : hasResponse
+        ? "已回复"
+        : "等待回复";
+  heading.append(title, pill);
+
+  if (!state.requestId) {
+    const empty = document.createElement("p");
+    empty.className = "dock-note";
+    empty.textContent = "发送消息后可查看本轮原始请求和模型回复。";
+    section.replaceChildren(heading, empty);
+    delete section.dataset.piRuntimeRequest;
+    return;
+  }
+
+  const previousDetails =
+    section.querySelector<HTMLDetailsElement>(".run-raw-details");
+  const details = document.createElement("details");
+  details.className = "run-raw-details";
+  details.open =
+    section.dataset.piRuntimeRequest === state.requestId
+      ? (previousDetails?.open ?? false)
+      : false;
+  details.dataset.piRuntimeRequest = state.requestId;
+
+  const summary = document.createElement("summary");
+  summary.textContent = "查看本轮原文";
+  const body = document.createElement("div");
+  body.className = "run-raw-grid";
+  body.append(
+    runRawBlock("原始请求", request, "本轮尚未记录原始请求。", "复制请求"),
+    runRawBlock(
+      "原始回复",
+      response,
+      state.status === "running"
+        ? "模型回复仍在生成中。"
+        : "本轮尚无原始回复。",
+      "复制回复",
+    ),
+  );
+  details.append(summary, body);
+  section.replaceChildren(heading, details);
+  section.dataset.piRuntimeRequest = state.requestId;
+}
+
 function renderRunDock(
   state: PiRuntimeState,
   startedAt: number,
   subagentTasks: readonly SubagentTaskSummary[] = [],
   worktreeActions?: WorktreeReviewActions,
+  subagentMessages: readonly SubagentMessageSummary[] = [],
 ) {
   const pane = runDock();
   if (!pane) return;
@@ -1042,6 +1496,7 @@ function renderRunDock(
       pane.querySelector<HTMLElement>("[data-run-context]") ?? undefined,
       state,
     );
+    renderRunRawSection(pane, state);
     const impactSection = pane.querySelector<HTMLElement>("[data-run-impact]");
     if (impactSection) {
       const heading = document.createElement("div");
@@ -1058,6 +1513,7 @@ function renderRunDock(
       impactSection.replaceChildren(heading, empty);
     }
     renderSubagentTasks(pane, subagentTasks, worktreeActions);
+    renderSubagentMessages(pane, subagentMessages);
     return;
   }
   const trace = pane.querySelector<HTMLOListElement>(".trace");
@@ -1149,6 +1605,7 @@ function renderRunDock(
   const contextSection =
     pane.querySelector<HTMLElement>("[data-run-context]") ?? undefined;
   renderContextSection(contextSection, state);
+  renderRunRawSection(pane, state);
 
   const impactSection = pane.querySelector<HTMLElement>("[data-run-impact]");
   if (impactSection) {
@@ -1198,6 +1655,7 @@ function renderRunDock(
     }
   }
   renderSubagentTasks(pane, subagentTasks, worktreeActions);
+  renderSubagentMessages(pane, subagentMessages);
 }
 
 function ensurePermissionPrompt(
@@ -2402,6 +2860,18 @@ function selectedModelSelection() {
 }
 
 function selectedPermission() {
+  // The picker owns the in-memory Full-access intent. Read it from that
+  // source of truth rather than relying solely on a CSS class that can lag a
+  // project/session refresh.
+  const pickerPermission = window.__novaveiPermission?.get?.();
+  if (
+    pickerPermission === "readonly" ||
+    pickerPermission === "ask" ||
+    pickerPermission === "auto-approve" ||
+    pickerPermission === "full"
+  ) {
+    return pickerPermission;
+  }
   const selected = document.querySelector<HTMLElement>(
     ".permission-option.on[data-permission]",
   );
@@ -2575,6 +3045,13 @@ type ContextCompactionUsage = {
   sourceMessageEnd: number;
   sourceTurnStart: number;
   sourceTurnEnd: number;
+  fileLedger?: ContextFileLedgerUsage;
+};
+
+type ContextFileLedgerUsage = {
+  read: number;
+  modified: number;
+  omittedCount: number;
 };
 
 type ContextInspector = {
@@ -2646,6 +3123,20 @@ function contextCompactionUsage(
     sourceTurnEnd < sourceTurnStart
   )
     return undefined;
+  const rawLedger = asRecord(raw.fileLedger);
+  const fileLedger =
+    rawLedger?.version === 1 &&
+    Array.isArray(rawLedger.read) &&
+    Array.isArray(rawLedger.modified) &&
+    rawLedger.read.every((item) => typeof item === "string") &&
+    rawLedger.modified.every((item) => typeof item === "string") &&
+    finiteNumber(rawLedger.omittedCount) !== undefined
+      ? {
+          read: rawLedger.read.length,
+          modified: rawLedger.modified.length,
+          omittedCount: Math.max(0, finiteNumber(rawLedger.omittedCount) ?? 0),
+        }
+      : undefined;
   const generatedAt = finiteNumber(raw.generatedAt);
   return {
     version: 1,
@@ -2656,6 +3147,7 @@ function contextCompactionUsage(
     sourceMessageEnd,
     sourceTurnStart,
     sourceTurnEnd,
+    ...(fileLedger ? { fileLedger } : {}),
   };
 }
 
@@ -2947,6 +3439,19 @@ function installContextInspector(): ContextInspector | undefined {
             contextCompactionTime(usage.compaction.generatedAt),
           ),
         );
+        if (usage.compaction.fileLedger) {
+          const ledger = usage.compaction.fileLedger;
+          details.append(
+            contextDetail(
+              "文件账本",
+              `改动 ${ledger.modified} · 读取 ${ledger.read}`,
+            ),
+          );
+          if (ledger.omittedCount > 0)
+            details.append(
+              contextDetail("账本省略", `${ledger.omittedCount} 条较早记录`),
+            );
+        }
       }
       const estimate =
         usage.source === "provider"
@@ -3207,11 +3712,16 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
   const liveTurnsBySession = new Map<string, LiveTurnContext>();
   let pendingLiveAssistantText = "";
   let pendingLiveAssistantThinking = "";
+  let pendingLiveAssistantTools: Record<string, PiToolState> = {};
   let pendingLiveAssistantNode: HTMLElement | null = null;
   let pendingLiveAssistantTimer: number | undefined;
   let lastLiveAssistantRenderedAt = 0;
   let lastLiveChromeRenderedAt = 0;
   let lastRenderedStreamEvent: PiRuntimeState["lastEvent"];
+  // A host-side virtual-window rebuild synchronously emits an event. During
+  // its rebind pass, renderState must update the new DOM node without feeding
+  // the same projection back into Host and starting another rebuild.
+  let rebindingTranscriptWindow = false;
   const planConfirmationCards = new PlanConfirmationCards();
   const planConfirmationContexts = new Map<
     string,
@@ -3221,15 +3731,32 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
     string,
     Map<string, SubagentTaskSummary>
   >();
+  const subagentMessagesBySession = new Map<
+    string,
+    Map<string, SubagentMessageSummary>
+  >();
   const reviewedWorktreesByTaskId = new Map<string, WorktreeReview>();
   const pendingWorktreeTaskIds = new Set<string>();
+  const queuedPromptsBySession = new Map<string, QueuedComposerPrompt[]>();
+  const pausedPromptQueues = new Set<string>();
+  let queueDrainInFlight = false;
+  let queueRunner: (() => void) | undefined;
   let disposeSubagentTaskListener: (() => void) | undefined;
+  let disposeSubagentMessageListener: (() => void) | undefined;
   const subagentTasksForSession = (sessionId: string | undefined) => {
     if (!sessionId) return [];
     return [...(subagentTasksBySession.get(sessionId)?.values() ?? [])];
   };
   const subagentTasksForState = (state: PiRuntimeState) =>
     subagentTasksForSession(
+      state.sessionId ?? window.__novaveiHost?.getSessionId(),
+    );
+  const subagentMessagesForSession = (sessionId: string | undefined) => {
+    if (!sessionId) return [];
+    return [...(subagentMessagesBySession.get(sessionId)?.values() ?? [])];
+  };
+  const subagentMessagesForState = (state: PiRuntimeState) =>
+    subagentMessagesForSession(
       state.sessionId ?? window.__novaveiHost?.getSessionId(),
     );
   const renderSubagentTasksForCurrentState = () => {
@@ -3239,6 +3766,7 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       activeStartedAt,
       subagentTasksForState(state),
       worktreeReviewActions,
+      subagentMessagesForState(state),
     );
   };
   const storeSubagentTask = (task: SubagentTaskSummary) => {
@@ -3247,6 +3775,12 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
     subagentTasksBySession.set(task.sessionId, tasks);
     if (task.status !== "review_ready")
       reviewedWorktreesByTaskId.delete(task.id);
+  };
+  const storeSubagentMessage = (message: SubagentMessageSummary) => {
+    const messages =
+      subagentMessagesBySession.get(message.sessionId) ?? new Map();
+    messages.set(message.id, message);
+    subagentMessagesBySession.set(message.sessionId, messages);
   };
   const invokeWorktreeAction = async (
     command: string,
@@ -3361,6 +3895,33 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       // older host must not disrupt normal chat rendering.
     }
   };
+  const hydrateSubagentMessages = async (sessionId: string | undefined) => {
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (!invoke || !sessionId) return;
+    try {
+      const messages = await invoke<unknown[]>("subagent_messages_list", {
+        sessionId,
+        limit: 30,
+      });
+      const summaries = messages
+        .map(subagentMessageSummary)
+        .filter((message): message is SubagentMessageSummary =>
+          Boolean(message),
+        );
+      subagentMessagesBySession.set(
+        sessionId,
+        new Map(summaries.map((message) => [message.id, message])),
+      );
+      if (
+        (controller.getState().sessionId ??
+          window.__novaveiHost?.getSessionId()) === sessionId
+      ) {
+        renderSubagentTasksForCurrentState();
+      }
+    } catch {
+      // A pre-message-bus native host remains compatible with normal chat.
+    }
+  };
   let permissionPrompt: HTMLElement | null = null;
   const answerPermission = async (decision: PermissionDecision) => {
     if (permissionDecisionsBlockedByRecovery()) {
@@ -3415,6 +3976,7 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       activeStartedAt,
       subagentTasksForState(state),
       worktreeReviewActions,
+      subagentMessagesForState(state),
     );
   };
   const onSessionChanged = (event: Event) => {
@@ -3439,6 +4001,7 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
     renderedTerminal = "";
     controller.selectSession(sessionId);
     void hydrateSubagentTasks(sessionId);
+    void hydrateSubagentMessages(sessionId);
   };
   const onSessionViewInvalidated = () => {
     // Native navigation invalidates the visible view before its async load
@@ -3469,7 +4032,14 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       return;
     // Host has just rebuilt the virtual window. Rebind the active stream to
     // its stable live id so the next delta never targets a detached article.
-    renderState(state);
+    // The rebind must be DOM-only: publishing the same terminal projection
+    // here used to recursively trigger another host window render.
+    rebindingTranscriptWindow = true;
+    try {
+      renderState(state);
+    } finally {
+      rebindingTranscriptWindow = false;
+    }
   };
   window.addEventListener("novavei:providers-changed", onProvidersChanged);
   window.addEventListener("novavei:host-state-changed", onHostStateChanged);
@@ -3499,8 +4069,24 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
         disposeSubagentTaskListener = unlisten;
       })
       .catch(() => undefined);
+    void listen<unknown>("subagent:message", ({ payload }) => {
+      const message = subagentMessageSummary(payload);
+      if (!message) return;
+      storeSubagentMessage(message);
+      renderSubagentTasksForCurrentState();
+    })
+      .then((unlisten) => {
+        disposeSubagentMessageListener = unlisten;
+      })
+      .catch(() => undefined);
+    void listen("tray:open-settings", () => {
+      // The native tray only asks the existing renderer to open its ordinary
+      // settings UI. It deliberately does not write preferences itself.
+      document.getElementById("btnSettings")?.click();
+    }).catch(() => undefined);
   }
   void hydrateSubagentTasks(window.__novaveiHost?.getSessionId());
+  void hydrateSubagentMessages(window.__novaveiHost?.getSessionId());
 
   function cancelPendingLiveAssistantRender() {
     if (pendingLiveAssistantTimer !== undefined) {
@@ -3510,6 +4096,7 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
     lastLiveAssistantRenderedAt = 0;
     pendingLiveAssistantText = "";
     pendingLiveAssistantThinking = "";
+    pendingLiveAssistantTools = {};
     pendingLiveAssistantNode = null;
   }
 
@@ -3581,6 +4168,7 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
   function syncLiveTranscriptFromState(state: PiRuntimeState) {
     const turn = liveTurnForState(state);
     if (!turn) return undefined;
+    if (rebindingTranscriptWindow) return turn;
     const presentation =
       (state.requestId
         ? presentationsByRequest.get(state.requestId)
@@ -3613,12 +4201,17 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
         };
       }
     }
+    const terminal = ["completed", "cancelled", "error"].includes(state.status);
+    if (terminal && turn.finishedAt === undefined) turn.finishedAt = Date.now();
     publishLiveTranscriptMessage({
       id: turn.assistantMessageId,
       sessionId: turn.sessionId,
       role: "assistant",
       content: state.assistantText,
+      thinking: state.thinkingText,
+      tools: sortedTools(state),
       createdAt: turn.createdAt + 1,
+      ...(turn.finishedAt !== undefined ? { finishedAt: turn.finishedAt } : {}),
       requestId: turn.requestId,
       turnId: turn.turnId,
       model: presentation?.model,
@@ -3748,20 +4341,23 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
   function renderLiveAssistantText(
     assistantText: string,
     thinkingText: string,
+    tools: Record<string, PiToolState>,
     flushImmediately: boolean,
   ) {
     if (!activeNode) return;
     pendingLiveAssistantText = stripPlanProtocolBlocks(assistantText);
     pendingLiveAssistantThinking = thinkingText;
+    pendingLiveAssistantTools = tools;
     pendingLiveAssistantNode = activeNode;
 
     const flush = () => {
       const targetNode = pendingLiveAssistantNode;
       const latestText = pendingLiveAssistantText;
       const latestThinking = pendingLiveAssistantThinking;
+      const latestTools = pendingLiveAssistantTools;
       pendingLiveAssistantTimer = undefined;
       if (!targetNode?.isConnected) return;
-      renderAssistantThinking(targetNode, latestThinking);
+      renderAssistantThinking(targetNode, latestThinking, latestTools);
       const text = targetNode.querySelector<HTMLElement>("[data-pi-text]");
       if (text) renderMarkdown(text, latestText);
       lastLiveAssistantRenderedAt = Date.now();
@@ -3771,6 +4367,7 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       cancelPendingLiveAssistantRender();
       pendingLiveAssistantText = stripPlanProtocolBlocks(assistantText);
       pendingLiveAssistantThinking = thinkingText;
+      pendingLiveAssistantTools = tools;
       pendingLiveAssistantNode = activeNode;
       flush();
       return;
@@ -3803,7 +4400,12 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       state.requestId === activeRequestId &&
       activeNode?.isConnected
     ) {
-      renderLiveAssistantText(state.assistantText, state.thinkingText, false);
+      renderLiveAssistantText(
+        state.assistantText,
+        state.thinkingText,
+        state.tools,
+        false,
+      );
       return;
     }
 
@@ -3819,7 +4421,12 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       Date.now() - lastLiveChromeRenderedAt < LIVE_CHROME_RENDER_INTERVAL_MS
     ) {
       syncLiveTranscriptFromState(state);
-      renderLiveAssistantText(state.assistantText, state.thinkingText, false);
+      renderLiveAssistantText(
+        state.assistantText,
+        state.thinkingText,
+        state.tools,
+        false,
+      );
       activeNode.dataset.piSource = stripPlanProtocolBlocks(
         state.assistantText,
       );
@@ -3872,6 +4479,7 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       activeStartedAt,
       subagentTasksForState(state),
       worktreeReviewActions,
+      subagentMessagesForState(state),
     );
     if (!activeNode) return;
     activeNode.dataset.piStatus = state.status;
@@ -3892,6 +4500,7 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       renderLiveAssistantText(
         state.assistantText,
         state.thinkingText,
+        state.tools,
         assistantTerminal,
       );
     }
@@ -3999,6 +4608,8 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       renderedTerminal = `${state.requestId}:${state.status}`;
       toast(state.status === "completed" ? "已完成" : "已取消");
     }
+    if (["completed", "cancelled", "error"].includes(state.status))
+      queueRunner?.();
     window.__novaveiFloorNav?.refresh?.();
   };
 
@@ -4049,6 +4660,36 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       sessionId: nativeSessionId || input.sessionId,
       cwd: nativeWorkdir || input.cwd || selectedWorkdir(),
     };
+    const queueSessionId = request.sessionId?.trim() || "__novavei-default__";
+    const activeState = controller.getState();
+    const activeForThisSession =
+      activeState.sessionId?.trim() === request.sessionId?.trim() &&
+      [
+        "starting",
+        "running",
+        "waiting_permission",
+        "cancelling",
+        "cancel_failed",
+      ].includes(activeState.status);
+    if (activeForThisSession) {
+      // Native media is session-scoped and transferred only once a turn is
+      // accepted. Keeping it out of the local queue avoids clearing or
+      // replaying an unaccepted attachment during a later cancellation.
+      if (attachmentPayload || request.images?.length) {
+        toast("当前运行时可排队纯文本提示；请在本轮结束后再发送附件。");
+        return undefined;
+      }
+      const queued = queuedPromptsBySession.get(queueSessionId) ?? [];
+      queued.push(request);
+      queuedPromptsBySession.set(queueSessionId, queued);
+      const queuedComposer = element<HTMLTextAreaElement>("composerInput");
+      if (queuedComposer) {
+        queuedComposer.value = "";
+        queuedComposer.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      toast(`已加入队列（${queued.length} 条）。`);
+      return undefined;
+    }
     const submissionPresentation: AssistantPresentation = {
       model: modelLabel(),
       reasoning: request.reasoning ?? selectedReasoning(),
@@ -4145,6 +4786,7 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
           role: "assistant",
           content: message,
           createdAt: optimisticTurn.createdAt + 1,
+          finishedAt: Date.now(),
           requestId: optimisticTurn.requestId,
           turnId: optimisticTurn.turnId,
           model: submissionPresentation.model,
@@ -4250,7 +4892,47 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
     }
   };
 
-  const cancel = () => controller.cancel();
+  const drainQueuedPrompts = () => {
+    if (queueDrainInFlight) return;
+    const state = controller.getState();
+    if (
+      [
+        "starting",
+        "running",
+        "waiting_permission",
+        "cancelling",
+        "cancel_failed",
+      ].includes(state.status)
+    )
+      return;
+    const sessionId =
+      state.sessionId?.trim() ??
+      window.__novaveiHost?.getSessionId?.()?.trim() ??
+      "__novavei-default__";
+    if (pausedPromptQueues.has(sessionId)) return;
+    const queued = queuedPromptsBySession.get(sessionId);
+    const next = queued?.shift();
+    if (!next) return;
+    if (!queued?.length) queuedPromptsBySession.delete(sessionId);
+    queueDrainInFlight = true;
+    void submit(next).finally(() => {
+      queueDrainInFlight = false;
+      // A synchronous/test transport may reach its terminal state before the
+      // current stack unwinds; defer to keep the queue strictly sequential.
+      window.queueMicrotask(drainQueuedPrompts);
+    });
+  };
+  queueRunner = drainQueuedPrompts;
+
+  const cancel = (options?: { resumeQueuedPrompt?: boolean }) => {
+    const sessionId =
+      controller.getState().sessionId?.trim() ??
+      window.__novaveiHost?.getSessionId?.()?.trim() ??
+      "__novavei-default__";
+    if (options?.resumeQueuedPrompt) pausedPromptQueues.delete(sessionId);
+    else pausedPromptQueues.add(sessionId);
+    return controller.cancel();
+  };
 
   const send = element<HTMLButtonElement>("btnSend");
   const onSendClick = (event: MouseEvent) => {
@@ -4268,7 +4950,9 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
     event.preventDefault();
     event.stopImmediatePropagation();
     if (controller.getState().status === "cancelling") return;
-    void cancel().catch((error) => toast(safeRuntimeMessage(error)));
+    void cancel({ resumeQueuedPrompt: true }).catch((error) =>
+      toast(safeRuntimeMessage(error)),
+    );
   };
   send?.addEventListener("click", onSendClick);
 
@@ -4317,6 +5001,7 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
         onTranscriptWindowRendered,
       );
       disposeSubagentTaskListener?.();
+      disposeSubagentMessageListener?.();
       disposeSessionModelPickerPersistence();
       disposeProjectPreferenceBindings();
       planConfirmationCards.dispose();

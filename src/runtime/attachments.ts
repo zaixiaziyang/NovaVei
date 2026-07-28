@@ -3,6 +3,17 @@ type Invoke = <T = unknown>(
   args?: Record<string, unknown>,
 ) => Promise<T>;
 
+/**
+ * Tauri treats a top-level ArrayBuffer payload as application/octet-stream.
+ * Keeping this separate from the ordinary JSON command helper prevents binary
+ * attachment bodies from accidentally being nested in an object and expanded
+ * into JSON number arrays.
+ */
+type RawInvoke = <T = unknown>(
+  command: string,
+  payload: ArrayBuffer,
+) => Promise<T>;
+
 type MediaKind = "image" | "audio" | "video";
 
 type PickedAttachment = {
@@ -27,10 +38,6 @@ type MediaDescriptor = {
   mime: string;
   kind: MediaKind;
   sizeBytes: number;
-};
-
-type MediaLoad = MediaDescriptor & {
-  bytes: unknown;
 };
 
 type LoadedMedia = MediaDescriptor & {
@@ -108,6 +115,15 @@ declare global {
 const MAX_ATTACHMENT_CHARS = 64_000;
 const MAX_TOTAL_CHARS = 240_000;
 const MAX_MEDIA_BYTES = 8 * 1024 * 1024;
+const MAX_MEDIA_IPC_HEADER_BYTES = 1024;
+const MAX_PASTED_IMAGE_IPC_HEADER_BYTES = 16 * 1024;
+const PASTED_IMAGE_IPC_MAGIC = [0x4e, 0x56, 0x50, 0x49] as const; // NVPI
+const PASTED_IMAGE_IPC_VERSION = 1;
+const PASTED_IMAGE_IPC_PREFIX_BYTES = 9;
+const MAX_PASTED_IMAGE_IPC_PAYLOAD_BYTES =
+  PASTED_IMAGE_IPC_PREFIX_BYTES +
+  MAX_PASTED_IMAGE_IPC_HEADER_BYTES +
+  MAX_MEDIA_BYTES;
 const MAX_MEDIA_TOTAL_BYTES = 16 * 1024 * 1024;
 const MAX_ATTACHMENTS = 20;
 const MAX_MEDIA_MARKER_CHARS = 64_000;
@@ -139,6 +155,10 @@ function byId<T extends HTMLElement>(id: string) {
 
 function desktopInvoke() {
   return window.__TAURI__?.core?.invoke as Invoke | undefined;
+}
+
+function desktopRawInvoke() {
+  return window.__TAURI__?.core?.invoke as unknown as RawInvoke | undefined;
 }
 
 function toast(message: string) {
@@ -197,20 +217,75 @@ function normaliseMediaDescriptor(value: unknown): MediaDescriptor | undefined {
   return { id, name, mime, kind, sizeBytes };
 }
 
-function bytesFromIpc(value: unknown): Uint8Array | undefined {
+function pastedImageIpcPayload(
+  header: {
+    workdir: string;
+    sessionId: string;
+    name: string;
+    mime: string;
+  },
+  image: ArrayBuffer,
+) {
+  const metadata = new TextEncoder().encode(JSON.stringify(header));
   if (
-    !Array.isArray(value) ||
-    value.length === 0 ||
-    value.length > MAX_MEDIA_BYTES
+    metadata.length === 0 ||
+    metadata.length > MAX_PASTED_IMAGE_IPC_HEADER_BYTES ||
+    image.byteLength === 0 ||
+    image.byteLength > MAX_MEDIA_BYTES
+  ) {
+    throw new Error("粘贴图片数据超出安全限制");
+  }
+  const payloadLength =
+    PASTED_IMAGE_IPC_PREFIX_BYTES + metadata.length + image.byteLength;
+  if (payloadLength > MAX_PASTED_IMAGE_IPC_PAYLOAD_BYTES) {
+    throw new Error("粘贴图片数据超出安全限制");
+  }
+  const payload = new Uint8Array(payloadLength);
+  payload.set(PASTED_IMAGE_IPC_MAGIC, 0);
+  payload[PASTED_IMAGE_IPC_MAGIC.length] = PASTED_IMAGE_IPC_VERSION;
+  new DataView(payload.buffer).setUint32(
+    PASTED_IMAGE_IPC_MAGIC.length + 1,
+    metadata.length,
+    false,
+  );
+  payload.set(metadata, PASTED_IMAGE_IPC_PREFIX_BYTES);
+  payload.set(
+    new Uint8Array(image),
+    PASTED_IMAGE_IPC_PREFIX_BYTES + metadata.length,
+  );
+  return payload.buffer;
+}
+
+function mediaLoadFromIpc(
+  value: unknown,
+): { descriptor: MediaDescriptor; bytes: Uint8Array } | undefined {
+  if (!(value instanceof ArrayBuffer) || value.byteLength <= 4)
+    return undefined;
+  const headerLength = new DataView(value).getUint32(0, false);
+  if (
+    headerLength === 0 ||
+    headerLength > MAX_MEDIA_IPC_HEADER_BYTES ||
+    headerLength > value.byteLength - 4
   )
     return undefined;
-  const bytes = new Uint8Array(value.length);
-  for (let index = 0; index < value.length; index += 1) {
-    const byte = value[index];
-    if (!Number.isInteger(byte) || byte < 0 || byte > 255) return undefined;
-    bytes[index] = byte;
+  let descriptorValue: unknown;
+  try {
+    descriptorValue = JSON.parse(
+      new TextDecoder().decode(new Uint8Array(value, 4, headerLength)),
+    );
+  } catch {
+    return undefined;
   }
-  return bytes;
+  const descriptor = normaliseMediaDescriptor(descriptorValue);
+  const bytes = new Uint8Array(value, 4 + headerLength);
+  if (
+    !descriptor ||
+    bytes.length === 0 ||
+    bytes.length > MAX_MEDIA_BYTES ||
+    bytes.length !== descriptor.sizeBytes
+  )
+    return undefined;
+  return { descriptor, bytes };
 }
 
 function bytesToBase64(bytes: Uint8Array) {
@@ -316,13 +391,13 @@ async function loadMedia(
   expected: MediaDescriptor,
   includeImageData = false,
 ): Promise<LoadedMedia> {
-  const raw = await invoke<unknown>("composer_media_load", {
+  const raw = await invoke<ArrayBuffer>("composer_media_load", {
     sessionId,
     attachmentId: expected.id,
   });
-  if (!isRecord(raw)) throw new Error("附件预览响应无效");
-  const descriptor = normaliseMediaDescriptor(raw as MediaLoad);
-  const bytes = bytesFromIpc(raw.bytes);
+  const loaded = mediaLoadFromIpc(raw);
+  const descriptor = loaded?.descriptor;
+  const bytes = loaded?.bytes;
   if (
     !descriptor ||
     !bytes ||
@@ -450,7 +525,7 @@ function ensureAttachmentStyles() {
     .novavei-attachment-card {
       display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; align-items: center; gap: 8px;
       min-width: min(100%, 208px); max-width: min(100%, 330px); padding: 6px;
-      border: 1px solid var(--line); border-radius: 12px; background: color-mix(in srgb, var(--panel-deep) 84%, var(--control));
+      border: 1px solid var(--line); border-radius: var(--r-surface); background: color-mix(in srgb, var(--panel-deep) 84%, var(--control));
       color: var(--text); box-shadow: 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent);
     }
     .novavei-attachment-card[data-load-state="error"] { border-color: color-mix(in srgb, var(--danger, #d96b6b) 52%, var(--line)); }
@@ -465,27 +540,27 @@ function ensureAttachmentStyles() {
     .novavei-attachment-thumb img { width: 100%; height: 100%; object-fit: cover; }
     .novavei-attachment-icon { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
     .novavei-attachment-body { display: grid; gap: 2px; min-width: 0; }
-    .novavei-attachment-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 620; }
-    .novavei-attachment-meta { color: var(--subtle); font-size: 11px; line-height: 1.3; }
-    .novavei-attachment-remove { width: 32px; height: 32px; padding: 0; border-radius: 8px; }
+    .novavei-attachment-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-sm); font-weight: 620; }
+    .novavei-attachment-meta { color: var(--subtle); font-size: var(--text-xs); line-height: 1.3; }
+    .novavei-attachment-remove { width: 32px; height: 32px; padding: 0; border-radius: var(--r-control); }
     .novavei-attachment-remove .novavei-attachment-icon, .novavei-media-preview-close .novavei-attachment-icon { width: 17px; height: 17px; }
     .novavei-text-attachment {
       display: inline-flex; align-items: center; gap: 6px; max-width: min(100%, 330px); padding: 5px 5px 5px 10px;
-      border: 1px solid var(--line); border-radius: 999px; background: var(--control); color: var(--text); font-size: 12px;
+      border: 1px solid var(--line); border-radius: var(--r-pill); background: var(--control); color: var(--text); font-size: var(--text-sm);
     }
     .novavei-text-attachment > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .novavei-text-attachment .novavei-attachment-remove { width: 28px; height: 28px; border-radius: 50%; }
+    .novavei-text-attachment .novavei-attachment-remove { width: 28px; height: 28px; border-radius: var(--r-circle); }
     .novavei-media-preview {
       width: min(860px, calc(100vw - 28px)); max-width: 860px; max-height: calc(100dvh - 28px); padding: 0;
-      border: 1px solid var(--line); border-radius: 16px; background: var(--panel); color: var(--text); box-shadow: 0 20px 70px rgba(0,0,0,.46);
+      border: 1px solid var(--line); border-radius: var(--r-md); background: var(--glass-strong); color: var(--text); box-shadow: 0 20px 70px rgba(0,0,0,.46);
     }
     .novavei-media-preview::backdrop { background: rgba(3, 7, 14, .56); }
     .novavei-media-preview-inner { display: grid; gap: 12px; max-height: calc(100dvh - 28px); padding: 14px; }
     .novavei-media-preview-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-    .novavei-media-preview-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 650; }
-    .novavei-media-preview-close { width: 40px; height: 40px; flex: 0 0 auto; border-radius: 10px; }
+    .novavei-media-preview-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-base); font-weight: 650; }
+    .novavei-media-preview-close { width: 40px; height: 40px; flex: 0 0 auto; border-radius: var(--r-sm); }
     .novavei-media-preview-content { display: grid; place-items: center; min-height: 80px; overflow: auto; }
-    .novavei-media-preview-content img, .novavei-media-preview-content video { max-width: 100%; max-height: min(68dvh, 660px); border-radius: 10px; object-fit: contain; }
+    .novavei-media-preview-content img, .novavei-media-preview-content video { max-width: 100%; max-height: min(68dvh, 660px); border-radius: var(--r-sm); object-fit: contain; }
     .novavei-media-preview-content audio { width: min(100%, 560px); }
     @media (max-width: 560px) {
       .novavei-composer-attachments { padding-left: 12px; padding-right: 12px; }
@@ -843,10 +918,11 @@ function makeDisplayText(
 export function installComposerAttachments() {
   if (window.__novaveiComposerAttachments) return;
   const invoke = desktopInvoke();
+  const rawInvoke = desktopRawInvoke();
   const host = window.__novaveiHost;
   const trigger = byId<HTMLButtonElement>("btnComposerAdd");
   const input = byId<HTMLTextAreaElement>("composerInput");
-  if (!invoke || !host || !trigger || !input) return;
+  if (!invoke || !rawInvoke || !host || !trigger || !input) return;
 
   ensureAttachmentStyles();
   trigger.removeAttribute("data-feature-unavailable");
@@ -1336,17 +1412,22 @@ export function installComposerAttachments() {
         toast("媒体附件超过当前消息的数量或大小上限");
         break;
       }
-      const bytes = new Uint8Array(await file.arrayBuffer());
+      const image = await file.arrayBuffer();
       if (!sessionIsStillCurrent(sessionId, workdir)) {
         throw new Error("项目或会话已切换，请重新粘贴图片");
       }
-      const raw = await invoke<unknown>("composer_stage_pasted_image", {
-        workdir,
-        sessionId,
-        name: safeName(file.name || `clipboard-image-${Date.now()}.png`),
-        mime: file.type,
-        bytes: Array.from(bytes),
-      });
+      const raw = await rawInvoke<unknown>(
+        "composer_stage_pasted_image",
+        pastedImageIpcPayload(
+          {
+            workdir,
+            sessionId,
+            name: safeName(file.name || `clipboard-image-${Date.now()}.png`),
+            mime: file.type,
+          },
+          image,
+        ),
+      );
       const descriptor = normaliseMediaDescriptor(raw);
       if (descriptor?.kind !== "image") {
         // A malformed renderer-facing DTO must not turn a successfully

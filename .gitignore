@@ -14,6 +14,8 @@
 *.spec.*
 /scripts/*
 !/scripts/copy-portable.mjs
+!/scripts/ci-supply-chain-audit.mjs
+!/scripts/ipc-capability-audit.mjs
 !/scripts/portable-packaging-audit.mjs
 !/scripts/release-smoke-checklist.mjs
 /*.cmd
@@ -22,6 +24,7 @@
 /node_modules/
 /dist/
 /release/
+/portable/
 /src-tauri/target/
 /src-tauri/gen/
 /.vite/

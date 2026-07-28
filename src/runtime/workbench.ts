@@ -4,6 +4,11 @@ import {
   showAppError,
 } from "./app-dialogs";
 import type { NativeShellApi } from "./host";
+import {
+  applyFullMessageTimestampPreference,
+  currentFullMessageTimestampPreference,
+  normalizeFullMessageTimestampPreference,
+} from "./message-time";
 import { displayPath } from "./path-display";
 
 type UnknownRecord = Record<string, unknown>;
@@ -40,6 +45,38 @@ type FileReadResponse = {
   startLine?: number;
   numLines?: number;
   totalLines?: number;
+};
+
+type GitStatusEntry = {
+  path?: string;
+  indexStatus?: string;
+  worktreeStatus?: string;
+};
+
+type GitStatusResponse = {
+  isRepository?: boolean;
+  repositoryRoot?: string;
+  branch?: string;
+  ahead?: number;
+  behind?: number;
+  entries?: GitStatusEntry[];
+  stagedCount?: number;
+  unstagedCount?: number;
+  untrackedCount?: number;
+  clean?: boolean;
+  unavailableReason?: string;
+};
+
+type GitCommitResponse = {
+  commitId?: string;
+  committedFiles?: number;
+};
+
+type GitCommitCapabilityResponse = {
+  grantToken?: string;
+  workdir?: string;
+  stagedCount?: number;
+  expiresAtMs?: number;
 };
 
 type RuntimeState = {
@@ -229,6 +266,26 @@ function applyShortcutHintVisibility(showShortcutHints: boolean) {
   composerInput.placeholder = showShortcutHints
     ? copy.composerPlaceholder
     : copy.composerPlaceholderWithoutShortcut;
+}
+
+function messageTimestampToggles() {
+  return [
+    ...document.querySelectorAll<HTMLInputElement>(
+      "[data-message-timestamp-toggle]",
+    ),
+  ];
+}
+
+function currentMessageTimestampPreference() {
+  const primary = element<HTMLInputElement>("showFullMessageTimestamp");
+  if (primary) return primary.checked;
+  const toggles = messageTimestampToggles();
+  return toggles[0]?.checked ?? currentFullMessageTimestampPreference();
+}
+
+function applyMessageTimestampPreference(showFull: boolean) {
+  applyFullMessageTimestampPreference(showFull);
+  for (const toggle of messageTimestampToggles()) toggle.checked = showFull;
 }
 
 function toast(message: string) {
@@ -631,22 +688,32 @@ function traceItem(
   startedAt?: number,
   finishedAt?: number,
 ): HTMLLIElement {
+  const normalizedStatus = normalizeTraceStatus(status);
   const item = document.createElement("li");
+  item.dataset.traceStatus = normalizedStatus;
   const marker = document.createElement("i");
   marker.setAttribute("aria-hidden", "true");
   if (
-    status === "running" ||
-    status === "starting" ||
-    status === "waiting_permission"
+    normalizedStatus === "running" ||
+    normalizedStatus === "starting" ||
+    normalizedStatus === "waiting_permission"
   )
     marker.className = "run";
-  else if (status === "unknown") marker.className = "wait";
+  else if (normalizedStatus === "unknown") marker.className = "wait";
   const content = document.createElement("span");
+  content.className = "history-trace-content";
   const title = document.createElement("b");
   title.textContent = name;
-  const detail = document.createElement("small");
-  detail.textContent = `${traceStatusLabel(status)} · ${traceTiming(startedAt, finishedAt)}`;
-  content.append(title, detail);
+  const meta = document.createElement("span");
+  meta.className = "history-trace-meta";
+  const statusLabel = document.createElement("small");
+  statusLabel.className = "history-trace-status";
+  statusLabel.textContent = traceStatusLabel(normalizedStatus);
+  const timing = document.createElement("small");
+  timing.className = "history-trace-time";
+  timing.textContent = traceTiming(startedAt, finishedAt);
+  meta.append(statusLabel, timing);
+  content.append(title, meta);
   item.append(marker, content);
   return item;
 }
@@ -657,7 +724,7 @@ function historyTraceList(article: HTMLElement): HTMLOListElement {
   );
   if (existing) return existing;
   const list = document.createElement("ol");
-  list.className = "trace";
+  list.className = "trace history-trace";
   list.dataset.historyTrace = "true";
   list.tabIndex = -1;
   list.setAttribute("aria-label", "本回复的已保存运行轨迹");
@@ -700,6 +767,7 @@ async function showHistoricalTrace(
   const previousLabel = button.textContent;
   button.disabled = true;
   button.textContent = "读取轨迹…";
+  button.setAttribute("aria-expanded", "true");
   list.setAttribute("aria-busy", "true");
   list.replaceChildren(traceItem("正在读取已保存轨迹", "running"));
   try {
@@ -738,6 +806,7 @@ async function showHistoricalTrace(
     toast(`已显示 ${trace.tools.length} 条本回复的工具轨迹`);
   } catch (error) {
     list.remove();
+    button.setAttribute("aria-expanded", "false");
     console.warn("[NovaVei workbench] historical trace load failed", error);
     throw new Error("无法读取本回复的已保存轨迹；不会显示其他运行的轨迹");
   } finally {
@@ -1609,6 +1678,29 @@ function installFiles() {
 
     const list = document.createElement("div");
     list.className = "file-browser-list";
+    const rowCache = new Map<string, HTMLButtonElement>();
+    let filterTimer: number | undefined;
+    const rowForEntry = (entry: FileEntry, selected: boolean) => {
+      const path = normaliseWorkspacePath(entry.path || entry.name);
+      let row = rowCache.get(path);
+      if (!row) {
+        row = fileEntryRow(
+          entry,
+          (opened) => {
+            if (opened.kind === "dir")
+              void loadDirectory(opened.path || opened.name || ".");
+            else void readFile(opened);
+          },
+          selected,
+        );
+        rowCache.set(path, row);
+      } else {
+        row.className = selected ? "tree-row is-selected" : "tree-row";
+        if (selected) row.setAttribute("aria-current", "true");
+        else row.removeAttribute("aria-current");
+      }
+      return row;
+    };
     const updateList = () => {
       const needle = fileFilter.trim().toLocaleLowerCase();
       const entries = needle
@@ -1627,13 +1719,8 @@ function installFiles() {
       );
       list.replaceChildren(
         ...entries.map((entry) =>
-          fileEntryRow(
+          rowForEntry(
             entry,
-            (selected) => {
-              if (selected.kind === "dir")
-                void loadDirectory(selected.path || selected.name || ".");
-              else void readFile(selected);
-            },
             entry.kind !== "dir" &&
               normaliseWorkspacePath(entry.path || entry.name) ===
                 normaliseWorkspacePath(previewEntry?.path || ""),
@@ -1654,7 +1741,11 @@ function installFiles() {
     };
     filter.addEventListener("input", () => {
       fileFilter = filter.value;
-      updateList();
+      if (filterTimer !== undefined) window.clearTimeout(filterTimer);
+      filterTimer = window.setTimeout(() => {
+        filterTimer = undefined;
+        updateList();
+      }, 100);
     });
     tree.append(
       treeHead,
@@ -1918,11 +2009,175 @@ function gitPane() {
   return document.querySelector<HTMLElement>('.dock-pane[data-pane="git"]');
 }
 
-function gitIntegratedShellUnavailableMessage() {
-  return uiText(
-    "集成命令行已移除，请在外部终端执行 Git 操作。",
-    "The integrated terminal was removed. Run Git commands in an external terminal.",
+let gitRefreshSerial = 0;
+let gitRefreshInFlight = false;
+let gitCommitInFlight = false;
+let gitCanCommit = false;
+
+function gitControls(pane = gitPane()) {
+  return {
+    commit: pane?.querySelector<HTMLButtonElement>("[data-git-commit]"),
+    refresh: pane?.querySelector<HTMLButtonElement>("[data-git-refresh]"),
+  };
+}
+
+function updateGitControls() {
+  const { commit, refresh } = gitControls();
+  if (commit) {
+    commit.disabled = gitRefreshInFlight || gitCommitInFlight || !gitCanCommit;
+    commit.textContent = gitCommitInFlight
+      ? uiText("正在提交…", "Committing…")
+      : uiText("提交", "Commit");
+  }
+  if (refresh) {
+    refresh.disabled = gitRefreshInFlight || gitCommitInFlight;
+    refresh.textContent = gitRefreshInFlight
+      ? uiText("正在刷新…", "Refreshing…")
+      : uiText("刷新", "Refresh");
+  }
+}
+
+function hideGitFeature() {
+  gitRefreshSerial += 1;
+  gitRefreshInFlight = false;
+  gitCommitInFlight = false;
+  gitCanCommit = false;
+  const pane = gitPane();
+  const tab = document.getElementById(
+    "dock-tab-git",
+  ) as HTMLButtonElement | null;
+  const menuChoice = document.querySelector<HTMLElement>(
+    '[data-dock-tool="git"]',
   );
+  const wasActive = tab?.classList.contains("on") === true;
+  if (tab) {
+    tab.hidden = true;
+    tab.disabled = true;
+    tab.tabIndex = -1;
+    tab.setAttribute("aria-hidden", "true");
+  }
+  if (menuChoice) menuChoice.hidden = true;
+  if (pane) {
+    pane.hidden = true;
+    pane.classList.remove("on");
+  }
+  if (wasActive)
+    document
+      .getElementById("dock-tab-run")
+      ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+}
+
+function gitUnavailableMessage(status: GitStatusResponse) {
+  switch (status.unavailableReason) {
+    case "repository_outside_workspace":
+      return uiText(
+        "当前打开的是仓库的子文件夹。为避免读取或提交项目外的改动，请从仓库根目录打开项目。",
+        "This project is a subfolder of a repository. Open the repository root so NovaVei never reviews or commits sibling changes.",
+      );
+    case "not_repository":
+      return uiText(
+        "当前项目不是 Git 仓库。切换到 Git 项目后可在这里查看状态。",
+        "This project is not a Git repository. Open a Git project to review its status here.",
+      );
+    default:
+      return uiText("Git 当前不可用。", "Git is currently unavailable.");
+  }
+}
+
+function gitStatusLabel(entry: GitStatusEntry) {
+  const index = entry.indexStatus?.trim() || "";
+  const worktree = entry.worktreeStatus?.trim() || "";
+  if (index === "?" && worktree === "?") return uiText("未跟踪", "Untracked");
+  const parts: string[] = [];
+  if (index) parts.push(uiText(`已暂存 ${index}`, `Staged ${index}`));
+  if (worktree)
+    parts.push(uiText(`未暂存 ${worktree}`, `Unstaged ${worktree}`));
+  return parts.join(" · ") || uiText("已变更", "Changed");
+}
+
+function renderGitStatus(pane: HTMLElement, status: GitStatusResponse) {
+  const section = pane.querySelector<HTMLElement>(".section");
+  const note = pane.querySelector<HTMLElement>(".dock-note");
+  if (!section || !note) return;
+  if (status.isRepository !== true) {
+    note.textContent = uiText(
+      "Git Review · 不可用",
+      "Git Review · Unavailable",
+    );
+    section.replaceChildren(fileMessage(gitUnavailableMessage(status)));
+    return;
+  }
+  const branch =
+    status.branch?.trim() || uiText("未命名分支", "Unnamed branch");
+  const ahead = Math.max(0, status.ahead ?? 0);
+  const behind = Math.max(0, status.behind ?? 0);
+  const staged = Math.max(0, status.stagedCount ?? 0);
+  const unstaged = Math.max(0, status.unstagedCount ?? 0);
+  const untracked = Math.max(0, status.untrackedCount ?? 0);
+  const entries = Array.isArray(status.entries) ? status.entries : [];
+  note.textContent = uiText("Git Review · 已连接", "Git Review · Connected");
+
+  const summary = document.createElement("div");
+  summary.className = "target";
+  const badge = document.createElement("div");
+  badge.className = "avatar";
+  badge.textContent = "Git";
+  const text = document.createElement("div");
+  const title = document.createElement("strong");
+  title.textContent = branch;
+  const detail = document.createElement("span");
+  const tracking = [
+    ahead ? uiText(`领先 ${ahead}`, `Ahead ${ahead}`) : "",
+    behind ? uiText(`落后 ${behind}`, `Behind ${behind}`) : "",
+  ].filter(Boolean);
+  detail.textContent = status.clean
+    ? uiText("工作区干净", "Working tree clean")
+    : uiText(
+        `已暂存 ${staged} · 未暂存 ${unstaged} · 未跟踪 ${untracked}`,
+        `Staged ${staged} · Unstaged ${unstaged} · Untracked ${untracked}`,
+      );
+  if (tracking.length) detail.textContent += ` · ${tracking.join(" · ")}`;
+  text.append(title, detail);
+  const state = document.createElement("span");
+  state.className = `pill ${status.clean ? "ok" : "wait"}`;
+  state.textContent = status.clean
+    ? uiText("干净", "Clean")
+    : uiText("有改动", "Changes");
+  summary.append(badge, text, state);
+
+  if (status.clean) {
+    section.replaceChildren(
+      summary,
+      fileMessage(
+        uiText("没有待提交的改动。", "There are no pending changes."),
+      ),
+    );
+    return;
+  }
+  const list = document.createElement("ol");
+  list.className = "trace";
+  list.setAttribute("aria-label", uiText("Git 改动列表", "Git changes"));
+  for (const entry of entries) {
+    const item = document.createElement("li");
+    const marker = document.createElement("i");
+    marker.className = entry.indexStatus?.trim() ? "run" : "wait";
+    marker.setAttribute("aria-hidden", "true");
+    const body = document.createElement("span");
+    const path = document.createElement("b");
+    path.textContent = entry.path || uiText("未知路径", "Unknown path");
+    const statusText = document.createElement("small");
+    statusText.textContent = gitStatusLabel(entry);
+    body.append(path, statusText);
+    item.append(marker, body);
+    list.appendChild(item);
+  }
+  section.replaceChildren(summary, list);
+}
+
+function isGitExecutableUnavailable(error: unknown) {
+  return errorText(error)
+    .toLocaleLowerCase()
+    .includes("git executable is unavailable");
 }
 
 function gitAccessMessage() {
@@ -1962,35 +2217,163 @@ async function refreshGit() {
   const section = pane?.querySelector<HTMLElement>(".section");
   const note = pane?.querySelector<HTMLElement>(".dock-note");
   if (!pane || !section || !note) return;
+  const serial = ++gitRefreshSerial;
+  gitRefreshInFlight = true;
+  gitCanCommit = false;
+  updateGitControls();
   // Match File Dock: never claim Git readiness before the host has a real
   // project/session. Browser preview keeps the static Git surface.
-  if (!invokeApi() || !hostApi()) return;
+  if (!invokeApi() || !hostApi()) {
+    gitRefreshInFlight = false;
+    updateGitControls();
+    return;
+  }
   const unavailable = gitAccessMessage();
   if (unavailable) {
     note.textContent = "Git Review";
     section.replaceChildren(fileMessage(unavailable));
+    gitRefreshInFlight = false;
+    updateGitControls();
     return;
   }
-  note.textContent = uiText(
-    "Git Review · 外部终端",
-    "Git Review · External terminal",
+  note.textContent = uiText("Git Review · 正在读取", "Git Review · Reading");
+  section.replaceChildren(
+    fileMessage(
+      uiText(
+        "正在读取当前项目的 Git 状态…",
+        "Reading this project's Git status…",
+      ),
+    ),
   );
-  const guidance = document.createElement("p");
-  guidance.className = "dock-note";
-  guidance.textContent = gitIntegratedShellUnavailableMessage();
-  section.replaceChildren(guidance);
+  try {
+    const { invoke, host } = requireDesktop();
+    const capability = await host.issueWorkspaceCapability();
+    const status = await invoke<GitStatusResponse>("git_status", {
+      workdir: capability.workdir,
+      capability_token: capability.capabilityToken,
+    });
+    if (serial !== gitRefreshSerial || !pane.isConnected) return;
+    gitCanCommit =
+      status.isRepository === true && (status.stagedCount ?? 0) > 0;
+    renderGitStatus(pane, status);
+  } catch (error) {
+    if (serial !== gitRefreshSerial || !pane.isConnected) return;
+    if (isGitExecutableUnavailable(error)) {
+      hideGitFeature();
+      toast(
+        uiText(
+          "未检测到 Git，已隐藏 Git 模块。安装 Git 并重启 NovaVei 后会重新显示。",
+          "Git is not installed, so the Git module was hidden. Install Git and restart NovaVei to restore it.",
+        ),
+      );
+      return;
+    }
+    note.textContent = uiText(
+      "Git Review · 无法读取",
+      "Git Review · Unavailable",
+    );
+    section.replaceChildren(
+      fileMessage(
+        uiText(
+          "无法读取当前项目的 Git 状态。",
+          "Could not read this project's Git status.",
+        ),
+      ),
+    );
+    console.warn("[NovaVei Git] status request failed", error);
+  } finally {
+    if (serial === gitRefreshSerial) {
+      gitRefreshInFlight = false;
+      updateGitControls();
+    }
+  }
 }
 
 async function commitGit() {
-  // Integrated shell execution was removed with the visible terminal dock.
-  // Keep the Git UI entry points, but never mint shell capabilities here.
   const unavailable = gitAccessMessage();
   if (unavailable) {
     await showAppError(unavailable, "Git 当前不可用");
     return;
   }
-  if (!invokeApi() || !hostApi()) return;
-  toast(gitIntegratedShellUnavailableMessage());
+  if (!invokeApi() || !hostApi() || gitCommitInFlight) return;
+  try {
+    const { invoke, host } = requireDesktop();
+    const capability = await host.issueWorkspaceCapability();
+    const status = await invoke<GitStatusResponse>("git_status", {
+      workdir: capability.workdir,
+      capability_token: capability.capabilityToken,
+    });
+    if (status.isRepository !== true) {
+      await refreshGit();
+      await showAppError(gitUnavailableMessage(status), "Git 当前不可用");
+      return;
+    }
+    if ((status.stagedCount ?? 0) < 1) {
+      await showAppError(
+        uiText(
+          "没有已暂存的改动可以提交。Git 模块只会提交你已明确暂存的文件。",
+          "There are no staged changes to commit. Git Review commits only files you explicitly staged.",
+        ),
+        uiText("没有可提交的改动", "Nothing to commit"),
+      );
+      return;
+    }
+    const message = await requestAppPrompt({
+      title: uiText("创建 Git 提交", "Create Git commit"),
+      message: uiText(
+        "只会提交当前暂存区的文件。该项目配置的 Git hooks 可能会在提交期间运行。",
+        "Only currently staged files will be committed. Git hooks configured by this project may run during the commit.",
+      ),
+      label: uiText("提交说明", "Commit message"),
+      placeholder: uiText("说明这次改动", "Describe this change"),
+      confirmLabel: uiText("继续", "Continue"),
+      maxLength: 4000,
+      multiline: true,
+    });
+    if (message === null) return;
+    if (
+      capability.sessionId &&
+      host.getSessionId()?.trim() !== capability.sessionId
+    ) {
+      throw new Error("会话已切换；不会提交其他项目的暂存改动");
+    }
+    const commitGrant = await invoke<GitCommitCapabilityResponse>(
+      "git_commit_capability_issue",
+      {
+        workdir: capability.workdir,
+        message,
+        capability_token: capability.capabilityToken,
+      },
+    );
+    if (!commitGrant.grantToken) {
+      throw new Error("Git 提交确认无效");
+    }
+    gitCommitInFlight = true;
+    updateGitControls();
+    const result = await invoke<GitCommitResponse>("git_commit", {
+      workdir: commitGrant.workdir ?? capability.workdir,
+      message,
+      commit_token: commitGrant.grantToken,
+    });
+    toast(
+      result.commitId
+        ? uiText(
+            `已创建提交 ${result.commitId}`,
+            `Created commit ${result.commitId}`,
+          )
+        : uiText("已创建 Git 提交", "Created Git commit"),
+    );
+    await refreshGit();
+  } catch (error) {
+    console.warn("[NovaVei Git] commit request failed", error);
+    await showAppError(
+      errorText(error),
+      uiText("Git 提交失败", "Git commit failed"),
+    );
+  } finally {
+    gitCommitInFlight = false;
+    updateGitControls();
+  }
 }
 
 function installGit() {
@@ -2016,6 +2399,11 @@ function installGit() {
       activateGit();
   });
   window.addEventListener("novavei:host-state-changed", () => {
+    const pane = gitPane();
+    if (!pane?.classList.contains("on")) return;
+    window.setTimeout(() => void refreshGit(), 0);
+  });
+  window.addEventListener("novavei:workdir-changed", () => {
     const pane = gitPane();
     if (!pane?.classList.contains("on")) return;
     window.setTimeout(() => void refreshGit(), 0);
@@ -2058,6 +2446,26 @@ function globalPromptCounterText(current: number) {
 const HISTORY_MESSAGE_PAGE_SIZES = new Set([40, 80, 120, 200]);
 const DEFAULT_HISTORY_MESSAGE_PAGE_SIZE = 80;
 const HISTORY_MESSAGE_PAGE_SIZE_STORAGE_KEY = "novavei.historyMessagePageSize";
+const SECONDARY_LAUNCH_FOCUS_EXISTING = "focus-existing";
+const SECONDARY_LAUNCH_NEW_WINDOW = "new-window";
+
+function normalizeSecondaryLaunchBehavior(value: unknown) {
+  return value === SECONDARY_LAUNCH_NEW_WINDOW
+    ? SECONDARY_LAUNCH_NEW_WINDOW
+    : SECONDARY_LAUNCH_FOCUS_EXISTING;
+}
+
+function applySecondaryLaunchBehavior(value: unknown) {
+  const behavior = normalizeSecondaryLaunchBehavior(value);
+  document
+    .querySelectorAll<HTMLButtonElement>("[data-secondary-launch-behavior]")
+    .forEach((button) => {
+      const selected = button.dataset.secondaryLaunchBehavior === behavior;
+      button.classList.toggle("on", selected);
+      button.setAttribute("aria-checked", String(selected));
+      button.tabIndex = selected ? 0 : -1;
+    });
+}
 
 function normalizeHistoryMessagePageSize(value: unknown): number {
   const parsed =
@@ -2111,7 +2519,14 @@ function currentSystemPayload(previous: UnknownRecord) {
   delete system.defaultPermissionTier;
   delete system.default_permission_tier;
   delete system.fullPermissionConfirmedRoots;
+  delete system.secondary_launch_behavior;
   const scale = selectedData("[data-ui-scale]", "uiScale");
+  const secondaryLaunchBehavior = normalizeSecondaryLaunchBehavior(
+    selectedData(
+      "[data-secondary-launch-behavior]",
+      "secondaryLaunchBehavior",
+    ) ?? system.secondaryLaunchBehavior,
+  );
   const pageSize = normalizeHistoryMessagePageSize(
     historyMessagePageSize?.value ?? system.historyMessagePageSize,
   );
@@ -2127,12 +2542,14 @@ function currentSystemPayload(previous: UnknownRecord) {
       "zh-CN",
     uiScale: Number(scale || 100),
     showShortcutHints: currentShortcutHintVisibility(),
+    showFullMessageTimestamp: currentMessageTimestampPreference(),
     userAccent: picker?.value || "#0A84FF",
     uiFont: uiFont?.value || "system",
     codeFont: codeFont?.value || "system",
     workdirPolicy: "project",
     historyMessagePageSize: pageSize,
     globalSystemPrompt: globalSystemPrompt?.value ?? "",
+    secondaryLaunchBehavior,
   };
 }
 
@@ -2159,12 +2576,14 @@ function installSettings() {
     "[data-ui-scale]",
     "[data-user-color]",
     "[data-shortcut-hints-toggle]",
+    "[data-message-timestamp-toggle]",
     "#userColorPicker",
     "#settingsUiFont",
     "#settingsCodeFont",
     "#workdirPolicy",
     "#historyMessagePageSize",
     "#globalSystemPrompt",
+    "[data-secondary-launch-behavior]",
   ].join(", ");
   const setPersistentSettingsControlsEnabled = (enabled: boolean) => {
     document
@@ -2232,6 +2651,16 @@ function installSettings() {
   };
   document.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : null;
+    const launchBehaviorChoice = target?.closest<HTMLButtonElement>(
+      "[data-secondary-launch-behavior]",
+    );
+    if (launchBehaviorChoice) {
+      applySecondaryLaunchBehavior(
+        launchBehaviorChoice.dataset.secondaryLaunchBehavior,
+      );
+      if (!hydrating) scheduleSave();
+      return;
+    }
     if (
       target?.closest(
         "[data-theme-opt], [data-lang-opt], [data-ui-scale], [data-user-color]",
@@ -2241,6 +2670,33 @@ function installSettings() {
       window.setTimeout(scheduleSave, 0);
     }
   });
+  document.addEventListener("keydown", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLButtonElement)) return;
+    if (!target.matches("[data-secondary-launch-behavior]")) return;
+    const controls = [
+      ...document.querySelectorAll<HTMLButtonElement>(
+        "[data-secondary-launch-behavior]",
+      ),
+    ];
+    const current = controls.indexOf(target);
+    if (current < 0 || !controls.length) return;
+    let next = current;
+    if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+      next = (current - 1 + controls.length) % controls.length;
+    } else if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+      next = (current + 1) % controls.length;
+    } else if (event.key === "Home") {
+      next = 0;
+    } else if (event.key === "End") {
+      next = controls.length - 1;
+    } else {
+      return;
+    }
+    event.preventDefault();
+    controls[next]?.focus();
+    controls[next]?.click();
+  });
   document.addEventListener("change", (event) => {
     const target = event.target instanceof Element ? event.target : null;
     if (target?.matches("[data-shortcut-hints-toggle]")) {
@@ -2249,6 +2705,13 @@ function installSettings() {
           ? target.checked
           : currentShortcutHintVisibility();
       applyShortcutHintVisibility(checked);
+      scheduleSave();
+    } else if (target?.matches("[data-message-timestamp-toggle]")) {
+      const checked =
+        target instanceof HTMLInputElement
+          ? target.checked
+          : currentMessageTimestampPreference();
+      applyMessageTimestampPreference(checked);
       scheduleSave();
     } else if (
       target?.matches(
@@ -2310,6 +2773,16 @@ function installSettings() {
           ?.click();
         const showShortcutHints = system.showShortcutHints !== false;
         applyShortcutHintVisibility(showShortcutHints);
+        const fullMessageTimestamp =
+          system.showFullMessageTimestamp ??
+          system.show_full_message_timestamp ??
+          system.messageTimestampFormat ??
+          system.message_timestamp_format;
+        applyMessageTimestampPreference(
+          fullMessageTimestamp === undefined
+            ? currentFullMessageTimestampPreference()
+            : normalizeFullMessageTimestampPreference(fullMessageTimestamp),
+        );
         const accent =
           typeof system.userAccent === "string"
             ? system.userAccent
@@ -2363,6 +2836,7 @@ function installSettings() {
                 )
               : "";
         }
+        applySecondaryLaunchBehavior(system.secondaryLaunchBehavior);
         updateGlobalPromptCounter();
         hydrating = false;
         settingsHydrated = true;

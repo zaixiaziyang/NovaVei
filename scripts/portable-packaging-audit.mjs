@@ -35,15 +35,17 @@ try {
 
   const manifest = JSON.parse(fs.readFileSync(result.manifestPath, "utf8"));
   assert.equal(manifest.version, "1.2.3");
+  assert.equal(manifest.storageMode, "installed");
   assert.equal(manifest.sizeBytes, binary.length);
   assert.equal(
     manifest.sha256,
     createHash("sha256").update(binary).digest("hex"),
   );
-  assert.deepEqual(JSON.parse(fs.readFileSync(result.markerPath, "utf8")), {
-    schemaVersion: 1,
-    mode: "portable",
-  });
+  assert.equal(
+    fs.existsSync(path.join(result.outDir, "novavei-portable.json")),
+    false,
+    "a newly packaged EXE must not force portable-password setup on first launch",
+  );
   assert.throws(
     () =>
       stagePortablePackage({
@@ -61,7 +63,8 @@ try {
   );
 
   console.log("Portable packaging audit passed", {
-    files: 3,
+    files: 2,
+    defaultStorageMode: "installed",
     existingPackageRejected: true,
     userDataUntouched: true,
   });

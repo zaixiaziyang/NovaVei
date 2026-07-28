@@ -1309,15 +1309,24 @@ function downloadCouncil(content: string, extension: string, mime: string) {
 }
 
 async function promptValue(
-  label: string,
+  title: string,
   initialValue: string,
   maxLength: number,
+  options: {
+    label?: string;
+    message?: string;
+    multiline?: boolean;
+    placeholder?: string;
+  } = {},
 ) {
   const value = await requestAppPrompt({
-    title: label,
-    label: workflowText("内容", "Content"),
+    title,
+    message: options.message,
+    label: options.label ?? workflowText("内容", "Content"),
     initialValue,
     maxLength,
+    multiline: options.multiline,
+    placeholder: options.placeholder,
     required: true,
   });
   if (value === null) return null;
@@ -1446,6 +1455,13 @@ function installCouncilSettings(
       workflowText("专家名称", "Expert name"),
       existing?.name ?? "",
       120,
+      {
+        label: workflowText("专家名称", "Expert name"),
+        placeholder: workflowText(
+          "例如：架构顾问",
+          "e.g. Architecture advisor",
+        ),
+      },
     );
     if (!name) return;
     if (
@@ -1461,6 +1477,14 @@ function installCouncilSettings(
       workflowText("专家系统提示词", "Expert system prompt"),
       existing?.prompt ?? "",
       12_000,
+      {
+        label: workflowText("系统提示词", "System prompt"),
+        multiline: true,
+        placeholder: workflowText(
+          "描述该专家的职责、关注点和输出方式",
+          "Describe the expert's role, focus, and output style",
+        ),
+      },
     );
     if (!prompt) return;
     const expert = { id: existing?.id ?? councilId("expert"), name, prompt };
@@ -1480,6 +1504,13 @@ function installCouncilSettings(
       workflowText("角色名称", "Character name"),
       existing?.name ?? "",
       120,
+      {
+        label: workflowText("角色名称", "Character name"),
+        placeholder: workflowText(
+          "例如：代码审阅助手",
+          "e.g. Code review assistant",
+        ),
+      },
     );
     if (!name) return;
     const normalizedCharacterName = name.toLocaleLowerCase();
@@ -1498,6 +1529,14 @@ function installCouncilSettings(
       workflowText("角色系统提示词", "Character system prompt"),
       existing?.prompt ?? "",
       12_000,
+      {
+        label: workflowText("系统提示词", "System prompt"),
+        multiline: true,
+        placeholder: workflowText(
+          "描述该角色的语气、职责和边界",
+          "Describe the character's voice, responsibilities, and boundaries",
+        ),
+      },
     );
     if (!prompt) return;
     const character = {
@@ -1559,6 +1598,10 @@ function installCouncilSettings(
       workflowText("专家团名称", "Team name"),
       existing?.name ?? "",
       120,
+      {
+        label: workflowText("专家团名称", "Team name"),
+        placeholder: workflowText("例如：发布把关团", "e.g. Release gate"),
+      },
     );
     if (!name) return;
     if (
@@ -1593,6 +1636,13 @@ function installCouncilSettings(
       ),
       initialMembers,
       2_000,
+      {
+        label: workflowText("成员名称或 ID", "Member names or IDs"),
+        placeholder: workflowText(
+          "架构顾问, 安全顾问",
+          "Architecture advisor, Security advisor",
+        ),
+      },
     );
     if (!memberText) return;
     const tokens = memberText
@@ -1660,6 +1710,13 @@ function installCouncilSettings(
         ? `${existing?.name ?? workflowText("提示词", "Prompt")} ${workflowText("副本", "copy")}`
         : (existing?.name ?? ""),
       120,
+      {
+        label: workflowText("提示词名称", "Prompt name"),
+        placeholder: workflowText(
+          "例如：严格架构评审",
+          "e.g. Strict architecture review",
+        ),
+      },
     );
     if (!name) return;
     if (
@@ -1676,6 +1733,14 @@ function installCouncilSettings(
       workflowText("圆桌附加提示词", "Council additional prompt"),
       existing?.prompt ?? "",
       12_000,
+      {
+        label: workflowText("提示词内容", "Prompt content"),
+        multiline: true,
+        placeholder: workflowText(
+          "写下会附加到圆桌专家评议中的提示词",
+          "Write the prompt to add to Council expert reviews",
+        ),
+      },
     );
     if (!prompt) return;
     const item: CouncilPrompt = {

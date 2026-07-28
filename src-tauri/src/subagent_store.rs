@@ -1,8 +1,9 @@
-//! Durable, metadata-only lifecycle records for delegated subagent work.
+//! Durable lifecycle records for delegated subagent work.
 //!
-//! Child prompts, provider output, source excerpts, and tool arguments are
-//! intentionally excluded. They remain in the active parent turn only and are
-//! never reloaded as a standalone subagent transcript.
+//! Child prompts, tool arguments, and raw tool output are never retained. A
+//! stable agent may opt into one bounded, encrypted private report checkpoint
+//! so a later delegated turn can continue its own work without exposing that
+//! state in the parent transcript or task list.
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -12,6 +13,12 @@ use std::time::Duration;
 const MAX_SUBAGENT_TASK_IDENTIFIER_BYTES: usize = 128;
 const MAX_SUBAGENT_TITLE_CHARS: usize = 120;
 const MAX_FAILURE_CODE_BYTES: usize = 64;
+const MAX_SUBAGENT_AGENT_ID_BYTES: usize = 80;
+const MAX_SUBAGENT_PRIVATE_CONTEXT_CHARS: usize = 12_000;
+const MAX_SUBAGENT_MESSAGE_CHARS: usize = 2_000;
+const MAX_SUBAGENT_MESSAGE_CHANNEL_BYTES: usize = 40;
+const MAX_SUBAGENT_MESSAGES_PER_SESSION: usize = 100;
+const LEGACY_SUBAGENT_AGENT_ID: &str = "legacy-agent";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,6 +122,7 @@ pub fn worktree_cleanup_terminal_status(failure_code: Option<&str>) -> SubagentT
 pub struct NewSubagentTask {
     pub id: String,
     pub session_id: String,
+    pub agent_id: String,
     pub parent_turn_id: String,
     pub parent_request_id: String,
     pub title: String,
@@ -126,6 +134,7 @@ pub struct NewSubagentTask {
 pub struct StoredSubagentTask {
     pub id: String,
     pub session_id: String,
+    pub agent_id: String,
     pub parent_turn_id: String,
     pub parent_request_id: String,
     pub title: String,
@@ -138,6 +147,21 @@ pub struct StoredSubagentTask {
     /// release always returns `None` so child output never becomes durable.
     pub result_summary: Option<String>,
     pub failure_code: Option<String>,
+}
+
+/// A bounded coordination message. `content` is decrypted only for the local
+/// session UI after native capability checks; SQLite stores the encrypted form
+/// and task lists intentionally do not project messages.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredSubagentMessage {
+    pub id: String,
+    pub session_id: String,
+    pub sender_agent_id: String,
+    pub recipient: String,
+    pub channel: String,
+    pub content: String,
+    pub created_at: i64,
 }
 
 /// Native-only worktree metadata. The actual patch is held in a managed file
@@ -171,6 +195,7 @@ impl SubagentStore {
                 "CREATE TABLE IF NOT EXISTS subagent_tasks (
                    id TEXT PRIMARY KEY NOT NULL,
                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                   agent_id TEXT NOT NULL DEFAULT '',
                    parent_turn_id TEXT NOT NULL,
                    parent_request_id TEXT NOT NULL,
                    title TEXT NOT NULL,
@@ -199,14 +224,51 @@ impl SubagentStore {
                    patch_digest TEXT,
                    changed_paths_json TEXT NOT NULL DEFAULT '[]',
                    updated_at INTEGER NOT NULL
-                 );",
+                 );
+                 CREATE TABLE IF NOT EXISTS subagent_identities (
+                   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                   agent_id TEXT NOT NULL,
+                   mode TEXT NOT NULL CHECK(mode IN ('readonly', 'worktree')),
+                   created_at INTEGER NOT NULL,
+                   updated_at INTEGER NOT NULL,
+                   PRIMARY KEY(session_id, agent_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS subagent_private_context (
+                   session_id TEXT NOT NULL,
+                   agent_id TEXT NOT NULL,
+                   encrypted_report TEXT NOT NULL,
+                   updated_at INTEGER NOT NULL,
+                   PRIMARY KEY(session_id, agent_id),
+                   FOREIGN KEY(session_id, agent_id)
+                     REFERENCES subagent_identities(session_id, agent_id)
+                     ON DELETE CASCADE
+                 );
+                 CREATE TABLE IF NOT EXISTS subagent_messages (
+                   id TEXT PRIMARY KEY NOT NULL,
+                   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                   sender_agent_id TEXT NOT NULL,
+                   recipient TEXT NOT NULL,
+                   channel TEXT NOT NULL,
+                   encrypted_content TEXT NOT NULL,
+                   created_at INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS subagent_messages_session_order
+                   ON subagent_messages(session_id, created_at DESC, id DESC);",
             )
-            .map_err(|error| format!("initialize subagent task store: {error}"))
+            .map_err(|error| format!("initialize subagent task store: {error}"))?;
+        ensure_subagent_task_agent_column(&connection)?;
+        connection
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS subagent_tasks_session_agent
+                   ON subagent_tasks(session_id, agent_id, created_at DESC, id);",
+            )
+            .map_err(|error| format!("index subagent task identities: {error}"))
     }
 
     pub fn create_task(&self, task: NewSubagentTask) -> Result<StoredSubagentTask, String> {
         validate_task_identifier(&task.id, "task id")?;
         validate_task_identifier(&task.session_id, "session id")?;
+        validate_agent_id(&task.agent_id)?;
         validate_task_identifier(&task.parent_turn_id, "parent turn id")?;
         validate_task_identifier(&task.parent_request_id, "parent request id")?;
         let title = normalize_title(&task.title)?;
@@ -217,12 +279,13 @@ impl SubagentStore {
         connection
             .execute(
                 "INSERT INTO subagent_tasks(
-                   id, session_id, parent_turn_id, parent_request_id, title, status,
+                   id, session_id, agent_id, parent_turn_id, parent_request_id, title, status,
                    created_at, updated_at
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6)",
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?7)",
                 params![
                     task.id,
                     task.session_id,
+                    task.agent_id,
                     task.parent_turn_id,
                     task.parent_request_id,
                     title,
@@ -457,7 +520,7 @@ impl SubagentStore {
         let connection = self.open()?;
         connection
             .query_row(
-                "SELECT id, session_id, parent_turn_id, parent_request_id, title, status,
+                "SELECT id, session_id, agent_id, parent_turn_id, parent_request_id, title, status,
                         created_at, started_at, finished_at, updated_at, failure_code
                  FROM subagent_tasks WHERE session_id = ?1 AND id = ?2",
                 params![session_id, task_id],
@@ -477,7 +540,7 @@ impl SubagentStore {
         let connection = self.open()?;
         let mut statement = connection
             .prepare(
-                "SELECT id, session_id, parent_turn_id, parent_request_id, title, status,
+                "SELECT id, session_id, agent_id, parent_turn_id, parent_request_id, title, status,
                         created_at, started_at, finished_at, updated_at, failure_code
                  FROM subagent_tasks
                  WHERE session_id = ?1
@@ -491,6 +554,212 @@ impl SubagentStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("read subagent tasks: {error}"))?;
         Ok(tasks)
+    }
+
+    /// Resolve a stable logical agent in one session. Its mode is immutable;
+    /// changing readonly/worktree semantics must create a distinct agent id.
+    /// Returning `None` is the normal first-run path.
+    pub fn prepare_agent(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        mode: &str,
+        resume: bool,
+        updated_at: i64,
+    ) -> Result<Option<String>, String> {
+        validate_task_identifier(session_id, "session id")?;
+        validate_agent_id(agent_id)?;
+        if !matches!(mode, "readonly" | "worktree") || updated_at <= 0 {
+            return Err("subagent identity is invalid".to_string());
+        }
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("start subagent identity transaction: {error}"))?;
+        let previous_mode = transaction
+            .query_row(
+                "SELECT mode FROM subagent_identities WHERE session_id = ?1 AND agent_id = ?2",
+                params![session_id, agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("read subagent identity: {error}"))?;
+        if let Some(previous_mode) = previous_mode {
+            if previous_mode != mode {
+                return Err("subagent identity mode cannot change".to_string());
+            }
+            transaction
+                .execute(
+                    "UPDATE subagent_identities SET updated_at = ?3
+                     WHERE session_id = ?1 AND agent_id = ?2",
+                    params![session_id, agent_id, updated_at],
+                )
+                .map_err(|error| format!("touch subagent identity: {error}"))?;
+        } else {
+            transaction
+                .execute(
+                    "INSERT INTO subagent_identities(session_id, agent_id, mode, created_at, updated_at)
+                     VALUES(?1, ?2, ?3, ?4, ?4)",
+                    params![session_id, agent_id, mode, updated_at],
+                )
+                .map_err(|error| format!("create subagent identity: {error}"))?;
+        }
+        let previous = if resume {
+            transaction
+                .query_row(
+                    "SELECT encrypted_report FROM subagent_private_context
+                     WHERE session_id = ?1 AND agent_id = ?2",
+                    params![session_id, agent_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| format!("read subagent private context: {error}"))?
+                .map(|encrypted| {
+                    crate::secret_store::unprotect_transcript_text(&encrypted)
+                        .map_err(|_| "read subagent private context failed".to_string())
+                })
+                .transpose()?
+        } else {
+            transaction
+                .execute(
+                    "DELETE FROM subagent_private_context WHERE session_id = ?1 AND agent_id = ?2",
+                    params![session_id, agent_id],
+                )
+                .map_err(|error| format!("clear subagent private context: {error}"))?;
+            None
+        };
+        transaction
+            .commit()
+            .map_err(|error| format!("commit subagent identity transaction: {error}"))?;
+        Ok(previous)
+    }
+
+    /// Persist only the child's final bounded report, encrypted with the same
+    /// platform policy as transcript text. Tool calls/results never enter this
+    /// checkpoint and no task-list API projects it.
+    pub fn save_agent_private_context(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        report: &str,
+        updated_at: i64,
+    ) -> Result<(), String> {
+        validate_task_identifier(session_id, "session id")?;
+        validate_agent_id(agent_id)?;
+        let report = normalize_private_context(report)?;
+        if updated_at <= 0 {
+            return Err("subagent private context time is invalid".to_string());
+        }
+        let connection = self.open()?;
+        if !agent_identity_exists(&connection, session_id, agent_id)? {
+            return Err("subagent identity is unavailable".to_string());
+        }
+        let encrypted = crate::secret_store::protect_transcript_text(&report)
+            .map_err(|_| "protect subagent private context failed".to_string())?;
+        let changed = connection
+            .execute(
+                "INSERT INTO subagent_private_context(session_id, agent_id, encrypted_report, updated_at)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(session_id, agent_id) DO UPDATE SET
+                   encrypted_report = excluded.encrypted_report,
+                   updated_at = excluded.updated_at",
+                params![session_id, agent_id, encrypted, updated_at],
+            )
+            .map_err(|error| format!("save subagent private context: {error}"))?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err("subagent identity is unavailable".to_string())
+        }
+    }
+
+    pub fn agent_exists(&self, session_id: &str, agent_id: &str) -> Result<bool, String> {
+        validate_task_identifier(session_id, "session id")?;
+        validate_agent_id(agent_id)?;
+        let connection = self.open()?;
+        agent_identity_exists(&connection, session_id, agent_id)
+    }
+
+    pub fn save_message(
+        &self,
+        id: &str,
+        session_id: &str,
+        sender_agent_id: &str,
+        recipient: &str,
+        channel: &str,
+        content: &str,
+        created_at: i64,
+    ) -> Result<StoredSubagentMessage, String> {
+        validate_task_identifier(id, "message id")?;
+        validate_task_identifier(session_id, "session id")?;
+        validate_message_endpoint(sender_agent_id)?;
+        validate_message_recipient(recipient)?;
+        let channel = normalize_message_channel(channel)?;
+        let content = normalize_message_content(content)?;
+        if created_at <= 0 {
+            return Err("subagent message time is invalid".to_string());
+        }
+        let encrypted = crate::secret_store::protect_transcript_text(&content)
+            .map_err(|_| "protect subagent message failed".to_string())?;
+        let connection = self.open()?;
+        connection
+            .execute(
+                "INSERT INTO subagent_messages(
+                   id, session_id, sender_agent_id, recipient, channel, encrypted_content, created_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id,
+                    session_id,
+                    sender_agent_id,
+                    recipient,
+                    channel,
+                    encrypted,
+                    created_at,
+                ],
+            )
+            .map_err(|error| format!("save subagent message: {error}"))?;
+        Ok(StoredSubagentMessage {
+            id: id.to_string(),
+            session_id: session_id.to_string(),
+            sender_agent_id: sender_agent_id.to_string(),
+            recipient: recipient.to_string(),
+            channel,
+            content,
+            created_at,
+        })
+    }
+
+    /// Session UI history only. It intentionally decrypts at most a small
+    /// recent page and never projects messages through task-list APIs.
+    pub fn list_messages(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredSubagentMessage>, String> {
+        validate_task_identifier(session_id, "session id")?;
+        let connection = self.open()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, session_id, sender_agent_id, recipient, channel, encrypted_content, created_at
+                 FROM subagent_messages
+                 WHERE session_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?2",
+            )
+            .map_err(|error| format!("prepare subagent message list: {error}"))?;
+        let mut messages = statement
+            .query_map(
+                params![
+                    session_id,
+                    limit.clamp(1, MAX_SUBAGENT_MESSAGES_PER_SESSION) as i64
+                ],
+                read_stored_message,
+            )
+            .map_err(|error| format!("query subagent messages: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read subagent messages: {error}"))?;
+        messages.reverse();
+        Ok(messages)
     }
 
     pub fn mark_interrupted_tasks(&self, interrupted_at: i64) -> Result<usize, String> {
@@ -531,7 +800,7 @@ impl SubagentStore {
     ) -> Result<Option<StoredSubagentTask>, String> {
         connection
             .query_row(
-                "SELECT id, session_id, parent_turn_id, parent_request_id, title, status,
+                "SELECT id, session_id, agent_id, parent_turn_id, parent_request_id, title, status,
                         created_at, started_at, finished_at, updated_at, failure_code
                  FROM subagent_tasks WHERE id = ?1",
                 params![task_id],
@@ -543,10 +812,10 @@ impl SubagentStore {
 }
 
 fn read_stored_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSubagentTask> {
-    let status = row.get::<_, String>(5)?;
+    let status = row.get::<_, String>(6)?;
     let status = SubagentTaskStatus::parse(&status).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
-            5,
+            6,
             rusqlite::types::Type::Text,
             Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
         )
@@ -554,16 +823,17 @@ fn read_stored_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSubagentT
     Ok(StoredSubagentTask {
         id: row.get(0)?,
         session_id: row.get(1)?,
-        parent_turn_id: row.get(2)?,
-        parent_request_id: row.get(3)?,
-        title: row.get(4)?,
+        agent_id: row.get(2)?,
+        parent_turn_id: row.get(3)?,
+        parent_request_id: row.get(4)?,
+        title: row.get(5)?,
         status,
-        created_at: row.get(6)?,
-        started_at: row.get(7)?,
-        finished_at: row.get(8)?,
-        updated_at: row.get(9)?,
+        created_at: row.get(7)?,
+        started_at: row.get(8)?,
+        finished_at: row.get(9)?,
+        updated_at: row.get(10)?,
         result_summary: None,
-        failure_code: row.get(10)?,
+        failure_code: row.get(11)?,
     })
 }
 
@@ -587,6 +857,29 @@ fn read_stored_worktree(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSubag
     })
 }
 
+fn read_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSubagentMessage> {
+    let encrypted = row.get::<_, String>(5)?;
+    let content = crate::secret_store::unprotect_transcript_text(&encrypted).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "decrypt subagent message",
+            )),
+        )
+    })?;
+    Ok(StoredSubagentMessage {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        sender_agent_id: row.get(2)?,
+        recipient: row.get(3)?,
+        channel: row.get(4)?,
+        content,
+        created_at: row.get(6)?,
+    })
+}
+
 fn validate_task_identifier(value: &str, label: &str) -> Result<(), String> {
     if value.is_empty()
         || value.len() > MAX_SUBAGENT_TASK_IDENTIFIER_BYTES
@@ -597,6 +890,129 @@ fn validate_task_identifier(value: &str, label: &str) -> Result<(), String> {
         return Err(format!("subagent {label} is invalid"));
     }
     Ok(())
+}
+
+fn validate_agent_id(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > MAX_SUBAGENT_AGENT_ID_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("subagent agent id is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn normalize_private_context(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > MAX_SUBAGENT_PRIVATE_CONTEXT_CHARS {
+        return Err("subagent private context is invalid".to_string());
+    }
+    if value
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err("subagent private context contains control characters".to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn validate_message_endpoint(value: &str) -> Result<(), String> {
+    if value == "parent" || value == "*" {
+        return Ok(());
+    }
+    validate_agent_id(value)
+}
+
+fn validate_message_recipient(value: &str) -> Result<(), String> {
+    if value == "parent" || value == "*" {
+        return Ok(());
+    }
+    validate_agent_id(value)
+}
+
+fn normalize_message_channel(value: &str) -> Result<String, String> {
+    let channel = value.trim();
+    if channel.is_empty()
+        || channel.len() > MAX_SUBAGENT_MESSAGE_CHANNEL_BYTES
+        || !channel.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+    {
+        return Err("subagent message channel is invalid".to_string());
+    }
+    Ok(channel.to_string())
+}
+
+fn normalize_message_content(value: &str) -> Result<String, String> {
+    let content = value.trim();
+    if content.is_empty() || content.chars().count() > MAX_SUBAGENT_MESSAGE_CHARS {
+        return Err("subagent message content is invalid".to_string());
+    }
+    if content
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err("subagent message content contains control characters".to_string());
+    }
+    Ok(content.to_string())
+}
+
+fn ensure_subagent_task_agent_column(connection: &Connection) -> Result<(), String> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(subagent_tasks)")
+        .map_err(|error| format!("inspect subagent task schema: {error}"))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| format!("read subagent task schema: {error}"))?;
+    let mut has_agent_id = false;
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| format!("iterate subagent task schema: {error}"))?
+    {
+        let name = row
+            .get::<_, String>(1)
+            .map_err(|error| format!("read subagent task schema column: {error}"))?;
+        if name == "agent_id" {
+            has_agent_id = true;
+            break;
+        }
+    }
+    if !has_agent_id {
+        connection
+            .execute_batch(
+                "ALTER TABLE subagent_tasks
+                   ADD COLUMN agent_id TEXT NOT NULL DEFAULT '';",
+            )
+            .map_err(|error| format!("migrate subagent agent identity: {error}"))?;
+    }
+    connection
+        .execute(
+            "UPDATE subagent_tasks
+             SET agent_id = ?1
+             WHERE agent_id = ''",
+            params![LEGACY_SUBAGENT_AGENT_ID],
+        )
+        .map_err(|error| format!("backfill legacy subagent agent identity: {error}"))?;
+    Ok(())
+}
+
+fn agent_identity_exists(
+    connection: &Connection,
+    session_id: &str,
+    agent_id: &str,
+) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT 1 FROM subagent_identities
+             WHERE session_id = ?1 AND agent_id = ?2",
+            params![session_id, agent_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|value| value.is_some())
+        .map_err(|error| format!("read subagent identity: {error}"))
 }
 
 fn normalize_title(value: &str) -> Result<String, String> {
@@ -677,6 +1093,7 @@ mod tests {
             .create_task(NewSubagentTask {
                 id: "task-1".to_string(),
                 session_id: "session-1".to_string(),
+                agent_id: "researcher".to_string(),
                 parent_turn_id: "turn-1".to_string(),
                 parent_request_id: "request-1".to_string(),
                 title: "Read-only workspace analysis".to_string(),
@@ -737,6 +1154,7 @@ mod tests {
             .create_task(NewSubagentTask {
                 id: "worktree-task-1".to_string(),
                 session_id: "session-2".to_string(),
+                agent_id: "implementer".to_string(),
                 parent_turn_id: "turn-2".to_string(),
                 parent_request_id: "request-2".to_string(),
                 title: "Isolated implementation".to_string(),
@@ -781,6 +1199,57 @@ mod tests {
             .get_worktree("worktree-task-1")
             .expect("worktree should be readable")
             .is_some());
+
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn coordination_messages_are_encrypted_and_session_scoped() {
+        let database_path = std::env::temp_dir().join(format!(
+            "novavei-subagent-message-store-{}-{}.sqlite3",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        HistoryStore::new(database_path.clone())
+            .initialize()
+            .expect("history store should initialize first");
+        Connection::open(&database_path)
+            .expect("test connection should open")
+            .execute(
+                "INSERT INTO sessions(id, title, cwd, created_at, updated_at)
+                 VALUES('session-message', 'test', 'C:\\workspace', 1, 1)",
+                [],
+            )
+            .expect("test session should exist");
+        let store = SubagentStore::new(database_path.clone());
+        store.initialize().expect("message store should initialize");
+
+        let message = store
+            .save_message(
+                "message-1",
+                "session-message",
+                "researcher",
+                "parent",
+                "status",
+                "Found the bounded evidence.",
+                1_725_000_000_000,
+            )
+            .expect("message should save");
+        assert_eq!(message.content, "Found the bounded evidence.");
+        let messages = store
+            .list_messages("session-message", 30)
+            .expect("message should decrypt for its session UI");
+        assert_eq!(messages, vec![message]);
+
+        let raw: String = Connection::open(&database_path)
+            .expect("test connection should open")
+            .query_row(
+                "SELECT encrypted_content FROM subagent_messages WHERE id = 'message-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("encrypted message should be stored");
+        assert!(!raw.contains("Found the bounded evidence."));
 
         let _ = std::fs::remove_file(database_path);
     }

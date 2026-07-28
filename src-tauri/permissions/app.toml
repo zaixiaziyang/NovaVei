@@ -106,6 +106,16 @@ commands.allow = [
 ]
 
 [[permission]]
+identifier = "allow-subagent-private-context"
+description = "Allow an active child to save its own encrypted bounded continuation report"
+commands.allow = ["subagent_private_context_save"]
+
+[[permission]]
+identifier = "allow-subagent-messages"
+description = "Allow bounded encrypted parent/child coordination messages and the session message feed"
+commands.allow = ["subagent_message_send", "subagent_messages_list"]
+
+[[permission]]
 identifier = "allow-sessions-get"
 description = "Allow reading messages for a session"
 commands.allow = ["sessions_get", "sessions_is_blank"]
@@ -242,19 +252,39 @@ commands.allow = [
 ]
 
 [[permission]]
-identifier = "allow-workspace-tools"
-description = "Allow workspace-scoped file and shell operations"
-commands.allow = [
-  "fs_read_text",
-  "fs_grep",
-  "fs_write_text",
-  "fs_edit_text",
-  "fs_delete",
-  "fs_list",
-  "workspace_capability_issue",
-  "shell_run",
-  "shell_cancel"
-]
+identifier = "allow-workspace-capability"
+description = "Allow minting a session-bound read-only workspace viewer capability"
+commands.allow = ["workspace_capability_issue"]
+
+[[permission]]
+identifier = "allow-workspace-read"
+description = "Allow read-only workspace file browsing through native capability checks"
+commands.allow = ["fs_read_text", "fs_grep", "fs_list"]
+
+[[permission]]
+identifier = "allow-workspace-mutate"
+description = "Allow workspace file mutations only after native agent or worktree capability checks"
+commands.allow = ["fs_write_text", "fs_edit_text", "fs_delete"]
+
+[[permission]]
+identifier = "allow-workspace-shell"
+description = "Allow shell execution and cancellation only after native agent approval checks"
+commands.allow = ["shell_run", "shell_cancel"]
+
+[[permission]]
+identifier = "allow-git-status"
+description = "Allow session-bound Git status review for the current project root"
+commands.allow = ["git_status"]
+
+[[permission]]
+identifier = "allow-git-commit-confirm"
+description = "Allow native confirmation to mint a one-use Git commit grant"
+commands.allow = ["git_commit_capability_issue"]
+
+[[permission]]
+identifier = "allow-git-commit"
+description = "Allow consuming a one-use native Git commit grant"
+commands.allow = ["git_commit"]
 
 [[permission]]
 identifier = "allow-global-read"

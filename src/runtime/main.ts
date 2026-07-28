@@ -107,17 +107,17 @@ function installComposerSubmitBridge(runtime: PiRuntimePublicApi) {
           "cancel_failed",
         ].includes(state.status)
       ) {
-        // Enter must have the same safe meaning as the visible send control
-        // while a turn is active: stop it (or retry a failed stop), never
-        // silently replace its active request with a new prompt.
-        if (state.status !== "cancelling") {
+        // Ctrl/Cmd+Enter with an empty composer is the direct-stop path and
+        // pauses any queued prompts. A non-empty draft continues below so the
+        // Composer runtime can enqueue it behind this exact active turn.
+        if (!input.value.trim() && state.status !== "cancelling") {
           void runtime
             .cancel()
             .catch((error) =>
               toast(error instanceof Error ? error.message : String(error)),
             );
         }
-        return;
+        if (!input.value.trim()) return;
       }
       const providerState = form.dataset.novaveiProviderState;
       if (

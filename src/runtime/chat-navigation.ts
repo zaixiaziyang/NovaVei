@@ -64,13 +64,13 @@ function installStyles() {
       gap: 8px;
       padding: 0 14px;
       border: 1px solid var(--line-strong);
-      border-radius: 999px;
+      border-radius: var(--r-pill);
       background: var(--glass-strong);
       color: var(--text);
       box-shadow: var(--shadow-md), 0 1px 0 var(--inset) inset;
       backdrop-filter: blur(20px) saturate(130%);
       font: inherit;
-      font-size: 12.5px;
+      font-size: var(--text-base);
       font-weight: 650;
       cursor: pointer;
       touch-action: manipulation;

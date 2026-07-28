@@ -1,6 +1,6 @@
 {
   "name": "novavei",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "NovaVei desktop — Tauri 2 + Luminous Quiet design",
   "type": "module",
@@ -17,8 +17,10 @@
     "lint": "biome lint src scripts vite.config.ts package.json tsconfig.json --error-on-warnings",
     "format:check": "biome check --formatter-enabled=true --linter-enabled=false --assist-enabled=false src scripts vite.config.ts package.json tsconfig.json",
     "format": "biome format --write src scripts vite.config.ts package.json tsconfig.json",
-    "verify": "npm run typecheck && npm run lint && npm run format:check && npm run build",
+    "verify": "npm run typecheck && npm run lint && npm run audit:ipc-capabilities && npm run test:ci-supply-chain && npm run format:check && npm run build",
     "checklist:release-smoke": "node scripts/release-smoke-checklist.mjs",
+    "audit:ipc-capabilities": "node scripts/ipc-capability-audit.mjs",
+    "test:ci-supply-chain": "node scripts/ci-supply-chain-audit.mjs",
     "audit:portable-packaging": "node scripts/portable-packaging-audit.mjs",
     "build": "tauri build --no-bundle -- --locked",
     "build:installer": "tauri build --bundles nsis -- --locked",
@@ -28,9 +30,10 @@
   "devDependencies": {
     "@biomejs/biome": "2.5.5",
     "@tauri-apps/cli": "2.11.4",
-    "@types/node": "26.1.1",
+    "@types/node": "24.13.3",
     "typescript": "7.0.2",
-    "vite": "8.1.5"
+    "vite": "8.1.5",
+    "vitest": "4.1.10"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.82.1",

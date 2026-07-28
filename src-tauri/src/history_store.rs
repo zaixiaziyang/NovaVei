@@ -4,12 +4,16 @@
 //! source of truth.  The store deliberately uses plain JSON payload columns so
 //! Pi message/tool shapes can evolve without a migration for every provider.
 
+use parking_lot::{Mutex, MutexGuard};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 const SCHEMA_VERSION: i64 = 6;
 const SECURE_SETTINGS_MIGRATION_KEY: &str = "settings_dpapi_v1_compacted";
@@ -25,10 +29,50 @@ pub const MAX_UI_MESSAGE_PAGE_SIZE: usize = 200;
 // useful inspection without allowing one provider event to create an
 // unbounded durable/UI payload.
 const MAX_STORED_TERMINAL_THINKING_CHARS: usize = 32 * 1024;
+const HISTORY_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct HistoryStore {
     path: PathBuf,
+    /// SQLite is serialized by design here: every durable operation uses the
+    /// same connection and transaction boundary, instead of reopening a file
+    /// handle for each row in a partial cache flush.
+    #[cfg_attr(test, allow(dead_code))]
+    connection: Arc<Mutex<Option<Connection>>>,
+}
+
+/// A borrowed production connection or a short-lived test connection.
+///
+/// Unit tests deliberately use the latter so their temporary SQLite files can
+/// be removed before the `HistoryStore` value leaves scope on Windows.
+#[allow(dead_code)]
+enum HistoryConnection<'a> {
+    Cached(MutexGuard<'a, Option<Connection>>),
+    Transient(Connection),
+}
+
+impl Deref for HistoryConnection<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Cached(connection) => connection
+                .as_ref()
+                .expect("history connection is initialized before use"),
+            Self::Transient(connection) => connection,
+        }
+    }
+}
+
+impl DerefMut for HistoryConnection<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Cached(connection) => connection
+                .as_mut()
+                .expect("history connection is initialized before use"),
+            Self::Transient(connection) => connection,
+        }
+    }
 }
 
 /// Export-safe history metadata. This projection intentionally excludes
@@ -193,7 +237,10 @@ pub struct StoredSegmentedHistory {
 
 impl HistoryStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            connection: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// Return aggregate turn health information without selecting any data
@@ -322,6 +369,8 @@ impl HistoryStore {
                    error TEXT,
                    usage_json TEXT
                  );
+                 CREATE INDEX IF NOT EXISTS turns_session_finished_order
+                   ON turns(session_id, finished_at DESC, started_at DESC, id DESC);
                  CREATE TABLE IF NOT EXISTS turn_events (
                    id TEXT PRIMARY KEY NOT NULL,
                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -335,6 +384,8 @@ impl HistoryStore {
                  );
                  CREATE INDEX IF NOT EXISTS turn_events_turn_order
                    ON turn_events(turn_id, sequence, created_at);
+                 CREATE INDEX IF NOT EXISTS turn_events_session_order
+                   ON turn_events(session_id, created_at, sequence, id);
                  CREATE TABLE IF NOT EXISTS tool_calls (
                    id TEXT PRIMARY KEY NOT NULL,
                    turn_id TEXT NOT NULL,
@@ -347,6 +398,8 @@ impl HistoryStore {
                    started_at INTEGER,
                    finished_at INTEGER
                  );
+                 CREATE INDEX IF NOT EXISTS tool_calls_session_turn
+                   ON tool_calls(session_id, turn_id);
                   CREATE TABLE IF NOT EXISTS permission_requests (
                    id TEXT PRIMARY KEY NOT NULL,
                    turn_id TEXT NOT NULL,
@@ -357,6 +410,8 @@ impl HistoryStore {
                     requested_at INTEGER NOT NULL,
                     resolved_at INTEGER
                   );
+                  CREATE INDEX IF NOT EXISTS permission_requests_session_order
+                    ON permission_requests(session_id, requested_at, id);
                   CREATE TABLE IF NOT EXISTS history_segment_headers (
                     conversation_id TEXT PRIMARY KEY NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                     source_session_id TEXT,
@@ -413,9 +468,12 @@ impl HistoryStore {
         Ok(())
     }
 
-    fn open(&self) -> Result<Connection, String> {
-        let connection = Connection::open(&self.path)
-            .map_err(|error| format!("open history database: {error}"))?;
+    fn open_connection(path: &PathBuf) -> Result<Connection, String> {
+        let connection =
+            Connection::open(path).map_err(|error| format!("open history database: {error}"))?;
+        connection
+            .busy_timeout(HISTORY_BUSY_TIMEOUT)
+            .map_err(|error| format!("configure history database timeout: {error}"))?;
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = ON;
@@ -423,6 +481,20 @@ impl HistoryStore {
             )
             .map_err(|error| format!("configure history database: {error}"))?;
         Ok(connection)
+    }
+
+    #[cfg(test)]
+    fn open(&self) -> Result<HistoryConnection<'_>, String> {
+        Self::open_connection(&self.path).map(HistoryConnection::Transient)
+    }
+
+    #[cfg(not(test))]
+    fn open(&self) -> Result<HistoryConnection<'_>, String> {
+        let mut connection = self.connection.lock();
+        if connection.is_none() {
+            *connection = Some(Self::open_connection(&self.path)?);
+        }
+        Ok(HistoryConnection::Cached(connection))
     }
 
     /// Remove plaintext settings remnants left by pre-DPAPI database pages.
@@ -529,10 +601,17 @@ impl HistoryStore {
         let mut statement = connection
             .prepare(
                 "SELECT session_id, status, finished_at
-                 FROM turns
-                 WHERE status IN ('completed', 'cancelled', 'error', 'interrupted')
-                   AND finished_at IS NOT NULL
-                 ORDER BY finished_at DESC, started_at DESC, id DESC",
+                 FROM (
+                   SELECT session_id, status, finished_at,
+                          ROW_NUMBER() OVER (
+                            PARTITION BY session_id
+                            ORDER BY finished_at DESC, started_at DESC, id DESC
+                          ) AS session_rank
+                   FROM turns
+                   WHERE status IN ('completed', 'cancelled', 'error', 'interrupted')
+                     AND finished_at IS NOT NULL
+                 )
+                 WHERE session_rank = 1",
             )
             .map_err(|error| format!("prepare session run summaries: {error}"))?;
         let rows = statement
@@ -546,13 +625,8 @@ impl HistoryStore {
                 ))
             })
             .map_err(|error| format!("query session run summaries: {error}"))?;
-        let mut summaries = HashMap::new();
-        for row in rows {
-            let (session_id, summary) =
-                row.map_err(|error| format!("read session run summary: {error}"))?;
-            summaries.entry(session_id).or_insert(summary);
-        }
-        Ok(summaries)
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|error| format!("read session run summaries: {error}"))
     }
 
     pub fn load_session_goals(&self) -> Result<HashMap<String, StoredSessionGoal>, String> {
@@ -772,6 +846,25 @@ impl HistoryStore {
             .map_err(|error| format!("count history messages: {error}"))
     }
 
+    /// Return the two transcript fields needed to validate a segmented
+    /// checkpoint without reading or decrypting any message content.
+    fn load_message_checkpoint(&self, session_id: &str) -> Result<(i64, Option<String>), String> {
+        let connection = self.open()?;
+        connection
+            .query_row(
+                "SELECT COUNT(*),
+                        (SELECT id FROM messages
+                         WHERE session_id = ?1
+                         ORDER BY created_at DESC, id DESC
+                         LIMIT 1)
+                 FROM messages
+                 WHERE session_id = ?1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| format!("load history message checkpoint: {error}"))
+    }
+
     /// Count messages for every session in one database round trip.
     ///
     /// Startup needs only the counts to decide whether an in-memory session
@@ -959,14 +1052,62 @@ impl HistoryStore {
 
     /// Upsert session row + metadata without rewriting messages.
     pub fn upsert_session_metadata(&self, session: &StoredSession) -> Result<(), String> {
-        let connection = self.open()?;
-        Self::upsert_session_row_in_transaction(&connection, session)
+        self.upsert_session_metadata_batch(std::slice::from_ref(session))
     }
 
-    /// Insert or replace one message by id (encrypts content). Never deletes siblings.
-    pub fn insert_message(&self, message: &StoredMessage) -> Result<(), String> {
-        let connection = self.open()?;
-        Self::upsert_message_in_transaction(&connection, message)
+    /// Upsert session rows and metadata in one transaction without touching
+    /// their transcript projections. This preserves all-or-nothing batch
+    /// archive/relocation updates while avoiding a corpus-wide snapshot.
+    pub fn upsert_session_metadata_batch(&self, sessions: &[StoredSession]) -> Result<(), String> {
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("begin session metadata batch: {error}"))?;
+        Self::upsert_session_metadata_batch_in_transaction(&transaction, sessions)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit session metadata batch: {error}"))
+    }
+
+    /// Atomically persist session metadata and selected setting scopes. This
+    /// is used when a workspace relocation changes both durable projections.
+    pub fn upsert_session_metadata_batch_and_settings(
+        &self,
+        sessions: &[StoredSession],
+        settings: &HashMap<String, Value>,
+    ) -> Result<(), String> {
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("begin session metadata/settings batch: {error}"))?;
+        Self::upsert_session_metadata_batch_in_transaction(&transaction, sessions)?;
+        Self::upsert_settings_in_transaction(&transaction, settings)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit session metadata/settings batch: {error}"))
+    }
+
+    /// Persist one session's metadata and any changed message rows in one
+    /// transaction without deleting transcript rows absent from a partial
+    /// in-memory cache.
+    pub fn upsert_session_metadata_and_messages(
+        &self,
+        session: &StoredSession,
+        messages: &[StoredMessage],
+    ) -> Result<(), String> {
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("begin partial session projection: {error}"))?;
+        Self::upsert_session_row_in_transaction(&transaction, session)?;
+        for message in messages {
+            if message.session_id == session.id {
+                Self::upsert_message_in_transaction(&transaction, message)?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("commit partial session projection: {error}"))
     }
 
     /// Upsert one session row + metadata and replace ONLY that session's messages.
@@ -1328,22 +1469,22 @@ impl HistoryStore {
     /// The returned source intentionally ignores a manual compaction record so
     /// a new `/compact` always replaces it from the full durable transcript.
     pub fn load_runtime_context_source(&self, session_id: &str) -> Result<Vec<Value>, String> {
-        let messages = self.load_messages(session_id)?;
         let Some(history) = self.load_segmented_history(session_id)? else {
             return self.load_context(session_id);
         };
+        let (message_count, raw_last_id) = self.load_message_checkpoint(session_id)?;
         let active = history
             .segments
             .iter()
             .find(|segment| segment.segment_index == history.header.active_segment_index);
-        let raw_last_id = messages.last().map(|message| message.id.as_str());
-        let checkpoint_matches_raw = history.header.total_message_count == messages.len() as i64
-            && active.and_then(|segment| segment.end_message_id.as_deref()) == raw_last_id;
+        let checkpoint_matches_raw = history.header.total_message_count == message_count
+            && active.and_then(|segment| segment.end_message_id.as_deref())
+                == raw_last_id.as_deref();
         if !checkpoint_matches_raw {
             return self.load_context(session_id);
         }
 
-        let mut context = Vec::with_capacity(messages.len());
+        let mut context = Vec::with_capacity(message_count.max(0) as usize);
         for segment in &history.segments {
             // load_segmented_history already decrypts messages_json.
             let values = serde_json::from_str::<Value>(&segment.messages_json)
@@ -1595,6 +1736,16 @@ impl HistoryStore {
                 continue;
             }
             Self::insert_message_in_transaction(transaction, message)?;
+        }
+        Ok(())
+    }
+
+    fn upsert_session_metadata_batch_in_transaction(
+        transaction: &Connection,
+        sessions: &[StoredSession],
+    ) -> Result<(), String> {
+        for session in sessions {
+            Self::upsert_session_row_in_transaction(transaction, session)?;
         }
         Ok(())
     }
@@ -2808,6 +2959,63 @@ fn context_fingerprint(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+/// File activity is renderer-generated metadata, so retain only the small,
+/// canonical shape used by deterministic context compaction. The transcript
+/// summary itself remains the authoritative encrypted copy; this projection is
+/// solely for audit/UI accounting and must never accept control text.
+fn sanitize_context_file_ledger(value: &Value) -> Option<Value> {
+    const MAX_ENTRIES_PER_KIND: usize = 100;
+    const MAX_PATH_CHARS: usize = 200;
+    const MAX_TOTAL_PATH_CHARS: usize = 4_000;
+    const MAX_OMITTED_COUNT: u64 = 1_000_000_000;
+    let source = value.as_object()?;
+    if source.get("version").and_then(Value::as_u64) != Some(1) {
+        return None;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut total_chars = 0usize;
+    let sanitize_paths = |key: &str,
+                          seen: &mut std::collections::BTreeSet<String>,
+                          total_chars: &mut usize|
+     -> Option<Vec<Value>> {
+        let values = source.get(key)?.as_array()?;
+        if values.len() > MAX_ENTRIES_PER_KIND {
+            return None;
+        }
+        let mut stored = Vec::with_capacity(values.len());
+        for value in values {
+            let path = value.as_str()?;
+            let path_chars = path.chars().count();
+            if path.is_empty()
+                || path.trim() != path
+                || path_chars > MAX_PATH_CHARS
+                || path.chars().any(char::is_control)
+                || !seen.insert(path.to_string())
+            {
+                return None;
+            }
+            *total_chars = total_chars.checked_add(path_chars)?;
+            if *total_chars > MAX_TOTAL_PATH_CHARS {
+                return None;
+            }
+            stored.push(Value::from(path));
+        }
+        Some(stored)
+    };
+    let read = sanitize_paths("read", &mut seen, &mut total_chars)?;
+    let modified = sanitize_paths("modified", &mut seen, &mut total_chars)?;
+    let omitted_count = source
+        .get("omittedCount")
+        .and_then(Value::as_u64)
+        .filter(|value| *value <= MAX_OMITTED_COUNT)?;
+    let mut stored = Map::new();
+    stored.insert("version".to_string(), Value::from(1));
+    stored.insert("read".to_string(), Value::Array(read));
+    stored.insert("modified".to_string(), Value::Array(modified));
+    stored.insert("omittedCount".to_string(), Value::from(omitted_count));
+    Some(Value::Object(stored))
+}
+
 fn sanitize_context_compaction(value: &Value) -> Option<Value> {
     const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
     const MAX_CONTEXT_METRIC: u64 = 1_000_000_000;
@@ -2880,6 +3088,12 @@ fn sanitize_context_compaction(value: &Value) -> Option<Value> {
         || summary_tokens > target_tokens
     {
         return None;
+    }
+    if let Some(file_ledger) = source.get("fileLedger") {
+        stored.insert(
+            "fileLedger".to_string(),
+            sanitize_context_file_ledger(file_ledger)?,
+        );
     }
     Some(Value::Object(stored))
 }
@@ -3762,6 +3976,35 @@ mod tests {
             .unwrap();
         assert_eq!(table, "session_goals");
         assert_eq!(version, SCHEMA_VERSION.to_string());
+        drop(connection);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn initialize_installs_session_indexes_and_connection_timeout() {
+        let (store, path) = test_store();
+        let connection = store.open().unwrap();
+        let timeout: i64 = connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, HISTORY_BUSY_TIMEOUT.as_millis() as i64);
+        for index in [
+            "turns_session_finished_order",
+            "turn_events_session_order",
+            "tool_calls_session_turn",
+            "permission_requests_session_order",
+        ] {
+            let exists: i64 = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+                    params![index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "missing index {index}");
+        }
         drop(connection);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
@@ -4735,7 +4978,7 @@ mod tests {
         // Reopen through a new store instance: the manual record must survive
         // process state while the original messages remain readable from SQLite.
         drop(store);
-        let reopened = HistoryStore { path: path.clone() };
+        let reopened = HistoryStore::new(path.clone());
         let compacted = reopened
             .load_runtime_context_with_metadata(&session.id)
             .unwrap();
@@ -4974,6 +5217,14 @@ mod tests {
 
         assert_eq!(store.count_messages(&session_a.id).unwrap(), 5);
         assert_eq!(store.count_messages(&session_b.id).unwrap(), 1);
+        assert_eq!(
+            store.load_message_checkpoint(&session_a.id).unwrap(),
+            (5, Some("a-4".to_string()))
+        );
+        assert_eq!(
+            store.load_message_checkpoint(&session_b.id).unwrap(),
+            (1, Some("b-0".to_string()))
+        );
         assert!(store.has_user_message(&session_a.id).unwrap());
         assert!(store.has_user_message(&session_b.id).unwrap());
 
@@ -5065,27 +5316,30 @@ mod tests {
         ];
         store.upsert_session_projection(&session, &full).unwrap();
 
-        // Incomplete cache path: metadata + insert only the newest cache rows.
-        store.upsert_session_metadata(&session).unwrap();
+        // Incomplete cache path: persist metadata and changed rows together
+        // without removing older rows absent from the working cache.
         store
-            .insert_message(&StoredMessage {
-                id: "new-3".to_string(),
-                session_id: session.id.clone(),
-                role: "user".to_string(),
-                content: "newest".to_string(),
-                created_at: 12,
-                turn_id: None,
-            })
-            .unwrap();
-        store
-            .insert_message(&StoredMessage {
-                id: "old-2".to_string(),
-                session_id: session.id.clone(),
-                role: "assistant".to_string(),
-                content: "older assistant updated".to_string(),
-                created_at: 11,
-                turn_id: Some("turn-old".to_string()),
-            })
+            .upsert_session_metadata_and_messages(
+                &session,
+                &[
+                    StoredMessage {
+                        id: "new-3".to_string(),
+                        session_id: session.id.clone(),
+                        role: "user".to_string(),
+                        content: "newest".to_string(),
+                        created_at: 12,
+                        turn_id: None,
+                    },
+                    StoredMessage {
+                        id: "old-2".to_string(),
+                        session_id: session.id.clone(),
+                        role: "assistant".to_string(),
+                        content: "older assistant updated".to_string(),
+                        created_at: 11,
+                        turn_id: Some("turn-old".to_string()),
+                    },
+                ],
+            )
             .unwrap();
 
         let loaded = store.load_messages(&session.id).unwrap();

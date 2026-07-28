@@ -1,4 +1,3 @@
-import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { PiReasoningLevel, PiRunInput } from "../types";
 import type {
@@ -425,35 +424,34 @@ function normalizeModelBaseUrl(baseUrl: string, api: PiProviderApi): string {
   return stripped;
 }
 
-function builtinModel(
+async function builtinModel(
   api: PiProviderApi,
   modelId: string,
   baseUrl: string,
-): Model<Api> | undefined {
-  const provider =
+): Promise<Model<Api> | undefined> {
+  // `providers/all` imports every pi-ai catalog, including providers NovaVei
+  // never resolves. Load only the selected API's small built-in catalog, and
+  // only when a turn actually needs model defaults.
+  const models =
     api === "anthropic-messages"
-      ? "anthropic"
+      ? (await import("@earendil-works/pi-ai/providers/anthropic.models"))
+          .ANTHROPIC_MODELS
       : api === "google-generative-ai"
-        ? "google"
-        : "openai";
-  try {
-    const model = getBuiltinModel(
-      provider as never,
-      modelId as never,
-    ) as Model<Api>;
-    return model?.api ? { ...model, baseUrl } : undefined;
-  } catch {
-    return undefined;
-  }
+        ? (await import("@earendil-works/pi-ai/providers/google.models"))
+            .GOOGLE_MODELS
+        : (await import("@earendil-works/pi-ai/providers/openai.models"))
+            .OPENAI_MODELS;
+  const model = models[modelId as never] as Model<Api> | undefined;
+  return model?.api ? { ...model, baseUrl } : undefined;
 }
 
-export function createPiModel(
+export async function createPiModel(
   config: PiProviderConfig,
   proxyBaseUrl: string,
   upstreamBaseUrl: string,
-): Model<Api> {
+): Promise<Model<Api>> {
   const baseUrl = normalizeModelBaseUrl(proxyBaseUrl, config.api);
-  const known = builtinModel(config.api, config.modelId, baseUrl);
+  const known = await builtinModel(config.api, config.modelId, baseUrl);
   const modelConfig = config.modelConfig;
   const contextWindow =
     modelConfig?.contextWindow ?? known?.contextWindow ?? 256_000;

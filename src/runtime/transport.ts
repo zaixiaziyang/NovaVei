@@ -292,6 +292,18 @@ export function normalisePiEvent(value: unknown): PiRunEvent | null {
       nestedContent?.text,
       nestedContent?.content,
     ),
+    thinking: stringValue(
+      record.thinking,
+      record.thinkingText,
+      record.thinking_text,
+      record.reasoningContent,
+      record.reasoning_content,
+      nestedContent?.thinking,
+      nestedContent?.thinkingText,
+      nestedContent?.thinking_text,
+      nestedContent?.reasoningContent,
+      nestedContent?.reasoning_content,
+    ),
     error: stringValue(
       record.error,
       record.errorMessage,
