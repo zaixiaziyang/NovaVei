@@ -18,7 +18,180 @@ type ParsedTable = {
   nextIndex: number;
 };
 
-const renderedSources = new WeakMap<HTMLElement, string>();
+type MarkdownRenderState = {
+  source: string;
+  /** Source through the last blank-line-delimited, immutable Markdown block. */
+  committedLength: number;
+  /** DOM for the single growing tail, replaced on the next streaming update. */
+  tailNodes: Node[];
+  /** A tail whose DOM can be extended without parsing the accumulated text. */
+  appendableTail?: AppendableTail;
+};
+
+type FenceLineProgress =
+  | { type: "indent"; spaces: number }
+  | { type: "marker"; markers: number }
+  | { type: "trailing"; markers: number }
+  | { type: "invalid" };
+
+type OpenCodeFence = {
+  marker: string;
+  width: number;
+  end: RegExp;
+  lineProgress: FenceLineProgress;
+};
+
+type AppendableTail =
+  | { type: "code"; pre: HTMLPreElement; fence: OpenCodeFence }
+  | { type: "plain-paragraph"; paragraph: HTMLParagraphElement };
+
+const renderedMarkdown = new WeakMap<HTMLElement, MarkdownRenderState>();
+
+function normaliseMarkdownSource(source: string) {
+  return source.replace(/\r\n?/g, "\n");
+}
+
+function initialFenceLineProgress(): FenceLineProgress {
+  return { type: "indent", spaces: 0 };
+}
+
+function advanceFenceLineProgress(
+  progress: FenceLineProgress,
+  character: string,
+  marker: string,
+  width: number,
+): FenceLineProgress {
+  if (progress.type === "invalid") return progress;
+  if (progress.type === "indent") {
+    if (character === " " && progress.spaces < 3) {
+      return { type: "indent", spaces: progress.spaces + 1 };
+    }
+    if (character === marker) return { type: "marker", markers: 1 };
+    return { type: "invalid" };
+  }
+  if (progress.type === "marker") {
+    if (character === marker) {
+      return { type: "marker", markers: progress.markers + 1 };
+    }
+    if (/\s/.test(character) && progress.markers >= width) {
+      return { type: "trailing", markers: progress.markers };
+    }
+    return { type: "invalid" };
+  }
+  if (/\s/.test(character)) return progress;
+  return { type: "invalid" };
+}
+
+function isCompleteFenceLine(progress: FenceLineProgress, width: number) {
+  return (
+    (progress.type === "marker" || progress.type === "trailing") &&
+    progress.markers >= width
+  );
+}
+
+/**
+ * Returns the final unclosed code fence only after its opening line is
+ * complete. Until then, streamed language text can still change the header
+ * and must use the ordinary renderer.
+ */
+function findOpenCodeFence(source: string): OpenCodeFence | undefined {
+  const lines = source.split("\n");
+  let open:
+    | { marker: string; width: number; end: RegExp; lineIndex: number }
+    | undefined;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (open) {
+      if (open.end.test(line)) open = undefined;
+      continue;
+    }
+    const fence = line.match(/^ {0,3}(`{3,}|~{3,})\s*([^\s`]*)\s*$/);
+    if (!fence) continue;
+    open = {
+      marker: fence[1][0],
+      width: fence[1].length,
+      end: new RegExp(`^ {0,3}${fence[1][0]}{${fence[1].length},}\\s*$`),
+      lineIndex: index,
+    };
+  }
+
+  // Without the opening line's newline, an append can still be part of the
+  // language token rather than code text.
+  if (!open || open.lineIndex === lines.length - 1) return undefined;
+
+  let lineProgress = initialFenceLineProgress();
+  for (let index = open.lineIndex + 1; index < lines.length; index += 1) {
+    for (const character of lines[index]) {
+      lineProgress = advanceFenceLineProgress(
+        lineProgress,
+        character,
+        open.marker,
+        open.width,
+      );
+    }
+    if (index + 1 < lines.length) lineProgress = initialFenceLineProgress();
+  }
+  return { ...open, lineProgress };
+}
+
+/** Returns false if the appended characters close the currently open fence. */
+function extendOpenCodeFence(fence: OpenCodeFence, appendedSource: string) {
+  let progress = fence.lineProgress;
+  for (const character of appendedSource) {
+    if (character === "\n") {
+      if (isCompleteFenceLine(progress, fence.width)) return false;
+      progress = initialFenceLineProgress();
+      continue;
+    }
+    progress = advanceFenceLineProgress(
+      progress,
+      character,
+      fence.marker,
+      fence.width,
+    );
+  }
+  if (isCompleteFenceLine(progress, fence.width)) return false;
+  fence.lineProgress = progress;
+  return true;
+}
+
+// Restrict the paragraph fast path to text which cannot gain block or inline
+// Markdown meaning after another same-line append. This deliberately leaves
+// punctuation-heavy prose on the normal (correctness-first) path.
+function isPlainAppendableText(source: string) {
+  return !/[\r\n`[\]()*~\\#>+\-_|.]/.test(source);
+}
+
+/**
+ * A blank line closes the preceding Markdown block in the supported subset.
+ * Everything after the final boundary remains mutable while a provider stream
+ * is still appending tokens.
+ */
+function lastCompletedBlockBoundary(source: string) {
+  const lines = source.split("\n");
+  let offset = 0;
+  let boundary = 0;
+  let fenceEnd: RegExp | undefined;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (fenceEnd) {
+      if (fenceEnd.test(line)) fenceEnd = undefined;
+    } else {
+      const fence = line.match(/^ {0,3}(`{3,}|~{3,})\s*[^\s`]*\s*$/);
+      if (fence) {
+        fenceEnd = new RegExp(
+          `^ {0,3}${fence[1][0]}{${fence[1].length},}\\s*$`,
+        );
+      } else if (!line.trim() && index + 1 < lines.length) {
+        // `offset + line.length + 1` is just after the blank line's newline.
+        boundary = offset + line.length + 1;
+      }
+    }
+    offset += line.length + (index + 1 < lines.length ? 1 : 0);
+  }
+  return boundary;
+}
 
 function isBlockStart(line: string) {
   return /^(?: {0,3}(?:#{1,6}\s+|```|~~~|>|[-+*]\s+|\d+[.)]\s+)| {0,3}(?:-{3,}|_{3,}|\*{3,})\s*$)/.test(
@@ -108,7 +281,7 @@ function parseTable(
  * never interpreted; unsupported syntax remains visible as ordinary text.
  */
 export function parseMarkdown(source: string): MarkdownBlock[] {
-  const lines = source.replace(/\r\n?/g, "\n").split("\n");
+  const lines = normaliseMarkdownSource(source).split("\n");
   const blocks: MarkdownBlock[] = [];
   let index = 0;
 
@@ -131,12 +304,10 @@ export function parseMarkdown(source: string): MarkdownBlock[] {
       const marker = fence[1][0];
       const width = fence[1].length;
       const language = fence[2].slice(0, 48);
+      const fenceEnd = new RegExp(`^ {0,3}${marker}{${width},}\\s*$`);
       const body: string[] = [];
       index += 1;
-      while (
-        index < lines.length &&
-        !new RegExp(`^ {0,3}${marker}{${width},}\\s*$`).test(lines[index])
-      ) {
+      while (index < lines.length && !fenceEnd.test(lines[index])) {
         body.push(lines[index]);
         index += 1;
       }
@@ -209,7 +380,7 @@ export function parseMarkdown(source: string): MarkdownBlock[] {
   return blocks;
 }
 
-type InlineKind = "code" | "link" | "strong" | "strike" | "em";
+type InlineKind = "code" | "image" | "link" | "strong" | "strike" | "em";
 type InlineMatch = { kind: InlineKind; match: RegExpMatchArray };
 
 function nextInlineMatch(source: string): InlineMatch | undefined {
@@ -218,6 +389,7 @@ function nextInlineMatch(source: string): InlineMatch | undefined {
     if (match) candidates.push({ kind, match });
   };
   add("code", source.match(/`([^`\n]+)`/));
+  add("image", source.match(/!\[([^\]\n]*)\]\(([^\s)]+)(?:\s+"[^"]*")?\)/));
   add("link", source.match(/\[([^\]\n]+)\]\(([^\s)]+)(?:\s+"[^"]*")?\)/));
   add("strong", source.match(/\*\*([^\n]+?)\*\*/));
   add("strike", source.match(/~~([^\n]+?)~~/));
@@ -231,6 +403,15 @@ function nextInlineMatch(source: string): InlineMatch | undefined {
 function safeLinkTarget(value: string) {
   const target = value.trim();
   if (/^(?:https?:|mailto:)/i.test(target)) return target;
+  return undefined;
+}
+
+function safeImageTarget(value: string) {
+  const target = value.trim();
+  if (/^https:/i.test(target)) return target;
+  if (/^(?:asset:|blob:)/i.test(target)) return target;
+  if (/^http:\/\/asset\.localhost(?:[:/]|$)/i.test(target)) return target;
+  if (/^data:image\/(?:avif|gif|jpe?g|png|webp);/i.test(target)) return target;
   return undefined;
 }
 
@@ -254,6 +435,18 @@ function appendInline(parent: HTMLElement, source: string, depth = 0) {
     if (candidate.kind === "code") {
       inline = document.createElement("code");
       inline.textContent = candidate.match[1];
+    } else if (candidate.kind === "image") {
+      const src = safeImageTarget(candidate.match[2]);
+      if (src) {
+        const image = document.createElement("img");
+        image.className = "markdown-image";
+        image.src = src;
+        image.alt = candidate.match[1] || "";
+        image.loading = "lazy";
+        image.decoding = "async";
+        image.referrerPolicy = "no-referrer";
+        inline = image;
+      }
     } else if (candidate.kind === "link") {
       const href = safeLinkTarget(candidate.match[2]);
       if (href) {
@@ -375,10 +568,74 @@ function renderBlock(block: MarkdownBlock) {
 }
 
 export function renderMarkdown(target: HTMLElement, source: string) {
-  if (renderedSources.get(target) === source) return;
-  renderedSources.set(target, source);
+  const normalisedSource = normaliseMarkdownSource(source);
+  let state = renderedMarkdown.get(target);
+  if (state?.source === normalisedSource) return;
+
+  // Static/history content and protocol-strip rewrites can replace arbitrary
+  // text. Only an append-only stream is safe to render incrementally.
+  if (!state || !normalisedSource.startsWith(state.source)) {
+    target.replaceChildren();
+    state = {
+      source: "",
+      committedLength: 0,
+      tailNodes: [],
+    };
+    renderedMarkdown.set(target, state);
+  } else {
+    const appendedSource = normalisedSource.slice(state.source.length);
+    if (state.appendableTail?.type === "code") {
+      if (extendOpenCodeFence(state.appendableTail.fence, appendedSource)) {
+        state.appendableTail.pre.appendChild(
+          document.createTextNode(appendedSource),
+        );
+        state.source = normalisedSource;
+        return;
+      }
+    } else if (
+      state.appendableTail?.type === "plain-paragraph" &&
+      isPlainAppendableText(appendedSource)
+    ) {
+      state.appendableTail.paragraph.appendChild(
+        document.createTextNode(appendedSource),
+      );
+      state.source = normalisedSource;
+      return;
+    }
+    for (const node of state.tailNodes) node.parentNode?.removeChild(node);
+    state.appendableTail = undefined;
+  }
+
+  const pendingSource = normalisedSource.slice(state.committedLength);
+  const completedLength = lastCompletedBlockBoundary(pendingSource);
+  if (completedLength) {
+    const completedFragment = document.createDocumentFragment();
+    for (const block of parseMarkdown(pendingSource.slice(0, completedLength)))
+      completedFragment.appendChild(renderBlock(block));
+    target.appendChild(completedFragment);
+    state.committedLength += completedLength;
+  }
+
+  const tailSource = normalisedSource.slice(state.committedLength);
+  const tailBlocks = parseMarkdown(tailSource);
   const fragment = document.createDocumentFragment();
-  for (const block of parseMarkdown(source))
-    fragment.appendChild(renderBlock(block));
-  target.replaceChildren(fragment);
+  for (const block of tailBlocks) fragment.appendChild(renderBlock(block));
+  state.tailNodes = [...fragment.childNodes];
+  target.appendChild(fragment);
+  const finalBlock = tailBlocks.at(-1);
+  const finalNode = state.tailNodes.at(-1);
+  const openFence =
+    finalBlock?.type === "code" && findOpenCodeFence(tailSource);
+  if (openFence && finalNode instanceof HTMLElement) {
+    const pre = finalNode.querySelector("pre");
+    if (pre) state.appendableTail = { type: "code", pre, fence: openFence };
+  } else if (
+    tailBlocks.length === 1 &&
+    finalBlock?.type === "paragraph" &&
+    isPlainAppendableText(tailSource) &&
+    finalNode instanceof HTMLParagraphElement
+  ) {
+    state.appendableTail = { type: "plain-paragraph", paragraph: finalNode };
+  }
+  state.source = normalisedSource;
 }

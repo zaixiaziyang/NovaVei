@@ -1,20 +1,8 @@
-import {
-  stream as streamAnthropic,
-  type AnthropicOptions,
-} from "@earendil-works/pi-ai/api/anthropic-messages";
-import {
-  stream as streamGoogle,
-  type GoogleOptions,
-} from "@earendil-works/pi-ai/api/google-generative-ai";
+import type { AnthropicOptions } from "@earendil-works/pi-ai/api/anthropic-messages";
+import type { GoogleOptions } from "@earendil-works/pi-ai/api/google-generative-ai";
 import type { GoogleThinkingLevel } from "@earendil-works/pi-ai/api/google-shared";
-import {
-  stream as streamCompletions,
-  type OpenAICompletionsOptions,
-} from "@earendil-works/pi-ai/api/openai-completions";
-import {
-  stream as streamResponses,
-  type OpenAIResponsesOptions,
-} from "@earendil-works/pi-ai/api/openai-responses";
+import type { OpenAICompletionsOptions } from "@earendil-works/pi-ai/api/openai-completions";
+import type { OpenAIResponsesOptions } from "@earendil-works/pi-ai/api/openai-responses";
 import {
   createAssistantMessageEventStream,
   type Api,
@@ -216,7 +204,9 @@ function waitForRetryBackoff(
  */
 function withStreamRetry(
   model: Model<Api>,
-  factory: () => AssistantMessageEventStream,
+  factory: () =>
+    | AssistantMessageEventStream
+    | Promise<AssistantMessageEventStream>,
   signal: AbortSignal | undefined,
   retryCount: number,
 ): AssistantMessageEventStream {
@@ -236,7 +226,7 @@ function withStreamRetry(
       let visible = false;
       let retry = false;
       try {
-        const source = factory();
+        const source = await factory();
         for await (const event of source) {
           if (
             event.type === "error" &&
@@ -304,18 +294,22 @@ function withStreamRetry(
   return output;
 }
 
-function createSource(
+async function createSource(
   api: PiProviderApi,
   model: Model<Api>,
   context: Context,
   options: PiStreamOptions,
-): AssistantMessageEventStream {
+): Promise<AssistantMessageEventStream> {
   const base = baseOptions(model, options);
   const level = reasoningLevel(options.reasoning);
   const hasTools = Boolean(context.tools?.length);
   switch (api) {
-    case "anthropic-messages":
-      return streamAnthropic(model as never, context, {
+    case "anthropic-messages": {
+      const { stream } = await import(
+        "@earendil-works/pi-ai/api/anthropic-messages"
+      );
+      if (options.signal?.aborted) throw new Error("Cancelled");
+      return stream(model as never, context, {
         ...base,
         thinkingEnabled: Boolean(level),
         thinkingBudgetTokens: thinkingBudget(level),
@@ -324,21 +318,36 @@ function createSource(
           options.toolChoice ?? (hasTools ? "auto" : "none"),
         ),
       });
-    case "openai-completions":
-      return streamCompletions(model as never, context, {
+    }
+    case "openai-completions": {
+      const { stream } = await import(
+        "@earendil-works/pi-ai/api/openai-completions"
+      );
+      if (options.signal?.aborted) throw new Error("Cancelled");
+      return stream(model as never, context, {
         ...base,
         reasoningEffort: level,
         toolChoice: hasTools
           ? openAiToolChoice(options.toolChoice ?? "auto")
           : undefined,
       });
-    case "openai-responses":
-      return streamResponses(model as never, context, {
+    }
+    case "openai-responses": {
+      const { stream } = await import(
+        "@earendil-works/pi-ai/api/openai-responses"
+      );
+      if (options.signal?.aborted) throw new Error("Cancelled");
+      return stream(model as never, context, {
         ...base,
         reasoningEffort: level,
       } satisfies OpenAIResponsesOptions);
-    case "google-generative-ai":
-      return streamGoogle(model as never, context, {
+    }
+    case "google-generative-ai": {
+      const { stream } = await import(
+        "@earendil-works/pi-ai/api/google-generative-ai"
+      );
+      if (options.signal?.aborted) throw new Error("Cancelled");
+      return stream(model as never, context, {
         ...base,
         thinking: {
           enabled: Boolean(level),
@@ -348,6 +357,7 @@ function createSource(
           options.toolChoice ?? (hasTools ? "auto" : "none"),
         ),
       } as GoogleOptions);
+    }
     default:
       throw new Error(`Unsupported Pi provider API: ${api}`);
   }

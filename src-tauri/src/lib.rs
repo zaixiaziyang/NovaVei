@@ -24,17 +24,31 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(feature = "desktop")]
-use tauri::Emitter;
+use tauri::menu::MenuBuilder;
+#[cfg(feature = "desktop")]
+use tauri::tray::TrayIconBuilder;
 #[cfg(feature = "desktop")]
 use tauri::WebviewWindowBuilder;
 #[cfg(feature = "desktop")]
+use tauri::{Emitter, Manager};
+#[cfg(feature = "desktop")]
 use tokio::sync::OwnedSemaphorePermit;
+#[cfg(feature = "desktop")]
+use uuid::Uuid;
 
 #[cfg(feature = "desktop")]
 const CRON_SCHEDULER_EVENT: &str = "cron:scheduler-update";
 #[cfg(feature = "desktop")]
 const CRON_SCHEDULER_INTERVAL: Duration = Duration::from_secs(30);
 const CRON_SCHEDULER_CLAIM_LIMIT: usize = 10;
+#[cfg(feature = "desktop")]
+const TRAY_SHOW_WINDOW: &str = "novavei-tray-show";
+#[cfg(feature = "desktop")]
+const TRAY_HIDE_WINDOW: &str = "novavei-tray-hide";
+#[cfg(feature = "desktop")]
+const TRAY_OPEN_SETTINGS: &str = "novavei-tray-settings";
+#[cfg(feature = "desktop")]
+const TRAY_QUIT: &str = "novavei-tray-quit";
 
 /// A bounded native worker pool for due Cron work. It deliberately has no
 /// in-memory backlog: a task is claimed only after its execution slot has
@@ -159,6 +173,95 @@ fn start_cron_scheduler(
     });
 }
 
+/// Construct a top-level NovaVei window from the one declarative template.
+/// Extra windows receive their own WebView profile so browser caches and
+/// renderer localStorage never contend, while all native state remains owned
+/// by this single process.
+#[cfg(feature = "desktop")]
+fn build_main_window(
+    app: &tauri::AppHandle,
+    label: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = app
+        .config()
+        .app
+        .windows
+        .first()
+        .cloned()
+        .ok_or_else(|| std::io::Error::other("main window configuration is missing"))?;
+    config.label = label;
+    let use_private_profile = storage::is_portable() || config.label != "main";
+    let profile_label = config.label.clone();
+    let builder = WebviewWindowBuilder::from_config(app, &config)?;
+    let builder = if use_private_profile {
+        builder.data_directory(
+            storage::application_data_dir()
+                .join("webview")
+                .join(profile_label),
+        )
+    } else {
+        builder
+    };
+    builder.build()?;
+    Ok(())
+}
+
+/// Restore the primary window (or the remaining newest window if the primary
+/// was closed) on an operating-system repeat launch.
+#[cfg(feature = "desktop")]
+fn focus_existing_window(app: &tauri::AppHandle) {
+    let window = app
+        .get_webview_window("main")
+        .or_else(|| app.webview_windows().into_values().next());
+    if let Some(window) = window {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+/// The tray is deliberately a compact native shell surface. It can restore or
+/// hide the existing UI, open the normal settings overlay, or quit; it cannot
+/// mint capabilities, run a model, or bypass the worktree review boundary.
+#[cfg(feature = "desktop")]
+fn install_system_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let menu = MenuBuilder::new(app)
+        .text("novavei-tray-status", "NovaVei · 正在运行")
+        .separator()
+        .text(TRAY_SHOW_WINDOW, "显示 NovaVei")
+        .text(TRAY_HIDE_WINDOW, "隐藏窗口")
+        .text(TRAY_OPEN_SETTINGS, "打开设置")
+        .separator()
+        .text(TRAY_QUIT, "退出 NovaVei")
+        .build()?;
+    let mut tray = TrayIconBuilder::with_id("novavei-tray")
+        .menu(&menu)
+        .tooltip("NovaVei · 正在运行")
+        .show_menu_on_left_click(true)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            TRAY_SHOW_WINDOW => focus_existing_window(app),
+            TRAY_HIDE_WINDOW => {
+                if let Some(window) = app
+                    .get_webview_window("main")
+                    .or_else(|| app.webview_windows().into_values().next())
+                {
+                    let _ = window.hide();
+                }
+            }
+            TRAY_OPEN_SETTINGS => {
+                focus_existing_window(app);
+                let _ = app.emit("tray:open-settings", ());
+            }
+            TRAY_QUIT => app.exit(0),
+            _ => {}
+        });
+    if let Some(icon) = app.default_window_icon().cloned() {
+        tray = tray.icon(icon);
+    }
+    tray.build(app)?;
+    Ok(())
+}
+
 #[cfg(feature = "desktop")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -171,73 +274,71 @@ pub fn run() {
         report_fatal_startup_error(&error);
         return;
     }
-    // A second process sharing the same data root would race the SQLite WAL
-    // files and the WebView2 profile. Hold an exclusive lock file inside the
-    // resolved root for the process lifetime; a portable copy launched twice
-    // (or an installed build started twice) fails closed with a clear message.
-    let _instance_lock = match storage::acquire_instance_lock() {
-        Ok(lock) => lock,
-        Err(error) => {
-            report_fatal_startup_error(&error);
-            return;
-        }
-    };
-    // Diagnostics initialization is intentionally best-effort: the desktop
-    // shell must remain usable even when a local log directory is unavailable.
-    let _ = diagnostics::initialize();
-    let state = Arc::new(backend::AppState::new());
-    // Local services deliberately retain initialization failures and retry on
-    // later requests instead of preventing the desktop shell from starting.
-    let local_services = Arc::new(local_services::LocalServices::new());
-    // MCP clients are native-owned: the renderer can select a configured
-    // server but never provides its command, URL, headers, or environment.
-    let mcp_runtime = Arc::new(mcp_runtime::McpRuntimeManager::new());
-    let resolver_state = state.clone();
-    let resolver: proxy::CredentialResolver = Arc::new(move |provider_id| {
-        backend::provider_proxy_config(&resolver_state, provider_id).map(|config| {
-            proxy::ProviderCredentials {
-                headers: config.headers,
-                upstream_base_url: config.upstream_base_url,
-                use_system_proxy: config.use_system_proxy,
-            }
-        })
-    });
-    // The provider proxy is an optional transport dependency. Its runtime
-    // retains a failed startup as an unavailable state rather than panicking,
-    // so the desktop shell can start and proxy-dependent calls can return a
-    // stable error (or retry through the explicit runtime command).
-    let proxy_state = proxy::start_proxy_runtime(resolver);
-    let scheduler_services = Arc::clone(&local_services);
-
     tauri::Builder::default()
-        .manage(state)
-        .manage(local_services)
-        .manage(mcp_runtime)
-        .manage(proxy_state)
+        // The plugin receives the second operating-system launch before this
+        // process creates SQLite or a WebView profile. That lets the first
+        // process either focus an existing window or create a second window
+        // safely, rather than showing a lock-file failure dialog.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            let open_new_window = app
+                .try_state::<Arc<backend::AppState>>()
+                .is_some_and(|state| backend::secondary_launch_opens_new_window(&state));
+            if open_new_window {
+                let label = format!("main-{}", Uuid::new_v4());
+                if build_main_window(app, label).is_ok() {
+                    return;
+                }
+            }
+            focus_existing_window(app);
+        }))
         .setup(move |app| {
-            // The configured main window is created here rather than by the
-            // declarative auto-create path so a portable executable can keep
-            // WebView2's localStorage, cache, and profile beside itself.
-            let main_config = app
-                .config()
-                .app
-                .windows
-                .first()
-                .ok_or("main window configuration is missing")?;
-            let builder = WebviewWindowBuilder::from_config(app.handle(), main_config)?;
-            let builder = if storage::is_portable() {
-                builder.data_directory(storage::application_data_dir().join("webview-main"))
-            } else {
-                builder
+            // A second process sharing this data root would race SQLite WAL
+            // files. Retain the lock in managed state for the whole lifetime;
+            // the single-instance plugin above has already handled normal
+            // repeat launches before this point.
+            let instance_lock = match storage::acquire_instance_lock() {
+                Ok(lock) => lock,
+                Err(error) => {
+                    report_fatal_startup_error(&error);
+                    return Err(std::io::Error::other(error).into());
+                }
             };
-            builder.build()?;
+            app.manage(instance_lock);
+
+            // Diagnostics initialization is intentionally best-effort: the
+            // desktop shell must remain usable when a local log directory is
+            // unavailable.
+            let _ = diagnostics::initialize();
+            let state = Arc::new(backend::AppState::new());
+            // Local services deliberately retain initialization failures and
+            // retry on later requests instead of preventing the shell launch.
+            let local_services = Arc::new(local_services::LocalServices::new());
+            let mcp_runtime = Arc::new(mcp_runtime::McpRuntimeManager::new());
+            let resolver_state = Arc::clone(&state);
+            let resolver: proxy::CredentialResolver = Arc::new(move |provider_id| {
+                backend::provider_proxy_config(&resolver_state, provider_id).map(|config| {
+                    proxy::ProviderCredentials {
+                        headers: config.headers,
+                        upstream_base_url: config.upstream_base_url,
+                        use_system_proxy: config.use_system_proxy,
+                    }
+                })
+            });
+            let proxy_state = proxy::start_proxy_runtime(resolver);
+            app.manage(state);
+            app.manage(Arc::clone(&local_services));
+            app.manage(mcp_runtime);
+            app.manage(proxy_state);
+
+            build_main_window(app.handle(), "main".to_string())?;
+            install_system_tray(app.handle())?;
 
             // Stored Cron jobs can run shell, HTTP, or prompt work. Do not
             // execute any of them while a removable drive is still locked.
             // Portable scheduling stays deliberately paused for this process;
             // it requires an explicit future re-enable flow after unlock.
             if !secret_store::portable_storage_needs_unlock() && !storage::is_portable() {
-                start_cron_scheduler(app.handle().clone(), Arc::clone(&scheduler_services));
+                start_cron_scheduler(app.handle().clone(), local_services);
             }
             Ok(())
         })
@@ -310,6 +411,9 @@ pub fn run() {
             backend::subagent_task_get,
             backend::subagent_task_finish,
             backend::subagent_task_cancel,
+            backend::subagent_private_context_save,
+            backend::subagent_message_send,
+            backend::subagent_messages_list,
             // A worktree child can change only its native-provisioned detached
             // checkout. Patch review and native confirmation remain separate
             // renderer-visible commands; nothing applies automatically.
@@ -418,6 +522,13 @@ pub fn run() {
             backend::fs_roots,
             backend::shell_run,
             backend::shell_cancel,
+            // Dedicated Git Review surface. This is intentionally separate
+            // from the general shell command and only accepts a session-bound
+            // workspace capability for status plus a one-use native grant for
+            // commits.
+            backend::git_status,
+            backend::git_commit_capability_issue,
+            backend::git_commit,
             backend::workspace_capability_issue,
             // Local provider proxy metadata and bounded recovery controls.
             proxy::proxy_runtime_status,

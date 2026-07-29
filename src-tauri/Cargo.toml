@@ -1,6 +1,6 @@
 [package]
 name = "novavei-agent"
-version = "0.1.0"
+version = "0.1.1"
 description = "NovaVei desktop shell (Luminous Quiet)"
 authors = ["NovaVei"]
 license = "MIT"
@@ -22,6 +22,7 @@ desktop = [
     "tauri/compression",
     "tauri/common-controls-v6",
     "tauri/dynamic-acl",
+    "tauri/tray-icon",
     "tauri/x11",
     "tauri/dbus",
 ]
@@ -34,6 +35,7 @@ tauri-build = { version = "2", features = [] }
 # Wry runtime. The package's default `desktop` feature above restores the
 # complete Tauri default desktop feature set for ordinary builds.
 tauri = { version = "2", default-features = false, features = ["test"] }
+tauri-plugin-single-instance = "2.4.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }

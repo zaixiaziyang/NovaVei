@@ -9,6 +9,7 @@
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 pub const MCP_REGISTRY_BASE_URL: &str = "https://registry.modelcontextprotocol.io";
@@ -29,6 +30,10 @@ const MAX_REMOTES: usize = 64;
 const DEFAULT_DRAFT_TIMEOUT_MS: u64 = 60_000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+
+// A reqwest Client owns the connection pool. Recreating it for each registry
+// lookup prevents keep-alive reuse and repeatedly pays TLS setup costs.
+static REGISTRY_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -275,14 +280,18 @@ pub async fn mcp_registry_remote_draft(
 }
 
 fn registry_client() -> Result<Client, String> {
-    Client::builder()
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .user_agent("NovaVei-McpRegistry/0.1")
-        .build()
-        .map_err(|error| format!("build MCP Registry client: {error}"))
+    REGISTRY_CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .https_only(true)
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .user_agent("NovaVei-McpRegistry/0.1")
+                .build()
+                .map_err(|error| format!("build MCP Registry client: {error}"))
+        })
+        .clone()
 }
 
 async fn fetch_json(url: Url) -> Result<Vec<u8>, String> {

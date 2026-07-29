@@ -1,8 +1,8 @@
 import { defineConfig } from "vite";
 
-// The visual shell remains `src/index.html`; Vite only transforms the
-// runtime TypeScript entry and emits a deployable static directory.  The
-// relative base is required when Tauri loads the bundle from disk.
+// HTML contains only the static document now; Vite owns the visual shell CSS
+// and JavaScript entries, so production builds minify and fingerprint them.
+// The relative base is required when Tauri loads the bundle from disk.
 export default defineConfig({
   root: "src",
   base: "./",

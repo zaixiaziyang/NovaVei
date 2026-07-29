@@ -111,6 +111,7 @@ export function installBrowser() {
 
   choice.disabled = false;
   choice.setAttribute("aria-disabled", "false");
+  choice.removeAttribute("data-feature-unavailable");
   for (const control of [address, open, back, reload]) control.disabled = false;
   panel.removeAttribute("data-feature-unavailable");
 

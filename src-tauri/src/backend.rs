@@ -18,8 +18,8 @@ use crate::mcp_runtime::{
 use crate::path_display::{path_for_display, path_string_for_display};
 use crate::secret_store::{protect_settings, unprotect_settings};
 use crate::subagent_store::{
-    worktree_cleanup_terminal_status, NewSubagentTask, StoredSubagentTask, SubagentStore,
-    SubagentTaskStatus, WorktreeCleanupDisposition,
+    worktree_cleanup_terminal_status, NewSubagentTask, StoredSubagentMessage, StoredSubagentTask,
+    SubagentStore, SubagentTaskStatus, WorktreeCleanupDisposition,
 };
 use crate::worktree_runtime::{self, WorktreeLease, WorktreePatch};
 use chrono::Utc;
@@ -40,9 +40,11 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 #[cfg(feature = "desktop")]
-use tauri::AppHandle;
+use tauri::{AppHandle, WebviewWindow};
 #[cfg(not(feature = "desktop"))]
 type AppHandle<R = tauri::test::MockRuntime> = tauri::AppHandle<R>;
+#[cfg(not(feature = "desktop"))]
+type WebviewWindow<R = tauri::test::MockRuntime> = tauri::WebviewWindow<R>;
 use tauri::{Emitter, State};
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -109,6 +111,8 @@ const MAX_SESSION_MODEL_SELECTION_JSON_BYTES: usize =
 // path hash must never be the sole identifier for project preferences.
 const PROJECT_SETTINGS_VERSION: u64 = 2;
 const PROJECT_STABLE_ID_PREFIX: &str = "project-";
+pub const SECONDARY_LAUNCH_FOCUS_EXISTING: &str = "focus-existing";
+pub const SECONDARY_LAUNCH_NEW_WINDOW: &str = "new-window";
 // This private scope is native-only. It lets a portable copy distinguish a
 // deliberate project list on this computer from paths carried over with a
 // copied USB/database. It is never returned to the WebView.
@@ -124,6 +128,14 @@ const MAX_COMPOSER_MEDIA_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_COMPOSER_MEDIA_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_COMPOSER_MEDIA_NAME_CHARS: usize = 160;
 const MAX_COMPOSER_MEDIA_METADATA_BYTES: u64 = 8 * 1024;
+const MAX_COMPOSER_MEDIA_IPC_HEADER_BYTES: usize = 1024;
+// The pasted-image request carries workspace-bound metadata in a small binary
+// envelope ahead of the raw image bytes. It is larger than the renderer-facing
+// response header because a canonical workspace path may be several KiB.
+const MAX_COMPOSER_PASTED_IMAGE_IPC_HEADER_BYTES: usize = 16 * 1024;
+const COMPOSER_PASTED_IMAGE_IPC_MAGIC: &[u8; 4] = b"NVPI";
+const COMPOSER_PASTED_IMAGE_IPC_VERSION: u8 = 1;
+const COMPOSER_PASTED_IMAGE_IPC_PREFIX_BYTES: usize = 9;
 const MAX_COMPOSER_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_COMPOSER_IMAGE_PIXELS: u64 = 40_000_000;
 const MAX_COMPOSER_IMAGE_FRAMES: u32 = 120;
@@ -133,6 +145,15 @@ const COMPOSER_MEDIA_DIRECTORY: &str = "composer-media";
 const COMPOSER_MEDIA_MARKER_PREFIX: &str = "[novavei-media:";
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 120_000;
 const MAX_SHELL_TIMEOUT_MS: u64 = 10 * 60_000;
+// Git Review is a deliberately small native capability, not a general shell.
+// Keep the read path quick and give a confirmed commit enough time for normal
+// local hooks without allowing a stalled hook to hold the desktop UI forever.
+const GIT_STATUS_TIMEOUT_MS: u64 = 10_000;
+const GIT_COMMIT_TIMEOUT_MS: u64 = 60_000;
+const MAX_GIT_STATUS_ENTRIES: usize = 1_000;
+const MAX_GIT_COMMIT_MESSAGE_CHARS: usize = 4_000;
+const GIT_COMMIT_GRANT_TTL: Duration = Duration::from_secs(2 * 60);
+const MAX_PENDING_GIT_COMMIT_GRANTS: usize = 64;
 // A shell descendant can retain a copied stdout/stderr handle after its direct
 // parent has exited. Never let that keep a Tauri IPC request open forever.
 const SHELL_STDIO_DRAIN_TIMEOUT_MS: u64 = 250;
@@ -150,6 +171,11 @@ const MAX_HISTORY_SEARCH_RESULTS: usize = 50;
 const MAX_HISTORY_SEARCH_PREVIEW_CHARS: usize = 240;
 const MAX_HISTORY_SEARCH_TITLE_CHARS: usize = 200;
 const MAX_HISTORY_SEARCH_MESSAGE_CHARS: usize = 100_000;
+// Search must never create a second plaintext durable store: conversation
+// segments are protected at rest.  This bounded-lifetime index exists only in
+// the process alongside the already-decrypted session cache and vanishes when
+// NovaVei exits.
+const HISTORY_SEARCH_INDEX_GRAM_CHARS: usize = 3;
 // Workspace paths are renderer-visible history metadata. Bound every path
 // probe and metadata search before it reaches filesystem APIs or a large
 // in-memory sort.
@@ -165,6 +191,7 @@ const RELOCATION_CONFLICT_GRANT_TTL: Duration = Duration::from_secs(2 * 60);
 const MAX_PENDING_RELOCATION_CONFLICT_GRANTS: usize = 64;
 const MAX_GLOBAL_SYSTEM_PROMPT_CHARS: usize = 32_000;
 const MAX_SUBAGENT_TASK_CHARS: usize = 4_000;
+const MAX_CONCURRENT_SUBAGENTS_PER_PARENT: usize = 4;
 // The renderer may choose only the project-root policy.  An earlier prototype
 // exposed an `extra` option without a native per-session allowlist or a way to
 // bind an extra root to a capability.  Treating that value as a grant would
@@ -305,6 +332,142 @@ struct SessionRecord {
     goal: Option<SessionGoal>,
 }
 
+#[derive(Debug, Clone)]
+struct InMemoryHistorySearchEntry {
+    conversation_id: String,
+    conversation_title: String,
+    message_id: String,
+    role: String,
+    content: String,
+    search_content: String,
+    created_at: i64,
+}
+
+/// An encrypted SQLite database cannot safely use ordinary FTS: its auxiliary
+/// tables would expose transcript terms. This is a process-lifetime index of
+/// the same user/assistant text already loaded for the renderer. It maintains
+/// a small character-ngram posting map so repeated searches do not repeatedly
+/// normalize and scan every loaded message. Nothing from this struct is ever
+/// serialized or persisted.
+#[derive(Debug, Default)]
+struct InMemoryHistorySearchIndex {
+    source_stamp: Option<[u8; 32]>,
+    entries: Vec<InMemoryHistorySearchEntry>,
+    grams: HashMap<String, Vec<usize>>,
+}
+
+impl InMemoryHistorySearchIndex {
+    fn search(
+        &mut self,
+        sessions: &HashMap<String, SessionRecord>,
+        query: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<Value> {
+        let source_stamp = history_search_source_stamp(sessions);
+        if self.source_stamp != Some(source_stamp) {
+            self.rebuild(sessions, source_stamp);
+        }
+
+        let query_grams = history_search_grams(query);
+        let candidate_indices = if query_grams.is_empty() {
+            (0..self.entries.len()).collect::<Vec<_>>()
+        } else {
+            let mut postings = Vec::with_capacity(query_grams.len());
+            for gram in &query_grams {
+                let Some(indices) = self.grams.get(gram) else {
+                    return Vec::new();
+                };
+                postings.push(indices);
+            }
+            postings.sort_by_key(|indices| indices.len());
+            let mut candidates = postings[0].clone();
+            for indices in postings.into_iter().skip(1) {
+                candidates.retain(|candidate| indices.binary_search(candidate).is_ok());
+                if candidates.is_empty() {
+                    break;
+                }
+            }
+            candidates
+        };
+
+        let mut matches = candidate_indices
+            .into_iter()
+            .filter_map(|index| self.entries.get(index))
+            .filter(|entry| entry.search_content.contains(query))
+            .map(|entry| {
+                (
+                    entry.created_at,
+                    json!({
+                        "conversationId": entry.conversation_id,
+                        "conversationTitle": entry.conversation_title,
+                        "messageId": entry.message_id,
+                        "role": entry.role,
+                        "text": history_search_preview(&entry.content, query),
+                        "updatedAt": entry.created_at,
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+        matches
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(_, value)| value)
+            .collect()
+    }
+
+    fn rebuild(&mut self, sessions: &HashMap<String, SessionRecord>, source_stamp: [u8; 32]) {
+        self.entries.clear();
+        self.grams.clear();
+        for record in sessions.values() {
+            let conversation_id = record.summary.id.trim();
+            if conversation_id.is_empty()
+                || conversation_id.len() > MAX_HISTORY_TRACE_SESSION_ID_BYTES
+                || conversation_id.chars().any(char::is_control)
+            {
+                continue;
+            }
+            let conversation_title =
+                history_search_normalize(&record.summary.title, MAX_HISTORY_SEARCH_TITLE_CHARS);
+            for message in &record.messages {
+                let role = message.role.to_ascii_lowercase();
+                if !matches!(role.as_str(), "user" | "assistant") {
+                    continue;
+                }
+                let message_id = message.id.trim();
+                if message_id.is_empty()
+                    || message_id.len() > MAX_HISTORY_TRACE_MESSAGE_ID_BYTES
+                    || message_id.chars().any(char::is_control)
+                {
+                    continue;
+                }
+                let content =
+                    history_search_normalize(&message.content, MAX_HISTORY_SEARCH_MESSAGE_CHARS);
+                if content.is_empty() {
+                    continue;
+                }
+                let search_content = content.to_lowercase();
+                let entry_index = self.entries.len();
+                for gram in history_search_grams(&search_content) {
+                    self.grams.entry(gram).or_default().push(entry_index);
+                }
+                self.entries.push(InMemoryHistorySearchEntry {
+                    conversation_id: conversation_id.to_string(),
+                    conversation_title: conversation_title.clone(),
+                    message_id: message_id.to_string(),
+                    role,
+                    content,
+                    search_content,
+                    created_at: message.created_at,
+                });
+            }
+        }
+        self.source_stamp = Some(source_stamp);
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -413,6 +576,16 @@ struct WorkspaceCapabilityGrant {
     expires_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct GitCommitCapabilityGrant {
+    session_id: String,
+    workdir: PathBuf,
+    message_digest: [u8; 32],
+    staged_digest: [u8; 32],
+    staged_count: usize,
+    expires_at: Instant,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingPermission {
     capability_token: String,
@@ -490,6 +663,9 @@ enum ToolAction {
     /// This is kept distinct from ordinary write actions and never enables a
     /// direct write into the parent workspace.
     Worktree,
+    /// A Git commit mutates repository history and may execute project hooks.
+    /// It is not equivalent to a read-only Git status check.
+    GitCommit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,6 +723,7 @@ fn tool_action(name: &str) -> Option<ToolAction> {
         }
         "delegatereadonly" => Some(ToolAction::Subagent),
         "delegateworktree" => Some(ToolAction::Worktree),
+        "gitcommit" | "git_commit" => Some(ToolAction::GitCommit),
         _ => None,
     }
 }
@@ -713,6 +890,7 @@ pub struct AppState {
     history: HistoryStore,
     subagent_tasks: SubagentStore,
     sessions: Mutex<HashMap<String, SessionRecord>>,
+    history_search_index: Mutex<InMemoryHistorySearchIndex>,
     settings: Mutex<HashMap<String, Value>>,
     // The entries contain only normalized, non-secret provider settings from
     // a user-picked JSON export.  They are short-lived and consumed exactly
@@ -741,6 +919,7 @@ pub struct AppState {
     full_permission_grants: Mutex<HashMap<String, FullPermissionRunGrant>>,
     subagent_capabilities: Mutex<HashMap<String, SubagentCapabilityGrant>>,
     workspace_capabilities: Mutex<HashMap<String, WorkspaceCapabilityGrant>>,
+    git_commit_capabilities: Mutex<HashMap<String, GitCommitCapabilityGrant>>,
     pending_permissions: Mutex<HashMap<String, PendingPermission>>,
     tool_approvals: Mutex<HashMap<String, ToolApprovalGrant>>,
     // Keep the cancellation flag and its capability owner in one lock-protected
@@ -1007,11 +1186,17 @@ impl AppState {
                 }
             }
         };
-        if settings_ready {
+        let settings_reconciled_at_startup = if settings_ready {
+            let settings_before_reconciliation = settings.clone();
             reconcile_portable_projects_at_startup(&mut settings);
-        }
+            settings != settings_before_reconciliation
+        } else {
+            false
+        };
+        let mut created_startup_session_id = None;
         if sessions.is_empty() && !portable_unlock_required {
             let record = new_session_record("本地工具执行与权限".to_string(), current_workdir());
+            created_startup_session_id = Some(record.summary.id.clone());
             sessions.insert(record.summary.id.clone(), record);
         }
 
@@ -1038,6 +1223,7 @@ impl AppState {
             history,
             subagent_tasks,
             sessions: Mutex::new(sessions),
+            history_search_index: Mutex::new(InMemoryHistorySearchIndex::default()),
             settings: Mutex::new(settings),
             provider_import_previews: Mutex::new(HashMap::new()),
             provider_connection_drafts: Mutex::new(HashMap::new()),
@@ -1053,18 +1239,34 @@ impl AppState {
             full_permission_grants: Mutex::new(HashMap::new()),
             subagent_capabilities: Mutex::new(HashMap::new()),
             workspace_capabilities: Mutex::new(HashMap::new()),
+            git_commit_capabilities: Mutex::new(HashMap::new()),
             pending_permissions: Mutex::new(HashMap::new()),
             tool_approvals: Mutex::new(HashMap::new()),
             shell_runs: Mutex::new(HashMap::new()),
         };
-        // This also upgrades old plaintext SQLite rows and migrates the
-        // legacy JSON snapshot. Delete the old file only after the encrypted
-        // snapshot has been committed successfully.
+        // A legacy JSON snapshot still needs one complete projection write.
+        // An ordinary SQLite startup has already loaded the durable metadata,
+        // so write only a newly-created starter session or reconciled settings.
+        // In particular, do not hydrate and replace every transcript merely
+        // because the process was restarted.
         if !portable_unlock_required
             && startup_persistence_decision(state.storage_recovery.is_ready(), settings_ready)
                 == StartupPersistenceDecision::Persist
         {
-            match state.persist() {
+            let startup_persist_result = if legacy_loaded {
+                state.persist()
+            } else {
+                (|| -> Result<(), String> {
+                    if let Some(session_id) = created_startup_session_id.as_deref() {
+                        state.persist_session_locked(session_id)?;
+                    }
+                    if settings_reconciled_at_startup {
+                        state.persist_settings_locked()?;
+                    }
+                    Ok(())
+                })()
+            };
+            match startup_persist_result {
                 Ok(()) => match state.history.secure_compact_once() {
                     Ok(_) if legacy_loaded => retire_legacy_state(&legacy_file),
                     Ok(_) => {}
@@ -1211,13 +1413,29 @@ impl AppState {
                 .collect::<Vec<_>>();
             self.history.upsert_session_projection(&session, &messages)
         } else {
-            self.history.upsert_session_metadata(&session)?;
-            for message in &record.messages {
-                self.history
-                    .insert_message(&stored_message_from_record(&record.summary.id, message))?;
-            }
-            Ok(())
+            let messages = record
+                .messages
+                .iter()
+                .map(|message| stored_message_from_record(&record.summary.id, message))
+                .collect::<Vec<_>>();
+            self.history
+                .upsert_session_metadata_and_messages(&session, &messages)
         }
+    }
+
+    /// Persist session fields that do not alter its transcript. Keeping this
+    /// separate from `persist_session_locked` prevents a rename, pin, model,
+    /// or share preference from re-encrypting and replacing cached messages.
+    fn persist_session_metadata_locked(&self, session_id: &str) -> Result<(), String> {
+        self.require_persistence_ready()?;
+        let record = self
+            .sessions
+            .lock()
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| "session not found".to_string())?;
+        self.history
+            .upsert_session_metadata(&stored_session_from_record(&record))
     }
 
     /// Persist settings only; never rewrites conversation messages.
@@ -2199,15 +2417,16 @@ pub fn app_health(
     ))
 }
 
-/// Open or navigate the user-visible side browser. This command is granted to
-/// the main NovaVei WebView only; the external page runs in a different child
-/// WebView without this capability.
+/// Open or navigate the user-visible side browser for the calling NovaVei
+/// window. The external page still runs in a different child WebView without
+/// this application's command capability.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn browser_open(
     app: AppHandle,
+    webview_window: WebviewWindow,
     url: String,
 ) -> Result<crate::browser::BrowserState, String> {
-    crate::browser::open(app, url).await
+    crate::browser::open(app, webview_window.label().to_string(), url).await
 }
 
 /// Keep the native child WebView aligned with the renderer-owned browser
@@ -2216,6 +2435,7 @@ pub async fn browser_open(
 #[tauri::command(rename_all = "camelCase")]
 pub fn browser_layout(
     app: AppHandle,
+    webview_window: WebviewWindow,
     x: f64,
     y: f64,
     width: f64,
@@ -2224,6 +2444,7 @@ pub fn browser_layout(
 ) -> Result<crate::browser::BrowserState, String> {
     crate::browser::layout(
         app,
+        webview_window.label().to_string(),
         crate::browser::BrowserViewport {
             x,
             y,
@@ -2235,18 +2456,27 @@ pub fn browser_layout(
 }
 
 #[tauri::command]
-pub fn browser_back(app: AppHandle) -> Result<crate::browser::BrowserState, String> {
-    crate::browser::back(app)
+pub fn browser_back(
+    app: AppHandle,
+    webview_window: WebviewWindow,
+) -> Result<crate::browser::BrowserState, String> {
+    crate::browser::back(app, webview_window.label().to_string())
 }
 
 #[tauri::command]
-pub fn browser_reload(app: AppHandle) -> Result<crate::browser::BrowserState, String> {
-    crate::browser::reload(app)
+pub fn browser_reload(
+    app: AppHandle,
+    webview_window: WebviewWindow,
+) -> Result<crate::browser::BrowserState, String> {
+    crate::browser::reload(app, webview_window.label().to_string())
 }
 
 #[tauri::command]
-pub fn browser_status(app: AppHandle) -> crate::browser::BrowserState {
-    crate::browser::status(app)
+pub fn browser_status(
+    app: AppHandle,
+    webview_window: WebviewWindow,
+) -> crate::browser::BrowserState {
+    crate::browser::status(app, webview_window.label().to_string())
 }
 
 fn require_browser_agent_capability(
@@ -2273,6 +2503,7 @@ fn require_browser_agent_capability(
 pub async fn browser_agent_navigate(
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
+    webview_window: WebviewWindow,
     workdir: String,
     capability_token: String,
     tool_call_id: String,
@@ -2285,7 +2516,7 @@ pub async fn browser_agent_navigate(
         &tool_call_id,
         "BrowserNavigate",
     )?;
-    let result = crate::browser::open(app, url).await?;
+    let result = crate::browser::open(app, webview_window.label().to_string(), url).await?;
     recheck_mutation_capability(
         &state,
         Some(&capability_token),
@@ -2299,6 +2530,7 @@ pub async fn browser_agent_navigate(
 pub async fn browser_agent_snapshot(
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
+    webview_window: WebviewWindow,
     workdir: String,
     capability_token: String,
     tool_call_id: String,
@@ -2310,7 +2542,7 @@ pub async fn browser_agent_snapshot(
         &tool_call_id,
         "BrowserSnapshot",
     )?;
-    let result = crate::browser::snapshot(app).await?;
+    let result = crate::browser::snapshot(app, webview_window.label().to_string()).await?;
     recheck_mutation_capability(
         &state,
         Some(&capability_token),
@@ -2325,6 +2557,7 @@ pub async fn browser_agent_snapshot(
 pub async fn browser_agent_click(
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
+    webview_window: WebviewWindow,
     workdir: String,
     capability_token: String,
     tool_call_id: String,
@@ -2339,7 +2572,14 @@ pub async fn browser_agent_click(
         &tool_call_id,
         "BrowserClick",
     )?;
-    let result = crate::browser::click(app, reference, expected_url, expected_fingerprint).await?;
+    let result = crate::browser::click(
+        app,
+        webview_window.label().to_string(),
+        reference,
+        expected_url,
+        expected_fingerprint,
+    )
+    .await?;
     recheck_mutation_capability(
         &state,
         Some(&capability_token),
@@ -2354,6 +2594,7 @@ pub async fn browser_agent_click(
 pub async fn browser_agent_type(
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
+    webview_window: WebviewWindow,
     workdir: String,
     capability_token: String,
     tool_call_id: String,
@@ -2369,8 +2610,15 @@ pub async fn browser_agent_type(
         &tool_call_id,
         "BrowserType",
     )?;
-    let result =
-        crate::browser::type_text(app, reference, expected_url, expected_fingerprint, text).await?;
+    let result = crate::browser::type_text(
+        app,
+        webview_window.label().to_string(),
+        reference,
+        expected_url,
+        expected_fingerprint,
+        text,
+    )
+    .await?;
     recheck_mutation_capability(
         &state,
         Some(&capability_token),
@@ -6054,7 +6302,42 @@ fn normalize_system_settings_payload(mut payload: Value) -> Result<Value, String
         "defaultPermissionTier".to_string(),
         Value::String(permission.to_string()),
     );
+    let camel_launch_behavior = object.remove("secondaryLaunchBehavior");
+    let snake_launch_behavior = object.remove("secondary_launch_behavior");
+    if let (Some(camel), Some(snake)) = (&camel_launch_behavior, &snake_launch_behavior) {
+        if camel != snake {
+            return Err("secondary launch behavior keys disagree".to_string());
+        }
+    }
+    let launch_behavior = match camel_launch_behavior
+        .or(snake_launch_behavior)
+        .as_ref()
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        None | Some("") | Some(SECONDARY_LAUNCH_FOCUS_EXISTING) => SECONDARY_LAUNCH_FOCUS_EXISTING,
+        Some(SECONDARY_LAUNCH_NEW_WINDOW) => SECONDARY_LAUNCH_NEW_WINDOW,
+        Some(_) => return Err("secondary launch behavior is invalid".to_string()),
+    };
+    object.insert(
+        "secondaryLaunchBehavior".to_string(),
+        Value::String(launch_behavior.to_string()),
+    );
     Ok(payload)
+}
+
+/// Whether an operating-system request to start NovaVei again should open a
+/// second top-level window in this already-running process. The process keeps
+/// the single database and protected settings owner; only the WebView profile
+/// is distinct per window.
+pub fn secondary_launch_opens_new_window(state: &AppState) -> bool {
+    state
+        .settings
+        .lock()
+        .get("system")
+        .and_then(|value| value.get("secondaryLaunchBehavior"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == SECONDARY_LAUNCH_NEW_WINDOW)
 }
 
 fn valid_project_id(value: &str) -> bool {
@@ -9718,6 +10001,8 @@ pub struct SubagentTaskStartResponse {
     pub task: StoredSubagentTask,
     pub capability_token: String,
     pub proxy_request_id: String,
+    pub agent_id: String,
+    pub private_context: Option<String>,
 }
 
 fn subagent_proxy_request_id(mode: SubagentCapabilityMode, task_id: &str) -> String {
@@ -9742,6 +10027,8 @@ pub fn subagent_task_start(
     capability_token: String,
     tool_call_id: String,
     allow_global_read: Option<bool>,
+    agent_id: Option<String>,
+    resume: Option<bool>,
 ) -> Result<SubagentTaskStartResponse, String> {
     state.require_persistence_ready()?;
     let task = task.trim();
@@ -9772,16 +10059,35 @@ pub fn subagent_task_start(
         .subagent_capabilities
         .lock()
         .values()
-        .any(|grant| grant.parent_request_id == parent_grant.request_id)
+        .filter(|grant| {
+            grant.parent_request_id == parent_grant.request_id
+                && !grant.cancelled.load(Ordering::SeqCst)
+        })
+        .count()
+        >= MAX_CONCURRENT_SUBAGENTS_PER_PARENT
     {
-        return Err("only one read-only subagent may run for a parent turn".to_string());
+        return Err("subagent concurrency limit reached for this parent turn".to_string());
     }
 
     let task_id = format!("subtask-{}", Uuid::new_v4());
     let created_at = now_ms();
+    let agent_id = agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("agent-{}", Uuid::new_v4().simple()));
+    let private_context = state.subagent_tasks.prepare_agent(
+        &parent_grant.session_id,
+        &agent_id,
+        "readonly",
+        resume.unwrap_or(false),
+        created_at,
+    )?;
     let task = state.subagent_tasks.create_task(NewSubagentTask {
         id: task_id.clone(),
         session_id: parent_grant.session_id.clone(),
+        agent_id: agent_id.clone(),
         parent_turn_id: parent_grant.turn_id.clone(),
         parent_request_id: parent_grant.request_id.clone(),
         title,
@@ -9841,6 +10147,8 @@ pub fn subagent_task_start(
         task,
         capability_token: child_capability_token,
         proxy_request_id,
+        agent_id,
+        private_context,
     })
 }
 
@@ -9942,6 +10250,115 @@ pub fn subagent_task_finish(
     Ok(task)
 }
 
+/// Save the child's own bounded final report as its private continuation
+/// checkpoint. The task list never returns this text; a later child receives
+/// it only when the parent explicitly requests `resume` for the same agent id.
+#[cfg(feature = "desktop")]
+#[tauri::command(rename_all = "camelCase")]
+pub fn subagent_private_context_save(
+    state: State<'_, Arc<AppState>>,
+    task_id: String,
+    capability_token: String,
+    report: String,
+) -> Result<(), String> {
+    state.require_persistence_ready()?;
+    let grant = require_subagent_capability(&state, &task_id, &capability_token)?;
+    let task = state
+        .subagent_tasks
+        .get_task(&grant.session_id, &grant.task_id)?
+        .ok_or_else(|| "subagent task is unavailable".to_string())?;
+    state.subagent_tasks.save_agent_private_context(
+        &grant.session_id,
+        &task.agent_id,
+        &report,
+        now_ms(),
+    )
+}
+
+/// Route a bounded coordination note through native storage. Child messages
+/// may target their parent or the session broadcast channel; a parent may
+/// address a stable child identity or broadcast. The database stores only the
+/// transcript-encrypted body and the renderer sees it through a session feed.
+#[cfg(feature = "desktop")]
+#[tauri::command(rename_all = "camelCase")]
+#[allow(clippy::too_many_arguments)]
+pub fn subagent_message_send(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+    task_id: Option<String>,
+    capability_token: String,
+    workdir: String,
+    recipient: String,
+    channel: Option<String>,
+    content: String,
+) -> Result<StoredSubagentMessage, String> {
+    state.require_persistence_ready()?;
+    let recipient = recipient.trim().to_string();
+    let channel = channel.unwrap_or_else(|| "status".to_string());
+    let (session_id, sender_agent_id) = if let Some(task_id) = task_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let grant = require_subagent_capability(&state, task_id, &capability_token)?;
+        if recipient != "parent" && recipient != "*" {
+            return Err("a child may message only parent or broadcast".to_string());
+        }
+        let task = state
+            .subagent_tasks
+            .get_task(&grant.session_id, &grant.task_id)?
+            .ok_or_else(|| "subagent task is unavailable".to_string())?;
+        (grant.session_id, task.agent_id)
+    } else {
+        // A parent run can send to a stable child identity or broadcast, but
+        // cannot impersonate a child or route a message back to itself.
+        let _ = require_capability(&state, Some(&capability_token), &workdir)?;
+        let grant = state
+            .capabilities
+            .lock()
+            .get(capability_token.trim())
+            .cloned()
+            .ok_or_else(|| "parent agent capability is no longer active".to_string())?;
+        if recipient == "parent" {
+            return Err("a parent message requires a child agent id or broadcast".to_string());
+        }
+        if recipient != "*"
+            && !state
+                .subagent_tasks
+                .agent_exists(&grant.session_id, &recipient)?
+        {
+            return Err("subagent message recipient is unavailable".to_string());
+        }
+        (grant.session_id, "parent".to_string())
+    };
+    let message = state.subagent_tasks.save_message(
+        &format!("submsg-{}", Uuid::new_v4()),
+        &session_id,
+        &sender_agent_id,
+        &recipient,
+        &channel,
+        &content,
+        now_ms(),
+    )?;
+    emit_subagent_message(&app, &message)?;
+    Ok(message)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn subagent_messages_list(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    limit: Option<usize>,
+) -> Result<Vec<StoredSubagentMessage>, String> {
+    let session_id = session_id.trim();
+    if !state.sessions.lock().contains_key(session_id) {
+        return Err("session not found".to_string());
+    }
+    state
+        .subagent_tasks
+        .list_messages(session_id, limit.unwrap_or(30))
+}
+
 #[cfg(feature = "desktop")]
 #[tauri::command(rename_all = "camelCase")]
 pub fn subagent_task_cancel(
@@ -9982,6 +10399,8 @@ pub struct WorktreeTaskStartResponse {
     pub proxy_request_id: String,
     pub workdir: String,
     pub base_commit: String,
+    pub agent_id: String,
+    pub private_context: Option<String>,
 }
 
 /// Provision a detached worktree only after the parent turn received a
@@ -9999,6 +10418,8 @@ pub fn worktree_task_start(
     capability_token: String,
     tool_call_id: String,
     allow_global_read: Option<bool>,
+    agent_id: Option<String>,
+    resume: Option<bool>,
 ) -> Result<WorktreeTaskStartResponse, String> {
     state.require_persistence_ready()?;
     let task = task.trim();
@@ -10029,15 +10450,34 @@ pub fn worktree_task_start(
         .subagent_capabilities
         .lock()
         .values()
-        .any(|grant| grant.parent_request_id == parent_grant.request_id)
+        .filter(|grant| {
+            grant.parent_request_id == parent_grant.request_id
+                && !grant.cancelled.load(Ordering::SeqCst)
+        })
+        .count()
+        >= MAX_CONCURRENT_SUBAGENTS_PER_PARENT
     {
-        return Err("only one subagent may run for a parent turn".to_string());
+        return Err("subagent concurrency limit reached for this parent turn".to_string());
     }
     let task_id = format!("worktree-{}", Uuid::new_v4());
     let created_at = now_ms();
+    let agent_id = agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("agent-{}", Uuid::new_v4().simple()));
+    let private_context = state.subagent_tasks.prepare_agent(
+        &parent_grant.session_id,
+        &agent_id,
+        "worktree",
+        resume.unwrap_or(false),
+        created_at,
+    )?;
     let task_record = state.subagent_tasks.create_task(NewSubagentTask {
         id: task_id.clone(),
         session_id: parent_grant.session_id.clone(),
+        agent_id: agent_id.clone(),
         parent_turn_id: parent_grant.turn_id.clone(),
         parent_request_id: parent_grant.request_id.clone(),
         title,
@@ -10104,6 +10544,8 @@ pub fn worktree_task_start(
         proxy_request_id,
         workdir: lease.worktree_path,
         base_commit: lease.base_commit,
+        agent_id,
+        private_context,
     })
 }
 
@@ -10317,6 +10759,14 @@ fn emit_subagent_task_update<R: tauri::Runtime>(
 ) -> Result<(), String> {
     app.emit("subagent:task-update", task)
         .map_err(|error| format!("emit subagent task update: {error}"))
+}
+
+fn emit_subagent_message<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    message: &StoredSubagentMessage,
+) -> Result<(), String> {
+    app.emit("subagent:message", message)
+        .map_err(|error| format!("emit subagent message: {error}"))
 }
 
 fn require_subagent_capability(
@@ -11350,7 +11800,26 @@ pub fn sessions_relocate_workspace(
         .settings
         .lock()
         .insert("projects".to_string(), normalized_projects);
-    if let Err(error) = state.persist_locked() {
+    let persistence = (|| -> Result<(), String> {
+        let sessions = state.sessions.lock();
+        let changed_sessions = previous_sessions
+            .iter()
+            .filter_map(|(id, _)| sessions.get(id).map(stored_session_from_record))
+            .collect::<Vec<_>>();
+        drop(sessions);
+        let projects = state
+            .settings
+            .lock()
+            .get("projects")
+            .cloned()
+            .ok_or_else(|| "projects settings are missing".to_string())?;
+        let protected_projects =
+            protect_settings(&HashMap::from([("projects".to_string(), projects)]))?;
+        state
+            .history
+            .upsert_session_metadata_batch_and_settings(&changed_sessions, &protected_projects)
+    })();
+    if let Err(error) = persistence {
         restore_history_records(&state, &previous_sessions);
         let mut settings = state.settings.lock();
         if let Some(previous_projects) = previous_projects {
@@ -11667,9 +12136,34 @@ pub struct ComposerMediaLoad {
     pub mime: String,
     pub kind: ComposerMediaKind,
     pub size_bytes: u64,
-    /// A bounded byte payload for a local Blob URL.  It is never added to the
-    /// user-visible transcript or persisted as prompt text.
-    pub bytes: Vec<u8>,
+}
+
+/// The JSON header prepended to the raw image bytes for an explicit clipboard
+/// paste. The fields remain subject to the same session/workspace checks as
+/// the former JSON command arguments; only the image body bypasses JSON.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ComposerPastedImageIpcHeader {
+    workdir: String,
+    session_id: String,
+    name: String,
+    mime: Option<String>,
+}
+
+fn validate_composer_pasted_image_ipc_header(
+    header: &ComposerPastedImageIpcHeader,
+) -> Result<(), String> {
+    if header.workdir.contains('\0')
+        || header.session_id.contains('\0')
+        || header.name.contains('\0')
+        || header
+            .mime
+            .as_deref()
+            .is_some_and(|mime| mime.contains('\0'))
+    {
+        return Err("pasted image IPC header contains a NUL byte".to_string());
+    }
+    Ok(())
 }
 
 fn validate_composer_media_session_id(value: &str) -> Result<String, String> {
@@ -12199,7 +12693,7 @@ fn stage_composer_media_bytes(
     state: &AppState,
     session_id: &str,
     name: &str,
-    bytes: Vec<u8>,
+    bytes: &[u8],
     media: (ComposerMediaKind, &'static str),
 ) -> Result<ComposerMediaAttachment, String> {
     if bytes.is_empty() || bytes.len() as u64 > MAX_COMPOSER_MEDIA_BYTES {
@@ -12208,7 +12702,7 @@ fn stage_composer_media_bytes(
         ));
     }
     if media.0 == ComposerMediaKind::Image {
-        validate_composer_image_bytes(&bytes, media.1)?;
+        validate_composer_image_bytes(bytes, media.1)?;
     }
     let id = Uuid::new_v4().to_string();
     let descriptor = ComposerMediaAttachment {
@@ -12221,7 +12715,7 @@ fn stage_composer_media_bytes(
     let root = composer_media_session_root(state, session_id)?;
     let data_path = root.join(format!("{id}.bin"));
     let metadata_path = root.join(format!("{id}.json"));
-    write_new_composer_media_file(&data_path, &bytes, "media data")?;
+    write_new_composer_media_file(&data_path, bytes, "media data")?;
     let metadata = serde_json::to_vec(&descriptor)
         .map_err(|error| format!("serialize composer media metadata: {error}"));
     match metadata.and_then(|metadata| {
@@ -12500,6 +12994,41 @@ fn load_composer_media_attachment(
     Ok((descriptor, bytes))
 }
 
+/// Compose the small, authoritative attachment descriptor and the media bytes
+/// into one binary IPC payload. Keeping the descriptor in the envelope lets
+/// the renderer verify its transcript marker without serializing each byte as
+/// a JSON number.
+fn composer_media_ipc_payload(
+    descriptor: ComposerMediaAttachment,
+    mut bytes: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let header = serde_json::to_vec(&ComposerMediaLoad {
+        id: descriptor.id,
+        name: descriptor.name,
+        mime: descriptor.mime,
+        kind: descriptor.kind,
+        size_bytes: descriptor.size_bytes,
+    })
+    .map_err(|error| format!("serialize composer media response header: {error}"))?;
+    if header.is_empty() || header.len() > MAX_COMPOSER_MEDIA_IPC_HEADER_BYTES {
+        return Err("composer media response metadata is invalid".to_string());
+    }
+    let mut payload = Vec::with_capacity(4 + header.len() + bytes.len());
+    payload.extend_from_slice(&(header.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&header);
+    payload.append(&mut bytes);
+    Ok(payload)
+}
+
+fn composer_media_ipc_response(
+    descriptor: ComposerMediaAttachment,
+    bytes: Vec<u8>,
+) -> Result<tauri::ipc::Response, String> {
+    Ok(tauri::ipc::Response::new(composer_media_ipc_payload(
+        descriptor, bytes,
+    )?))
+}
+
 fn composer_marker_hex(value: u8) -> Option<u8> {
     match value {
         b'0'..=b'9' => Some(value - b'0'),
@@ -12655,7 +13184,7 @@ pub async fn composer_pick_attachments(
                 .ok_or_else(|| "selected attachment file name is not valid UTF-8".to_string())?;
             if let Some(media) = detect_composer_media(&bytes, &name) {
                 let descriptor =
-                    stage_composer_media_bytes(&state, &session_id, &name, bytes, media)?;
+                    stage_composer_media_bytes(&state, &session_id, &name, &bytes, media)?;
                 staged_ids.push(descriptor.id.clone());
                 output.push(ComposerPickedAttachment {
                     attachment_type: "media".to_string(),
@@ -12714,26 +13243,76 @@ pub async fn composer_pick_attachments(
     result
 }
 
-/// Stage an image copied from the composer clipboard.  The renderer supplies
-/// raw bytes only for this explicit paste gesture; native signature detection
-/// chooses the MIME type and refuses SVG/HTML or declared-type mismatches.
+/// Decode the small JSON header embedded before a raw pasted-image body.
+///
+/// Tauri's raw invoke body is intentionally used here instead of a `Vec<u8>`
+/// command argument: serde_json represents the latter as one number per byte,
+/// making multi-megabyte clipboard images needlessly large and expensive.
+fn decode_composer_pasted_image_ipc_payload(
+    payload: &[u8],
+) -> Result<(ComposerPastedImageIpcHeader, &[u8]), String> {
+    const HEADER_LENGTH_OFFSET: usize = 5;
+    let max_payload_bytes = COMPOSER_PASTED_IMAGE_IPC_PREFIX_BYTES
+        .checked_add(MAX_COMPOSER_PASTED_IMAGE_IPC_HEADER_BYTES)
+        .and_then(|size| size.checked_add(MAX_COMPOSER_MEDIA_BYTES as usize))
+        .ok_or_else(|| "pasted image IPC limits are invalid".to_string())?;
+    if payload.len() > max_payload_bytes {
+        return Err("pasted image IPC payload exceeds its limit".to_string());
+    }
+    if payload.len() < COMPOSER_PASTED_IMAGE_IPC_PREFIX_BYTES {
+        return Err("pasted image IPC payload is truncated".to_string());
+    }
+    if &payload[..COMPOSER_PASTED_IMAGE_IPC_MAGIC.len()] != COMPOSER_PASTED_IMAGE_IPC_MAGIC {
+        return Err("pasted image IPC magic is invalid".to_string());
+    }
+    if payload[COMPOSER_PASTED_IMAGE_IPC_MAGIC.len()] != COMPOSER_PASTED_IMAGE_IPC_VERSION {
+        return Err("pasted image IPC version is not supported".to_string());
+    }
+    let header_len = u32::from_be_bytes(
+        payload[HEADER_LENGTH_OFFSET..COMPOSER_PASTED_IMAGE_IPC_PREFIX_BYTES]
+            .try_into()
+            .map_err(|_| "pasted image IPC header is invalid".to_string())?,
+    ) as usize;
+    if header_len == 0 || header_len > MAX_COMPOSER_PASTED_IMAGE_IPC_HEADER_BYTES {
+        return Err("pasted image IPC header exceeds its limit".to_string());
+    }
+    let body_start = COMPOSER_PASTED_IMAGE_IPC_PREFIX_BYTES
+        .checked_add(header_len)
+        .ok_or_else(|| "pasted image IPC header is invalid".to_string())?;
+    if body_start > payload.len() {
+        return Err("pasted image IPC payload is truncated".to_string());
+    }
+    let header =
+        serde_json::from_slice(&payload[COMPOSER_PASTED_IMAGE_IPC_PREFIX_BYTES..body_start])
+            .map_err(|_| "pasted image IPC header is invalid".to_string())?;
+    validate_composer_pasted_image_ipc_header(&header)?;
+    Ok((header, &payload[body_start..]))
+}
+
+/// Stage an image copied from the composer clipboard. The renderer sends a
+/// bounded metadata header followed by the image as Tauri raw IPC bytes. The
+/// session/workspace binding, media signature, declared MIME, and image-bounds
+/// checks remain native and apply before any file is written.
 #[tauri::command(rename_all = "camelCase")]
 pub fn composer_stage_pasted_image(
     state: State<'_, Arc<AppState>>,
-    workdir: String,
-    session_id: String,
-    name: String,
-    mime: Option<String>,
-    bytes: Vec<u8>,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<ComposerMediaAttachment, String> {
-    let (session_id, _) = composer_attachment_session(&state, workdir, session_id)?;
-    let safe_name = safe_composer_media_name(&name);
-    let media = detect_composer_media(&bytes, &safe_name)
+    let payload = match request.body() {
+        tauri::ipc::InvokeBody::Raw(payload) => payload.as_slice(),
+        tauri::ipc::InvokeBody::Json(_) => {
+            return Err("pasted image must use raw binary IPC".to_string())
+        }
+    };
+    let (header, bytes) = decode_composer_pasted_image_ipc_payload(payload)?;
+    let (session_id, _) = composer_attachment_session(&state, header.workdir, header.session_id)?;
+    let safe_name = safe_composer_media_name(&header.name);
+    let media = detect_composer_media(bytes, &safe_name)
         .ok_or_else(|| "pasted content is not a supported image".to_string())?;
     if media.0 != ComposerMediaKind::Image {
         return Err("only pasted images are supported".to_string());
     }
-    let declared = mime.unwrap_or_default().trim().to_ascii_lowercase();
+    let declared = header.mime.unwrap_or_default().trim().to_ascii_lowercase();
     if !declared.is_empty() && declared != media.1 {
         return Err("pasted image type does not match its data".to_string());
     }
@@ -12747,18 +13326,11 @@ pub fn composer_media_load(
     state: State<'_, Arc<AppState>>,
     session_id: String,
     attachment_id: String,
-) -> Result<ComposerMediaLoad, String> {
+) -> Result<tauri::ipc::Response, String> {
     let session_id = composer_attachment_session_exists(&state, session_id)?;
     let attachment_id = validate_composer_media_id(&attachment_id)?;
     let (descriptor, bytes) = load_composer_media_attachment(&state, &session_id, &attachment_id)?;
-    Ok(ComposerMediaLoad {
-        id: descriptor.id,
-        name: descriptor.name,
-        mime: descriptor.mime,
-        kind: descriptor.kind,
-        size_bytes: descriptor.size_bytes,
-        bytes,
-    })
+    composer_media_ipc_response(descriptor, bytes)
 }
 
 /// Discard an unsent attachment after the user removes it or leaves a draft.
@@ -12840,6 +13412,56 @@ fn require_capability(
     require_capability_for(state, capability_token, workdir, ToolAction::Read, None)
 }
 
+fn validate_workspace_view_grant(
+    state: &AppState,
+    token: &str,
+    canonical: &Path,
+    grant: &WorkspaceCapabilityGrant,
+) -> Result<(), String> {
+    if grant.expires_at <= Instant::now() {
+        state.workspace_capabilities.lock().remove(token);
+        return Err("workspace capability token is expired".to_string());
+    }
+    if grant.workdir != canonical {
+        return Err("workspace capability token is bound to a different workdir".to_string());
+    }
+    let session_matches = state
+        .sessions
+        .lock()
+        .get(&grant.session_id)
+        .and_then(|record| canonical_workdir(&record.summary.cwd).ok())
+        .is_some_and(|stored| stored == canonical);
+    if !session_matches {
+        state.workspace_capabilities.lock().remove(token);
+        return Err("workspace capability session is no longer available".to_string());
+    }
+    if require_registered_project_workdir(state, canonical).is_err() {
+        state.workspace_capabilities.lock().remove(token);
+        return Err("workspace capability project is no longer registered".to_string());
+    }
+    Ok(())
+}
+
+fn require_workspace_view_capability(
+    state: &AppState,
+    capability_token: Option<&str>,
+    workdir: &str,
+) -> Result<(PathBuf, WorkspaceCapabilityGrant), String> {
+    let token = capability_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "workspace capability token is required".to_string())?;
+    let canonical = canonical_workdir(workdir)?;
+    let grant = state
+        .workspace_capabilities
+        .lock()
+        .get(token)
+        .cloned()
+        .ok_or_else(|| "workspace capability token is invalid or expired".to_string())?;
+    validate_workspace_view_grant(state, token, &canonical, &grant)?;
+    Ok((canonical, grant))
+}
+
 fn require_read_capability(
     state: &AppState,
     capability_token: Option<&str>,
@@ -12880,31 +13502,10 @@ fn require_read_capability(
         }
         return Ok(canonical);
     }
-    let workspace_grant = state.workspace_capabilities.lock().get(token).cloned();
-    let Some(grant) = workspace_grant else {
+    let Some(grant) = state.workspace_capabilities.lock().get(token).cloned() else {
         return require_capability(state, Some(token), workdir);
     };
-    if grant.expires_at <= Instant::now() {
-        state.workspace_capabilities.lock().remove(token);
-        return Err("workspace capability token is expired".to_string());
-    }
-    if grant.workdir != canonical {
-        return Err("workspace capability token is bound to a different workdir".to_string());
-    }
-    let session_matches = state
-        .sessions
-        .lock()
-        .get(&grant.session_id)
-        .and_then(|record| canonical_workdir(&record.summary.cwd).ok())
-        .is_some_and(|stored| stored == canonical);
-    if !session_matches {
-        state.workspace_capabilities.lock().remove(token);
-        return Err("workspace capability session is no longer available".to_string());
-    }
-    if require_registered_project_workdir(state, &canonical).is_err() {
-        state.workspace_capabilities.lock().remove(token);
-        return Err("workspace capability project is no longer registered".to_string());
-    }
+    validate_workspace_view_grant(state, token, &canonical, &grant)?;
     Ok(canonical)
 }
 
@@ -15260,6 +15861,632 @@ pub fn shell_cancel(
 }
 
 // ---------------------------------------------------------------------------
+// Git Review
+
+/// The Dock deliberately exposes a small, deterministic Git surface instead
+/// of a terminal. The renderer can review one approved workspace and create a
+/// confirmed commit from files that the user has already staged; it never
+/// receives an arbitrary command or a repository path outside that workspace.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitStatusEntry {
+    pub path: String,
+    pub index_status: String,
+    pub worktree_status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitStatusResponse {
+    pub is_repository: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub ahead: usize,
+    pub behind: usize,
+    pub entries: Vec<GitStatusEntry>,
+    pub staged_count: usize,
+    pub unstaged_count: usize,
+    pub untracked_count: usize,
+    pub clean: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+impl GitStatusResponse {
+    fn unavailable(reason: &str) -> Self {
+        Self {
+            is_repository: false,
+            repository_root: None,
+            branch: None,
+            ahead: 0,
+            behind: 0,
+            entries: Vec::new(),
+            staged_count: 0,
+            unstaged_count: 0,
+            untracked_count: 0,
+            clean: true,
+            unavailable_reason: Some(reason.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCommitResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
+    pub committed_files: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCommitCapabilityResponse {
+    pub grant_token: String,
+    pub workdir: String,
+    pub staged_count: usize,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug)]
+struct GitCommandOutput {
+    exit_code: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    timed_out: bool,
+}
+
+fn run_git_command(
+    repository_root: &Path,
+    arguments: &[String],
+    timeout_ms: u64,
+) -> Result<GitCommandOutput, String> {
+    let mut command = Command::new("git");
+    command
+        .args(arguments)
+        .current_dir(repository_root)
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
+        // Keep diagnostics parseable and never let a repository-provided
+        // fsmonitor helper run merely because the user opened Git Review.
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_hidden_console_process(&mut command);
+
+    let started = Instant::now();
+    let mut child = command.spawn().map_err(|_| {
+        "Git executable is unavailable. Install Git and restart NovaVei to enable Git Review."
+            .to_string()
+    })?;
+    let stdout_capture = child.stdout.take().map(bounded_output);
+    let stderr_capture = child.stderr.take().map(bounded_output);
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < Duration::from_millis(timeout_ms) => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                timed_out = true;
+                terminate_shell_process_tree(&mut child);
+                break wait_for_terminated_shell(&mut child, "timed-out Git")?;
+            }
+            Err(error) => {
+                terminate_shell_process_tree(&mut child);
+                let _ = wait_for_terminated_shell(&mut child, "failed Git");
+                return Err(format!("wait for Git: {error}"));
+            }
+        }
+    };
+    let drain_deadline = Instant::now() + Duration::from_millis(SHELL_STDIO_DRAIN_TIMEOUT_MS);
+    let (stdout, stdout_truncated, _) = collect_bounded_output(stdout_capture, drain_deadline);
+    let (stderr, stderr_truncated, _) = collect_bounded_output(stderr_capture, drain_deadline);
+    Ok(GitCommandOutput {
+        exit_code: status.code().unwrap_or(-1),
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+        timed_out,
+    })
+}
+
+fn git_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn git_command_failed(output: &GitCommandOutput) -> bool {
+    output.timed_out || output.exit_code != 0
+}
+
+fn git_not_repository(output: &GitCommandOutput) -> bool {
+    git_text(&output.stderr)
+        .to_ascii_lowercase()
+        .contains("not a git repository")
+}
+
+fn git_args(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
+}
+
+fn parse_git_branch_header(header: &str) -> (Option<String>, usize, usize) {
+    let header = header.trim();
+    if let Some(branch) = header.strip_prefix("No commits yet on ") {
+        return (Some(branch.trim().to_string()), 0, 0);
+    }
+    let (branch, tracking) = header.split_once("...").unwrap_or((header, ""));
+    let branch = match branch.trim() {
+        "" => None,
+        "HEAD (no branch)" => Some("detached HEAD".to_string()),
+        value => Some(value.to_string()),
+    };
+    let mut ahead = 0;
+    let mut behind = 0;
+    if let Some((_, progress)) = tracking.split_once('[') {
+        let progress = progress.trim_end_matches(']');
+        for item in progress.split(',').map(str::trim) {
+            if let Some(value) = item.strip_prefix("ahead ") {
+                ahead = value.parse().unwrap_or(0);
+            } else if let Some(value) = item.strip_prefix("behind ") {
+                behind = value.parse().unwrap_or(0);
+            }
+        }
+    }
+    (branch, ahead, behind)
+}
+
+fn parse_git_status(
+    output: &[u8],
+) -> Result<(Option<String>, usize, usize, Vec<GitStatusEntry>), String> {
+    let mut branch = None;
+    let mut ahead = 0;
+    let mut behind = 0;
+    let mut entries = Vec::new();
+    let mut records = output.split(|byte| *byte == b'\0');
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        if record.starts_with(b"## ") {
+            let (parsed_branch, parsed_ahead, parsed_behind) =
+                parse_git_branch_header(&String::from_utf8_lossy(&record[3..]));
+            branch = parsed_branch;
+            ahead = parsed_ahead;
+            behind = parsed_behind;
+            continue;
+        }
+        if record.len() < 4 || record[2] != b' ' {
+            return Err("Git returned an unsupported status record".to_string());
+        }
+        let index_status = record[0] as char;
+        let worktree_status = record[1] as char;
+        let path = git_text(&record[3..]);
+        if path.trim().is_empty() {
+            return Err("Git returned a status record without a file path".to_string());
+        }
+        if (index_status == 'R' || index_status == 'C') && records.next().is_none() {
+            return Err("Git returned an incomplete rename status record".to_string());
+        }
+        entries.push(GitStatusEntry {
+            path,
+            index_status: index_status.to_string(),
+            worktree_status: worktree_status.to_string(),
+        });
+        if entries.len() > MAX_GIT_STATUS_ENTRIES {
+            return Err("Git status has too many changed paths to display safely".to_string());
+        }
+    }
+    Ok((branch, ahead, behind, entries))
+}
+
+fn git_status_for_workspace(workdir: &Path) -> Result<GitStatusResponse, String> {
+    let root = run_git_command(
+        workdir,
+        &git_args(&["-c", "core.fsmonitor=false", "rev-parse", "--show-toplevel"]),
+        GIT_STATUS_TIMEOUT_MS,
+    )?;
+    if root.timed_out {
+        return Err("Git repository discovery timed out".to_string());
+    }
+    if root.exit_code != 0 {
+        if git_not_repository(&root) {
+            return Ok(GitStatusResponse::unavailable("not_repository"));
+        }
+        return Err("Git could not inspect the current project".to_string());
+    }
+    if root.stdout_truncated || root.stderr_truncated {
+        return Err("Git repository discovery returned too much output".to_string());
+    }
+    let root_text = String::from_utf8_lossy(&root.stdout).trim().to_string();
+    let repository_root = fs::canonicalize(&root_text)
+        .map_err(|_| "Git returned an inaccessible repository root".to_string())?;
+    if repository_root != workdir {
+        // Git may discover a parent checkout when a user opens only one of its
+        // subfolders. Do not expose or commit sibling changes outside NovaVei's
+        // exact approved project root.
+        return Ok(GitStatusResponse::unavailable(
+            "repository_outside_workspace",
+        ));
+    }
+    let status = run_git_command(
+        &repository_root,
+        &git_args(&[
+            "-c",
+            "color.ui=false",
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "-b",
+            "--untracked-files=all",
+        ]),
+        GIT_STATUS_TIMEOUT_MS,
+    )?;
+    if status.timed_out {
+        return Err("Git status timed out".to_string());
+    }
+    if status.exit_code != 0 {
+        return Err("Git could not read the current project status".to_string());
+    }
+    if status.stdout_truncated || status.stderr_truncated {
+        return Err("Git status is too large to display safely".to_string());
+    }
+    let (branch, ahead, behind, entries) = parse_git_status(&status.stdout)?;
+    let staged_count = entries
+        .iter()
+        .filter(|entry| entry.index_status != " " && entry.index_status != "?")
+        .count();
+    let unstaged_count = entries
+        .iter()
+        .filter(|entry| entry.worktree_status != " ")
+        .count();
+    let untracked_count = entries
+        .iter()
+        .filter(|entry| entry.index_status == "?" && entry.worktree_status == "?")
+        .count();
+    Ok(GitStatusResponse {
+        is_repository: true,
+        repository_root: Some(path_for_display(&repository_root)),
+        branch,
+        ahead,
+        behind,
+        clean: entries.is_empty(),
+        entries,
+        staged_count,
+        unstaged_count,
+        untracked_count,
+        unavailable_reason: None,
+    })
+}
+
+fn normalized_git_commit_message(message: &str) -> Result<String, String> {
+    let message = message.trim();
+    if message.is_empty() {
+        return Err("a Git commit message is required".to_string());
+    }
+    if message.chars().count() > MAX_GIT_COMMIT_MESSAGE_CHARS {
+        return Err(format!(
+            "Git commit messages must be at most {MAX_GIT_COMMIT_MESSAGE_CHARS} characters"
+        ));
+    }
+    if message.contains('\0') {
+        return Err("Git commit messages cannot contain NUL characters".to_string());
+    }
+    Ok(message.to_string())
+}
+
+fn git_commit_message_digest(message: &str) -> [u8; 32] {
+    Sha256::digest(message.as_bytes()).into()
+}
+
+fn git_staged_snapshot_digest(workdir: &Path) -> Result<[u8; 32], String> {
+    let output = run_git_command(
+        workdir,
+        &git_args(&[
+            "diff",
+            "--cached",
+            "--raw",
+            "-z",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-renames",
+            "--",
+        ]),
+        GIT_STATUS_TIMEOUT_MS,
+    )?;
+    if git_command_failed(&output) {
+        return Err("Git staged snapshot is unavailable".to_string());
+    }
+    if output.stdout_truncated || output.stderr_truncated {
+        return Err("Git staged snapshot is too large to confirm safely".to_string());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"git-staged-raw-v1\0");
+    hasher.update(&output.stdout);
+    Ok(hasher.finalize().into())
+}
+
+fn prune_git_commit_capabilities(grants: &mut HashMap<String, GitCommitCapabilityGrant>) {
+    let now = Instant::now();
+    grants.retain(|_, grant| grant.expires_at > now);
+}
+
+fn request_native_git_commit_confirmation(
+    workdir: &Path,
+    message: &str,
+    staged_count: usize,
+) -> Result<(), String> {
+    let description = format!(
+        "NovaVei will create a Git commit in:\n{}\n\nStaged files: {}\n\nMessage:\n{}\n\nProject Git hooks may run during this commit.",
+        truncate_mcp_confirmation_text(&path_for_display(workdir), 240),
+        staged_count,
+        truncate_mcp_confirmation_text(message, 800)
+    );
+    #[cfg(all(windows, not(test)))]
+    {
+        let response = rfd::MessageDialog::new()
+            .set_title("Confirm NovaVei Git commit")
+            .set_description(description)
+            .set_buttons(rfd::MessageButtons::OkCancel)
+            .show();
+        if response == rfd::MessageDialogResult::Ok {
+            Ok(())
+        } else {
+            Err("native Git commit confirmation was denied".to_string())
+        }
+    }
+    #[cfg(test)]
+    {
+        let _ = description;
+        Ok(())
+    }
+    #[cfg(all(not(windows), not(test)))]
+    {
+        let _ = description;
+        Err("native Git commit confirmation is unavailable on this platform".to_string())
+    }
+}
+
+fn git_commit_status_or_error(workdir: &Path) -> Result<GitStatusResponse, String> {
+    let status = git_status_for_workspace(workdir)?;
+    if !status.is_repository {
+        return Err("the current project is not an eligible Git repository".to_string());
+    }
+    if status.staged_count == 0 {
+        return Err("there are no staged changes to commit".to_string());
+    }
+    Ok(status)
+}
+
+fn issue_git_commit_capability(
+    state: &AppState,
+    workdir: &str,
+    message: &str,
+    capability_token: Option<&str>,
+) -> Result<GitCommitCapabilityResponse, String> {
+    state.require_persistence_ready()?;
+    let (workdir, workspace_grant) =
+        require_workspace_view_capability(state, capability_token, workdir)?;
+    let message = normalized_git_commit_message(message)?;
+    let status = git_commit_status_or_error(&workdir)?;
+    let staged_digest = git_staged_snapshot_digest(&workdir)?;
+    request_native_git_commit_confirmation(&workdir, &message, status.staged_count)?;
+
+    let current_status = git_commit_status_or_error(&workdir)?;
+    if current_status.staged_count != status.staged_count
+        || git_staged_snapshot_digest(&workdir)? != staged_digest
+    {
+        return Err("Git staged changes changed while confirming the commit".to_string());
+    }
+
+    let grant_token = format!("git-commit-{}", Uuid::new_v4());
+    let expires_at = Instant::now() + GIT_COMMIT_GRANT_TTL;
+    {
+        let mut grants = state.git_commit_capabilities.lock();
+        prune_git_commit_capabilities(&mut grants);
+        if grants.len() >= MAX_PENDING_GIT_COMMIT_GRANTS {
+            return Err(
+                "too many pending Git commit confirmations; wait for one to expire".to_string(),
+            );
+        }
+        grants.insert(
+            grant_token.clone(),
+            GitCommitCapabilityGrant {
+                session_id: workspace_grant.session_id,
+                workdir: workdir.clone(),
+                message_digest: git_commit_message_digest(&message),
+                staged_digest,
+                staged_count: status.staged_count,
+                expires_at,
+            },
+        );
+    }
+
+    Ok(GitCommitCapabilityResponse {
+        grant_token,
+        workdir: path_for_display(&workdir),
+        staged_count: status.staged_count,
+        expires_at_ms: now_ms() + GIT_COMMIT_GRANT_TTL.as_millis() as i64,
+    })
+}
+
+fn consume_git_commit_capability(
+    state: &AppState,
+    commit_token: Option<&str>,
+    workdir: &str,
+    message: &str,
+) -> Result<PathBuf, String> {
+    let token = commit_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 128 && value.starts_with("git-commit-"))
+        .ok_or_else(|| "Git commit requires a current native confirmation".to_string())?;
+    let workdir = canonical_workdir(workdir)?;
+    let message = normalized_git_commit_message(message)?;
+    let grant = {
+        let mut grants = state.git_commit_capabilities.lock();
+        prune_git_commit_capabilities(&mut grants);
+        grants
+            .remove(token)
+            .ok_or_else(|| "Git commit confirmation is invalid or expired".to_string())?
+    };
+    if grant.expires_at <= Instant::now()
+        || grant.workdir != workdir
+        || grant.message_digest != git_commit_message_digest(&message)
+    {
+        return Err("Git commit confirmation does not match this operation".to_string());
+    }
+    let session_matches = state
+        .sessions
+        .lock()
+        .get(&grant.session_id)
+        .and_then(|record| canonical_workdir(&record.summary.cwd).ok())
+        .is_some_and(|stored| stored == workdir);
+    if !session_matches {
+        return Err("Git commit confirmation session is no longer available".to_string());
+    }
+    require_registered_project_workdir(state, &workdir)?;
+    let status = git_commit_status_or_error(&workdir)?;
+    if status.staged_count != grant.staged_count
+        || git_staged_snapshot_digest(&workdir)? != grant.staged_digest
+    {
+        return Err("Git staged changes changed after commit confirmation".to_string());
+    }
+    Ok(workdir)
+}
+
+fn git_commit_failure(output: &GitCommandOutput) -> String {
+    if output.timed_out {
+        return "Git commit timed out; NovaVei did not assume whether a commit was created"
+            .to_string();
+    }
+    let detail = git_text(&output.stderr).to_ascii_lowercase();
+    if detail.contains("please tell me who you are")
+        || detail.contains("unable to auto-detect email")
+    {
+        return "Git needs user.name and user.email before it can create a commit".to_string();
+    }
+    if detail.contains("nothing to commit") {
+        return "There are no staged changes to commit".to_string();
+    }
+    if detail.contains("hook") {
+        return "A project Git hook rejected or interrupted the commit".to_string();
+    }
+    "Git commit failed; review the staged changes and repository settings".to_string()
+}
+
+fn git_commit_for_workspace(workdir: &Path, message: &str) -> Result<GitCommitResponse, String> {
+    let message = normalized_git_commit_message(message)?;
+    let status = git_status_for_workspace(workdir)?;
+    if !status.is_repository {
+        return Err("the current project is not an eligible Git repository".to_string());
+    }
+    if status.staged_count == 0 {
+        return Err("there are no staged changes to commit".to_string());
+    }
+    let output = run_git_command(
+        workdir,
+        &[
+            "-c".to_string(),
+            "color.ui=false".to_string(),
+            "-c".to_string(),
+            "core.pager=cat".to_string(),
+            "commit".to_string(),
+            "-m".to_string(),
+            message,
+        ],
+        GIT_COMMIT_TIMEOUT_MS,
+    )?;
+    if git_command_failed(&output) {
+        return Err(git_commit_failure(&output));
+    }
+    let revision = run_git_command(
+        workdir,
+        &git_args(&["rev-parse", "--short=12", "HEAD"]),
+        GIT_STATUS_TIMEOUT_MS,
+    )?;
+    let commit_id = (!git_command_failed(&revision))
+        .then(|| String::from_utf8_lossy(&revision.stdout).trim().to_string())
+        .filter(|value| !value.is_empty());
+    Ok(GitCommitResponse {
+        commit_id,
+        committed_files: status.staged_count,
+    })
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn git_status(
+    state: State<'_, Arc<AppState>>,
+    workdir: String,
+    capability_token: Option<String>,
+) -> Result<GitStatusResponse, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let workdir = require_read_capability(&state, capability_token.as_deref(), &workdir)?;
+        git_status_for_workspace(&workdir)
+    })
+    .await
+    .map_err(|error| format!("git_status join failed: {error}"))?
+}
+
+/// Issue a short-lived, one-use native grant for one exact Git commit. The
+/// grant is bound to the visible workspace session, commit message, and staged
+/// file snapshot; the read-only workspace capability is never accepted by the
+/// commit command itself.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn git_commit_capability_issue(
+    state: State<'_, Arc<AppState>>,
+    workdir: String,
+    message: String,
+    capability_token: Option<String>,
+) -> Result<GitCommitCapabilityResponse, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        issue_git_commit_capability(&state, &workdir, &message, capability_token.as_deref())
+    })
+    .await
+    .map_err(|error| format!("git_commit_capability_issue join failed: {error}"))?
+}
+
+/// Commit only already-staged paths. The app UI obtains the message and shows
+/// explicit confirmation before a native grant is minted; no shell command,
+/// ref name, or repository path is renderer-controlled.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn git_commit(
+    state: State<'_, Arc<AppState>>,
+    workdir: String,
+    message: String,
+    commit_token: Option<String>,
+) -> Result<GitCommitResponse, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let workdir =
+            consume_git_commit_capability(&state, commit_token.as_deref(), &workdir, &message)?;
+        git_commit_for_workspace(&workdir, &message)
+    })
+    .await
+    .map_err(|error| format!("git_commit join failed: {error}"))?
+}
+
+// ---------------------------------------------------------------------------
 // History compatibility surface
 
 #[derive(Debug, Clone, Serialize)]
@@ -15931,10 +17158,52 @@ fn history_search_preview(value: &str, query: &str) -> String {
     preview
 }
 
+fn history_search_grams(value: &str) -> Vec<String> {
+    let characters = value.chars().collect::<Vec<_>>();
+    if characters.len() < HISTORY_SEARCH_INDEX_GRAM_CHARS {
+        return Vec::new();
+    }
+    let mut unique = HashSet::new();
+    for window in characters.windows(HISTORY_SEARCH_INDEX_GRAM_CHARS) {
+        unique.insert(window.iter().collect::<String>());
+    }
+    unique.into_iter().collect()
+}
+
+/// This deliberately hashes only cache-shape metadata, never writes it, and
+/// never sends it over IPC. Session updates already advance `updated_at`; the
+/// loaded-count/complete bits also catch lazy transcript page changes.
+fn history_search_source_stamp(sessions: &HashMap<String, SessionRecord>) -> [u8; 32] {
+    let mut records = sessions.values().collect::<Vec<_>>();
+    records.sort_by(|left, right| left.summary.id.cmp(&right.summary.id));
+    let mut hasher = Sha256::new();
+    for record in records {
+        hasher.update(record.summary.id.as_bytes());
+        hasher.update(record.summary.title.as_bytes());
+        hasher.update(record.summary.updated_at.to_le_bytes());
+        hasher.update(record.message_count.to_le_bytes());
+        hasher.update((record.messages.len() as u64).to_le_bytes());
+        hasher.update([
+            u8::from(record.messages_loaded),
+            u8::from(record.messages_complete),
+        ]);
+        for message in &record.messages {
+            hasher.update(message.id.as_bytes());
+            hasher.update(message.role.as_bytes());
+            hasher.update(message.created_at.to_le_bytes());
+            hasher.update(message.content.len().to_le_bytes());
+            hasher.update(message.content.as_bytes());
+        }
+    }
+    hasher.finalize().into()
+}
+
 fn history_search_matches(
+    index: &mut InMemoryHistorySearchIndex,
     sessions: &HashMap<String, SessionRecord>,
     raw_query: &str,
     requested_limit: Option<u64>,
+    requested_offset: Option<u64>,
 ) -> Vec<Value> {
     let query = history_search_normalize(raw_query, MAX_HISTORY_SEARCH_QUERY_CHARS).to_lowercase();
     if query.is_empty() {
@@ -15943,58 +17212,8 @@ fn history_search_matches(
     let limit = requested_limit
         .unwrap_or(12)
         .clamp(1, MAX_HISTORY_SEARCH_RESULTS as u64) as usize;
-    let mut matches = Vec::<(i64, Value)>::new();
-
-    for record in sessions.values() {
-        let conversation_id = record.summary.id.trim();
-        if conversation_id.is_empty()
-            || conversation_id.len() > MAX_HISTORY_TRACE_SESSION_ID_BYTES
-            || conversation_id.chars().any(char::is_control)
-        {
-            continue;
-        }
-        let title = history_search_normalize(&record.summary.title, MAX_HISTORY_SEARCH_TITLE_CHARS);
-        for message in &record.messages {
-            if !matches!(
-                message.role.to_ascii_lowercase().as_str(),
-                "user" | "assistant"
-            ) {
-                continue;
-            }
-            let content =
-                history_search_normalize(&message.content, MAX_HISTORY_SEARCH_MESSAGE_CHARS);
-            if content.is_empty() || !content.to_lowercase().contains(&query) {
-                continue;
-            }
-            let message_id = message.id.trim();
-            if message_id.is_empty()
-                || message_id.len() > MAX_HISTORY_TRACE_MESSAGE_ID_BYTES
-                || message_id.chars().any(char::is_control)
-            {
-                continue;
-            }
-            let role = message.role.to_ascii_lowercase();
-            let preview = history_search_preview(&content, &query);
-            matches.push((
-                message.created_at,
-                json!({
-                    "conversationId": conversation_id,
-                    "conversationTitle": title,
-                    "messageId": message_id,
-                    "role": role,
-                    "text": preview,
-                    "updatedAt": message.created_at
-                }),
-            ));
-        }
-    }
-
-    matches.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    matches
-        .into_iter()
-        .take(limit)
-        .map(|(_, value)| value)
-        .collect()
+    let offset = requested_offset.unwrap_or(0).min(10_000) as usize;
+    index.search(sessions, &query, offset, limit)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -16281,7 +17500,15 @@ pub fn session_metadata_search(
 pub fn chat_history_search(state: State<'_, Arc<AppState>>, args: Value) -> Value {
     let raw_query = args.get("query").and_then(Value::as_str).unwrap_or("");
     let requested_limit = args.get("limit").and_then(Value::as_u64);
-    let matches = history_search_matches(&state.sessions.lock(), raw_query, requested_limit);
+    let requested_offset = args.get("offset").and_then(Value::as_u64);
+    let sessions = state.sessions.lock();
+    let matches = history_search_matches(
+        &mut state.history_search_index.lock(),
+        &sessions,
+        raw_query,
+        requested_limit,
+        requested_offset,
+    );
     json!({"matches": matches})
 }
 
@@ -16704,7 +17931,16 @@ fn bulk_set_history_archived(
             record.summary.updated_at = mutation_time;
         }
     }
-    if let Err(error) = state.persist_locked() {
+    let persisted_sessions = {
+        let sessions = state.sessions.lock();
+        ids.iter()
+            .filter_map(|id| sessions.get(id).map(stored_session_from_record))
+            .collect::<Vec<_>>()
+    };
+    if let Err(error) = state
+        .history
+        .upsert_session_metadata_batch(&persisted_sessions)
+    {
         restore_history_records(state, &snapshots);
         return Err(error);
     }
@@ -16774,7 +18010,7 @@ fn mutate_session_and_persist<T>(
             .ok_or_else(|| "history conversation not found".to_string())?;
         mutate(record)?
     };
-    if let Err(error) = state.persist_session_locked(id) {
+    if let Err(error) = state.persist_session_metadata_locked(id) {
         state.sessions.lock().insert(id.to_string(), previous);
         return Err(error);
     }
@@ -17152,6 +18388,7 @@ mod tests {
             history,
             subagent_tasks,
             sessions: Mutex::new(HashMap::from([(session_id, record)])),
+            history_search_index: Mutex::new(InMemoryHistorySearchIndex::default()),
             settings: Mutex::new(HashMap::new()),
             provider_import_previews: Mutex::new(HashMap::new()),
             provider_connection_drafts: Mutex::new(HashMap::new()),
@@ -17167,6 +18404,7 @@ mod tests {
             full_permission_grants: Mutex::new(HashMap::new()),
             subagent_capabilities: Mutex::new(HashMap::new()),
             workspace_capabilities: Mutex::new(HashMap::new()),
+            git_commit_capabilities: Mutex::new(HashMap::new()),
             pending_permissions: Mutex::new(HashMap::new()),
             tool_approvals: Mutex::new(HashMap::new()),
             shell_runs: Mutex::new(HashMap::new()),
@@ -17213,6 +18451,93 @@ mod tests {
     }
 
     #[test]
+    fn composer_media_ipc_payload_keeps_descriptor_and_bytes_separate() {
+        let descriptor = ComposerMediaAttachment {
+            id: "media-123".to_string(),
+            name: "test.png".to_string(),
+            mime: "image/png".to_string(),
+            kind: ComposerMediaKind::Image,
+            size_bytes: 3,
+        };
+        let bytes = vec![0xde, 0xad, 0xbe];
+
+        let payload = composer_media_ipc_payload(descriptor, bytes.clone())
+            .expect("the IPC envelope should serialize");
+        let header_len = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+        let header: Value = serde_json::from_slice(&payload[4..4 + header_len])
+            .expect("the descriptor header should be JSON");
+
+        assert_eq!(header["id"], "media-123");
+        assert_eq!(header["name"], "test.png");
+        assert_eq!(header["mime"], "image/png");
+        assert_eq!(header["kind"], "image");
+        assert_eq!(header["sizeBytes"], 3);
+        assert_eq!(&payload[4 + header_len..], bytes.as_slice());
+    }
+
+    fn composer_pasted_image_ipc_payload_for_test(header: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut payload =
+            Vec::with_capacity(COMPOSER_PASTED_IMAGE_IPC_PREFIX_BYTES + header.len() + body.len());
+        payload.extend_from_slice(COMPOSER_PASTED_IMAGE_IPC_MAGIC);
+        payload.push(COMPOSER_PASTED_IMAGE_IPC_VERSION);
+        payload.extend_from_slice(&(header.len() as u32).to_be_bytes());
+        payload.extend_from_slice(header);
+        payload.extend_from_slice(body);
+        payload
+    }
+
+    #[test]
+    fn composer_pasted_image_ipc_payload_is_versioned_bounded_and_binary() {
+        let header = br#"{"workdir":"workspace","sessionId":"session-1","name":"clip.png","mime":"image/png"}"#;
+        let body = [0x89, b'P', b'N', b'G'];
+        let payload = composer_pasted_image_ipc_payload_for_test(header, &body);
+        let (decoded, decoded_body) = decode_composer_pasted_image_ipc_payload(&payload)
+            .expect("a valid raw pasted-image envelope should decode");
+        assert_eq!(decoded.workdir, "workspace");
+        assert_eq!(decoded.session_id, "session-1");
+        assert_eq!(decoded.name, "clip.png");
+        assert_eq!(decoded.mime.as_deref(), Some("image/png"));
+        assert_eq!(decoded_body, body.as_slice());
+
+        let mut invalid_magic = payload.clone();
+        invalid_magic[0] ^= 0xff;
+        assert!(decode_composer_pasted_image_ipc_payload(&invalid_magic).is_err());
+
+        let mut unsupported_version = payload.clone();
+        unsupported_version[COMPOSER_PASTED_IMAGE_IPC_MAGIC.len()] += 1;
+        assert!(decode_composer_pasted_image_ipc_payload(&unsupported_version).is_err());
+
+        let duplicate_field = br#"{"workdir":"workspace","sessionId":"session-1","name":"first.png","name":"second.png","mime":"image/png"}"#;
+        assert!(decode_composer_pasted_image_ipc_payload(
+            &composer_pasted_image_ipc_payload_for_test(duplicate_field, &body),
+        )
+        .is_err());
+
+        let unknown_field = br#"{"workdir":"workspace","sessionId":"session-1","name":"clip.png","mime":"image/png","extra":true}"#;
+        assert!(decode_composer_pasted_image_ipc_payload(
+            &composer_pasted_image_ipc_payload_for_test(unknown_field, &body),
+        )
+        .is_err());
+
+        let nul_field = br#"{"workdir":"workspace","sessionId":"session-1","name":"clip\u0000.png","mime":"image/png"}"#;
+        assert!(decode_composer_pasted_image_ipc_payload(
+            &composer_pasted_image_ipc_payload_for_test(nul_field, &body),
+        )
+        .is_err());
+
+        assert!(decode_composer_pasted_image_ipc_payload(
+            &composer_pasted_image_ipc_payload_for_test(&[0xff], &body),
+        )
+        .is_err());
+
+        let oversized_body = vec![0; MAX_COMPOSER_MEDIA_BYTES as usize + 1];
+        assert!(decode_composer_pasted_image_ipc_payload(
+            &composer_pasted_image_ipc_payload_for_test(header, &oversized_body),
+        )
+        .is_err());
+    }
+
+    #[test]
     fn composer_media_load_revalidates_stored_image_bounds() {
         let (state, database_path) = test_state();
         let session_id = state.sessions.lock().keys().next().cloned().unwrap();
@@ -17221,7 +18546,7 @@ mod tests {
             &state,
             &session_id,
             "test.png",
-            valid_bytes.clone(),
+            &valid_bytes,
             (ComposerMediaKind::Image, "image/png"),
         )
         .expect("bounded image should stage");
@@ -17251,7 +18576,7 @@ mod tests {
             &state,
             &session_id,
             "test.png",
-            composer_test_png(1, 1),
+            &composer_test_png(1, 1),
             (ComposerMediaKind::Image, "image/png"),
         )
         .expect("bounded image should stage");
@@ -18256,6 +19581,7 @@ mod tests {
             ToolAction::Edit,
             ToolAction::Delete,
             ToolAction::Shell,
+            ToolAction::GitCommit,
         ] {
             assert_eq!(
                 permission_requirement(PermissionMode::Readonly, action),
@@ -18285,6 +19611,10 @@ mod tests {
         );
         assert_eq!(
             permission_requirement(PermissionMode::AutoApprove, ToolAction::Shell),
+            Approval
+        );
+        assert_eq!(
+            permission_requirement(PermissionMode::AutoApprove, ToolAction::GitCommit),
             Approval
         );
         assert_eq!(PermissionMode::parse(Some("unknown")), PermissionMode::Ask);
@@ -18845,6 +20175,7 @@ mod tests {
             .create_task(NewSubagentTask {
                 id: task_id.clone(),
                 session_id: run.session_id.clone(),
+                agent_id: "worktree-test-agent".to_string(),
                 parent_turn_id: run.turn_id.clone(),
                 parent_request_id: run.request_id.clone(),
                 title: "Git metadata boundary".to_string(),
@@ -20418,6 +21749,32 @@ mod tests {
     }
 
     #[test]
+    fn system_settings_normalize_secondary_launch_behavior() {
+        let defaulted = normalize_system_settings_payload(json!({})).unwrap();
+        assert_eq!(
+            defaulted["secondaryLaunchBehavior"],
+            json!(SECONDARY_LAUNCH_FOCUS_EXISTING)
+        );
+        let new_window = normalize_system_settings_payload(json!({
+            "secondaryLaunchBehavior": SECONDARY_LAUNCH_NEW_WINDOW
+        }))
+        .unwrap();
+        assert_eq!(
+            new_window["secondaryLaunchBehavior"],
+            json!(SECONDARY_LAUNCH_NEW_WINDOW)
+        );
+        assert!(normalize_system_settings_payload(json!({
+            "secondaryLaunchBehavior": "another-process"
+        }))
+        .is_err());
+        assert!(normalize_system_settings_payload(json!({
+            "secondaryLaunchBehavior": SECONDARY_LAUNCH_NEW_WINDOW,
+            "secondary_launch_behavior": SECONDARY_LAUNCH_FOCUS_EXISTING
+        }))
+        .is_err());
+    }
+
+    #[test]
     fn project_permission_preferences_are_canonical_and_never_persist_full_access() {
         let entry = json!({
             "preferences": {
@@ -21214,7 +22571,33 @@ mod tests {
     fn metadata_mutation_persists_and_survives_reload() {
         let (state, path) = test_state();
         let id = state.sessions.lock().keys().next().cloned().unwrap();
-        state.persist().unwrap();
+        {
+            let mut sessions = state.sessions.lock();
+            let record = sessions.get_mut(&id).unwrap();
+            record.messages.push(MessageRecord {
+                id: "metadata-message".to_string(),
+                role: "user".to_string(),
+                content: "leave this ciphertext untouched".to_string(),
+                created_at: 1,
+                turn_id: None,
+                model: None,
+                reasoning: None,
+                finished_at: None,
+                thinking: None,
+            });
+            record.message_count = 1;
+            record.messages_loaded = true;
+            record.messages_complete = true;
+        }
+        state.persist_session_locked(&id).unwrap();
+        let ciphertext_before: String = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT content FROM messages WHERE id = 'metadata-message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         let summary = mutate_session_and_persist(&state, &id, |record| {
             record.pinned_at = Some(10);
             record.archived_at = Some(11);
@@ -21233,6 +22616,15 @@ mod tests {
         assert_eq!(loaded.provider_id, "gateway");
         assert_eq!(loaded.model, "model-1");
         assert_eq!(loaded.share_token.as_deref(), Some("share-test"));
+        let ciphertext_after: String = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT content FROM messages WHERE id = 'metadata-message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ciphertext_after, ciphertext_before);
         cleanup_test_db(&path);
     }
 
@@ -21267,11 +22659,45 @@ mod tests {
             Some("tool")
         )
         .is_err());
+        assert!(consume_git_commit_capability(
+            &state,
+            Some(token),
+            &workdir.display().to_string(),
+            "commit from read token"
+        )
+        .is_err());
         state.sessions.lock().remove(&id);
         assert!(
             require_read_capability(&state, Some(token), &workdir.display().to_string()).is_err()
         );
         cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn git_porcelain_status_parses_branch_counts_and_rename_records() {
+        let output = b"## main...origin/main [ahead 2, behind 1]\0M  staged.txt\0 M unstaged.txt\0?? new.txt\0R  renamed.txt\0old-name.txt\0";
+        let (branch, ahead, behind, entries) =
+            parse_git_status(output).expect("porcelain v1 output should parse");
+        assert_eq!(branch.as_deref(), Some("main"));
+        assert_eq!(ahead, 2);
+        assert_eq!(behind, 1);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].path, "staged.txt");
+        assert_eq!(entries[1].worktree_status, "M");
+        assert_eq!(entries[2].index_status, "?");
+        assert_eq!(entries[3].path, "renamed.txt");
+    }
+
+    #[test]
+    fn git_commit_message_is_bounded_and_never_allows_nul() {
+        assert_eq!(
+            normalized_git_commit_message("  Keep the Git Review usable  ").unwrap(),
+            "Keep the Git Review usable"
+        );
+        assert!(normalized_git_commit_message("\0").is_err());
+        assert!(
+            normalized_git_commit_message(&"x".repeat(MAX_GIT_COMMIT_MESSAGE_CHARS + 1)).is_err()
+        );
     }
 
     #[test]
@@ -21462,7 +22888,8 @@ mod tests {
         });
         let sessions = HashMap::from([(session.summary.id.clone(), session)]);
 
-        let matches = history_search_matches(&sessions, "  NEEDLE\n", Some(500));
+        let mut index = InMemoryHistorySearchIndex::default();
+        let matches = history_search_matches(&mut index, &sessions, "  NEEDLE\n", Some(500), None);
         assert_eq!(matches.len(), MAX_HISTORY_SEARCH_RESULTS);
         assert_eq!(matches[0]["updatedAt"], json!(59));
         assert_eq!(matches[0]["conversationTitle"], json!("Search Session"));
@@ -21478,7 +22905,7 @@ mod tests {
         let serialized = serde_json::to_string(&matches).unwrap();
         assert!(!serialized.contains("tool-secret"));
         assert!(!serialized.contains("tail-secret"));
-        assert!(history_search_matches(&sessions, " \n\t", Some(12)).is_empty());
+        assert!(history_search_matches(&mut index, &sessions, " \n\t", Some(12), None).is_empty());
         assert_eq!(
             history_search_normalize(
                 &"q".repeat(MAX_HISTORY_SEARCH_QUERY_CHARS + 20),
@@ -21794,6 +23221,7 @@ mod tests {
             .create_task(NewSubagentTask {
                 id: child_task_id.clone(),
                 session_id: run.session_id.clone(),
+                agent_id: "proxy-test-agent".to_string(),
                 parent_turn_id: run.turn_id.clone(),
                 parent_request_id: run.request_id.clone(),
                 title: "Proxy transport child".to_string(),

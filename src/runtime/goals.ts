@@ -44,6 +44,7 @@ type GoalElements = {
   progress: HTMLElement;
   runStatus: HTMLElement;
   editorStatus: HTMLElement;
+  applyEditorLayout: () => void;
 };
 
 type SessionGoalSetDto = {
@@ -174,6 +175,29 @@ function invokeGoal<T>(
   const invoke = window.__TAURI__?.core?.invoke;
   if (!invoke) return Promise.reject(new Error("本地目标存储不可用"));
   return invoke<T>(command, args);
+}
+
+/**
+ * Keep an empty goal strip out of the transcript while leaving a clear way to
+ * create the first goal for a conversation.
+ */
+function ensureGoalLaunchButton() {
+  const existing = document.getElementById(
+    "btnGoal",
+  ) as HTMLButtonElement | null;
+  if (existing) return existing;
+  const actions = document.querySelector<HTMLElement>(".reader-bar-right");
+  if (!actions) return undefined;
+  const button = document.createElement("button");
+  button.id = "btnGoal";
+  button.type = "button";
+  button.className = "btn ghost";
+  button.textContent = "设置目标";
+  button.title = "设置当前会话目标";
+  button.setAttribute("aria-controls", "goalBar");
+  button.setAttribute("aria-expanded", "false");
+  actions.prepend(button);
+  return button;
 }
 
 function createElements(bar: HTMLElement): GoalElements {
@@ -322,6 +346,17 @@ function createElements(bar: HTMLElement): GoalElements {
     editor,
   );
 
+  const applyEditorLayout = () => {
+    const narrow = window.matchMedia("(max-width: 560px)").matches;
+    editor.style.gridTemplateColumns = narrow
+      ? "minmax(0, 1fr) minmax(0, 1fr)"
+      : "minmax(0, 1fr) minmax(96px, auto) auto auto";
+    field.style.gridColumn = narrow ? "1 / -1" : "auto";
+    save.style.minWidth = narrow ? "0" : "auto";
+    cancel.style.minWidth = narrow ? "0" : "auto";
+  };
+  applyEditorLayout();
+
   return {
     bar,
     summary,
@@ -337,6 +372,7 @@ function createElements(bar: HTMLElement): GoalElements {
     progress,
     runStatus,
     editorStatus,
+    applyEditorLayout,
   };
 }
 
@@ -346,6 +382,7 @@ export function installGoals() {
   if (!bar || !runtime) return;
 
   const elements = createElements(bar);
+  const goalLaunch = ensureGoalLaunchButton();
   let activeSessionId = currentRealSessionId();
   let activeGoal: SessionGoal | undefined;
   let transientGoal: SessionGoal | undefined;
@@ -354,6 +391,7 @@ export function installGoals() {
   let saving = false;
   let goalError = "";
   let operation = 0;
+  let sessionViewInvalidated = false;
 
   const runtimeRenderKey = (state: PiRuntimeSnapshot) =>
     `${state.requestId ?? ""}:${state.sessionId ?? ""}:${state.status}`;
@@ -418,16 +456,34 @@ export function installGoals() {
     elements.bar.setAttribute("aria-busy", saving ? "true" : "false");
     if (goalError && !editorWasOpen && showBar)
       elements.runStatus.textContent = "目标不可用";
+    if (goalLaunch) {
+      const hasGoal = Boolean(goal);
+      goalLaunch.textContent = editorWasOpen
+        ? "收起目标"
+        : hasGoal
+          ? "目标"
+          : "设置目标";
+      goalLaunch.title = editorWasOpen
+        ? "收起当前会话目标编辑器"
+        : hasGoal
+          ? "查看或编辑当前会话目标"
+          : "设置当前会话目标";
+      goalLaunch.setAttribute("aria-expanded", String(editorWasOpen));
+      goalLaunch.disabled = saving || sessionViewInvalidated;
+    }
   };
 
   function closeEditor(restoreFocus: boolean) {
     elements.editor.hidden = true;
     editorWasOpen = false;
     elements.summary.setAttribute("aria-expanded", "false");
-    if (restoreFocus) elements.summary.focus();
+    render();
+    if (restoreFocus)
+      (goalForActiveSession() ? elements.summary : goalLaunch)?.focus();
   }
 
   const openEditor = () => {
+    if (sessionViewInvalidated) return;
     const goal = goalForActiveSession();
     elements.input.value = goal?.text ?? "";
     elements.progressInput.value = String(
@@ -439,6 +495,7 @@ export function installGoals() {
     elements.editor.hidden = false;
     editorWasOpen = true;
     elements.summary.setAttribute("aria-expanded", "true");
+    render();
     window.requestAnimationFrame(() => elements.input.focus());
   };
 
@@ -517,6 +574,7 @@ export function installGoals() {
   };
 
   const refreshSession = () => {
+    if (sessionViewInvalidated) return;
     const nextSessionId = currentRealSessionId();
     if (nextSessionId === activeSessionId) return;
     const promoteTransientGoal = !activeSessionId ? transientGoal : undefined;
@@ -560,6 +618,10 @@ export function installGoals() {
   };
 
   elements.summary.addEventListener("click", openEditor);
+  goalLaunch?.addEventListener("click", () => {
+    if (editorWasOpen) closeEditor(true);
+    else openEditor();
+  });
   elements.clear.addEventListener("click", () => {
     void writeGoal(activeSessionId, undefined);
   });
@@ -609,6 +671,37 @@ export function installGoals() {
   };
   window.addEventListener(SESSION_GOAL_UPDATED_EVENT, onGoalProgressUpdated);
 
+  const onSessionChanged = (event: Event) => {
+    const detail = asRecord((event as CustomEvent).detail);
+    const nextSessionId = detail?.sessionId;
+    if (!isRealSessionId(nextSessionId)) return;
+    sessionViewInvalidated = false;
+    if (nextSessionId === activeSessionId) {
+      void hydrate(nextSessionId);
+      return;
+    }
+    activeSessionId = nextSessionId;
+    activeGoal = undefined;
+    saving = false;
+    goalError = "";
+    if (editorWasOpen) closeEditor(false);
+    render();
+    void hydrate(nextSessionId);
+  };
+  const onSessionViewInvalidated = () => {
+    sessionViewInvalidated = true;
+    activeGoal = undefined;
+    saving = false;
+    goalError = "";
+    if (editorWasOpen) closeEditor(false);
+    render();
+  };
+  window.addEventListener("novavei:session-changed", onSessionChanged);
+  window.addEventListener(
+    "novavei:session-view-invalidated",
+    onSessionViewInvalidated,
+  );
+
   // NativeShell replaces session buttons after loading and handles the actual
   // switch in a document-capture listener. Window capture observes the intent
   // first; the short poll is the reliable fallback for keyboard or programmatic
@@ -637,6 +730,8 @@ export function installGoals() {
     });
   }
   const sessionPoll = window.setInterval(refreshSession, SESSION_POLL_MS);
+  const onWindowResize = () => elements.applyEditorLayout();
+  window.addEventListener("resize", onWindowResize, { passive: true });
 
   render();
   void hydrate(activeSessionId);
@@ -646,7 +741,13 @@ export function installGoals() {
       SESSION_GOAL_UPDATED_EVENT,
       onGoalProgressUpdated,
     );
+    window.removeEventListener("novavei:session-changed", onSessionChanged);
+    window.removeEventListener(
+      "novavei:session-view-invalidated",
+      onSessionViewInvalidated,
+    );
     window.removeEventListener("click", onSessionIntent, true);
+    window.removeEventListener("resize", onWindowResize);
     observer?.disconnect();
     window.clearInterval(sessionPoll);
   };

@@ -32,7 +32,8 @@ const gates = [
     steps: [
       "npm run pack:portable (or build:installer)",
       "Launch release/packages/NovaVei-<version>-portable/NovaVei-portable.exe",
-      "For a portable package, keep novavei-portable.json beside the EXE; create a portable password, restart, and unlock it",
+      "On first launch, confirm the EXE opens the main page in installed mode without a password gate",
+      "In Settings → System → Portable, explicitly select Portable, restart, then create a password and unlock it",
       "Move the complete portable folder to another drive letter and confirm its novavei/ data reopens without writing installed-mode AppData",
       "Repeat a short chat turn and one settings save",
       "Record SHA-256 of the new artifact; do not reuse historical hashes",

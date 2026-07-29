@@ -26,10 +26,6 @@ use tauri::{
     LogicalPosition, LogicalSize, Manager, WebviewUrl,
 };
 
-#[cfg(feature = "desktop")]
-const BROWSER_WEBVIEW_LABEL: &str = "browser";
-#[cfg(feature = "desktop")]
-const MAIN_WEBVIEW_WINDOW_LABEL: &str = "main";
 const MAX_BROWSER_URL_BYTES: usize = 2_048;
 const MAX_BROWSER_RESOLVED_ADDRESSES: usize = 64;
 #[cfg(feature = "desktop")]
@@ -227,8 +223,14 @@ fn public_ipv6(address: Ipv6Addr) -> bool {
 }
 
 #[cfg(feature = "desktop")]
-fn browser_state(app: &AppHandle) -> BrowserState {
-    let Some(webview) = app.get_webview(BROWSER_WEBVIEW_LABEL) else {
+fn browser_webview_label(owner_label: &str) -> String {
+    format!("browser-{owner_label}")
+}
+
+#[cfg(feature = "desktop")]
+fn browser_state(app: &AppHandle, owner_label: &str) -> BrowserState {
+    let browser_label = browser_webview_label(owner_label);
+    let Some(webview) = app.get_webview(&browser_label) else {
         return BrowserState {
             available: false,
             url: None,
@@ -243,28 +245,34 @@ fn browser_state(app: &AppHandle) -> BrowserState {
 /// Return the compact, renderer-safe state of the native browser surface.
 /// A missing child WebView is a normal unopened state rather than an error.
 #[cfg(feature = "desktop")]
-pub fn status(app: AppHandle) -> BrowserState {
-    browser_state(&app)
+pub fn status(app: AppHandle, owner_label: String) -> BrowserState {
+    browser_state(&app, &owner_label)
 }
 
 /// Create the native WebView on a worker thread. WebView2 can deadlock when a
 /// child is created synchronously from an invoke handler, so this deliberately
 /// follows Tauri's documented asynchronous creation route.
 #[cfg(feature = "desktop")]
-pub async fn open(app: AppHandle, url: String) -> Result<BrowserState, String> {
+pub async fn open(
+    app: AppHandle,
+    owner_label: String,
+    url: String,
+) -> Result<BrowserState, String> {
     let url = browser_url(&url)?;
     let app_for_worker = app.clone();
+    let owner_label_for_worker = owner_label.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
-        if let Some(webview) = app_for_worker.get_webview(BROWSER_WEBVIEW_LABEL) {
+        let browser_label = browser_webview_label(&owner_label_for_worker);
+        if let Some(webview) = app_for_worker.get_webview(&browser_label) {
             webview
                 .navigate(url)
                 .map_err(|_| "browser navigation failed".to_string())?;
             return Ok(());
         }
         let main_webview = app_for_worker
-            .get_webview(MAIN_WEBVIEW_WINDOW_LABEL)
-            .ok_or_else(|| "main NovaVei WebView is unavailable".to_string())?;
-        let browser_builder = WebviewBuilder::new(BROWSER_WEBVIEW_LABEL, WebviewUrl::External(url))
+            .get_webview(&owner_label_for_worker)
+            .ok_or_else(|| "calling NovaVei WebView is unavailable".to_string())?;
+        let browser_builder = WebviewBuilder::new(browser_label, WebviewUrl::External(url))
             .on_navigation(allowed_browser_navigation)
             // A site may not create detached windows from inside the
             // dock. It can navigate the one visible browser surface.
@@ -272,12 +280,14 @@ pub async fn open(app: AppHandle, url: String) -> Result<BrowserState, String> {
             // Downloads need a dedicated, user-mediated save flow;
             // do not let a page write files as a side effect here.
             .on_download(|_, _| false);
-        let browser_builder = if crate::storage::is_portable() {
-            browser_builder
-                .data_directory(crate::storage::application_data_dir().join("webview-browser"))
-        } else {
-            browser_builder
-        };
+        // Every top-level NovaVei window owns one browser child, so its
+        // profile must be distinct even in installed mode. Otherwise two
+        // WebView2 children can contend for one profile directory.
+        let browser_builder = browser_builder.data_directory(
+            crate::storage::application_data_dir()
+                .join("webview")
+                .join(format!("browser-{owner_label_for_worker}")),
+        );
         // `add_child` belongs to Tauri's native `Window`, not its
         // `WebviewWindow` facade. Obtain the owning native window from the
         // main webview so the browser stays a child surface rather than a
@@ -298,11 +308,15 @@ pub async fn open(app: AppHandle, url: String) -> Result<BrowserState, String> {
     })
     .await
     .map_err(|_| "browser WebView task did not complete".to_string())??;
-    Ok(browser_state(&app))
+    Ok(browser_state(&app, &owner_label))
 }
 
 #[cfg(feature = "desktop")]
-pub fn layout(app: AppHandle, viewport: BrowserViewport) -> Result<BrowserState, String> {
+pub fn layout(
+    app: AppHandle,
+    owner_label: String,
+    viewport: BrowserViewport,
+) -> Result<BrowserState, String> {
     if !viewport.x.is_finite()
         || !viewport.y.is_finite()
         || !viewport.width.is_finite()
@@ -318,8 +332,9 @@ pub fn layout(app: AppHandle, viewport: BrowserViewport) -> Result<BrowserState,
     {
         return Err("browser viewport is outside the supported window bounds".to_string());
     }
-    let Some(webview) = app.get_webview(BROWSER_WEBVIEW_LABEL) else {
-        return Ok(browser_state(&app));
+    let browser_label = browser_webview_label(&owner_label);
+    let Some(webview) = app.get_webview(&browser_label) else {
+        return Ok(browser_state(&app, &owner_label));
     };
     webview
         .set_position(LogicalPosition::new(viewport.x, viewport.y))
@@ -336,35 +351,38 @@ pub fn layout(app: AppHandle, viewport: BrowserViewport) -> Result<BrowserState,
             .hide()
             .map_err(|_| "browser WebView could not be hidden".to_string())?;
     }
-    Ok(browser_state(&app))
+    Ok(browser_state(&app, &owner_label))
 }
 
 #[cfg(feature = "desktop")]
-pub fn back(app: AppHandle) -> Result<BrowserState, String> {
+pub fn back(app: AppHandle, owner_label: String) -> Result<BrowserState, String> {
+    let browser_label = browser_webview_label(&owner_label);
     let webview = app
-        .get_webview(BROWSER_WEBVIEW_LABEL)
+        .get_webview(&browser_label)
         .ok_or_else(|| "browser has not opened a page yet".to_string())?;
     webview
         .eval("history.back()")
         .map_err(|_| "browser could not go back".to_string())?;
-    Ok(browser_state(&app))
+    Ok(browser_state(&app, &owner_label))
 }
 
 #[cfg(feature = "desktop")]
-pub fn reload(app: AppHandle) -> Result<BrowserState, String> {
+pub fn reload(app: AppHandle, owner_label: String) -> Result<BrowserState, String> {
+    let browser_label = browser_webview_label(&owner_label);
     let webview = app
-        .get_webview(BROWSER_WEBVIEW_LABEL)
+        .get_webview(&browser_label)
         .ok_or_else(|| "browser has not opened a page yet".to_string())?;
     webview
         .reload()
         .map_err(|_| "browser could not reload".to_string())?;
-    Ok(browser_state(&app))
+    Ok(browser_state(&app, &owner_label))
 }
 
 #[cfg(feature = "desktop")]
-async fn evaluate(app: AppHandle, script: String) -> Result<Value, String> {
+async fn evaluate(app: AppHandle, owner_label: String, script: String) -> Result<Value, String> {
+    let browser_label = browser_webview_label(&owner_label);
     let webview = app
-        .get_webview(BROWSER_WEBVIEW_LABEL)
+        .get_webview(&browser_label)
         .ok_or_else(|| "browser has not opened a page yet".to_string())?;
     let current_url = webview
         .url()
@@ -418,9 +436,10 @@ const INTERACTIVES_SCRIPT: &str = r#"
 "#;
 
 #[cfg(feature = "desktop")]
-pub async fn snapshot(app: AppHandle) -> Result<Value, String> {
+pub async fn snapshot(app: AppHandle, owner_label: String) -> Result<Value, String> {
     evaluate(
         app,
+        owner_label,
         format!(
             r#"(() => {{
               try {{
@@ -474,6 +493,7 @@ fn encode_expected_fingerprint(value: &str) -> Result<String, String> {
 #[cfg(feature = "desktop")]
 pub async fn click(
     app: AppHandle,
+    owner_label: String,
     reference: String,
     expected_url: String,
     expected_fingerprint: String,
@@ -485,6 +505,7 @@ pub async fn click(
     let expected_fingerprint = encode_expected_fingerprint(&expected_fingerprint)?;
     evaluate(
         app,
+        owner_label,
         format!(
             r#"(() => {{
               try {{
@@ -511,6 +532,7 @@ pub async fn click(
 #[cfg(feature = "desktop")]
 pub async fn type_text(
     app: AppHandle,
+    owner_label: String,
     reference: String,
     expected_url: String,
     expected_fingerprint: String,
@@ -528,6 +550,7 @@ pub async fn type_text(
         serde_json::to_string(&text).map_err(|_| "browser text encoding failed".to_string())?;
     evaluate(
         app,
+        owner_label,
         format!(
             r#"(() => {{
               try {{
@@ -573,7 +596,7 @@ fn browser_unavailable() -> String {
 }
 
 #[cfg(not(feature = "desktop"))]
-pub fn status(_app: AppHandle) -> BrowserState {
+pub fn status(_app: AppHandle, _owner_label: String) -> BrowserState {
     BrowserState {
         available: false,
         url: None,
@@ -581,12 +604,20 @@ pub fn status(_app: AppHandle) -> BrowserState {
 }
 
 #[cfg(not(feature = "desktop"))]
-pub async fn open(_app: AppHandle, _url: String) -> Result<BrowserState, String> {
+pub async fn open(
+    _app: AppHandle,
+    _owner_label: String,
+    _url: String,
+) -> Result<BrowserState, String> {
     Err(browser_unavailable())
 }
 
 #[cfg(not(feature = "desktop"))]
-pub fn layout(_app: AppHandle, _viewport: BrowserViewport) -> Result<BrowserState, String> {
+pub fn layout(
+    _app: AppHandle,
+    _owner_label: String,
+    _viewport: BrowserViewport,
+) -> Result<BrowserState, String> {
     Ok(BrowserState {
         available: false,
         url: None,
@@ -594,23 +625,24 @@ pub fn layout(_app: AppHandle, _viewport: BrowserViewport) -> Result<BrowserStat
 }
 
 #[cfg(not(feature = "desktop"))]
-pub fn back(_app: AppHandle) -> Result<BrowserState, String> {
+pub fn back(_app: AppHandle, _owner_label: String) -> Result<BrowserState, String> {
     Err(browser_unavailable())
 }
 
 #[cfg(not(feature = "desktop"))]
-pub fn reload(_app: AppHandle) -> Result<BrowserState, String> {
+pub fn reload(_app: AppHandle, _owner_label: String) -> Result<BrowserState, String> {
     Err(browser_unavailable())
 }
 
 #[cfg(not(feature = "desktop"))]
-pub async fn snapshot(_app: AppHandle) -> Result<Value, String> {
+pub async fn snapshot(_app: AppHandle, _owner_label: String) -> Result<Value, String> {
     Err(browser_unavailable())
 }
 
 #[cfg(not(feature = "desktop"))]
 pub async fn click(
     _app: AppHandle,
+    _owner_label: String,
     _reference: String,
     _expected_url: String,
     _expected_fingerprint: String,
@@ -621,6 +653,7 @@ pub async fn click(
 #[cfg(not(feature = "desktop"))]
 pub async fn type_text(
     _app: AppHandle,
+    _owner_label: String,
     _reference: String,
     _expected_url: String,
     _expected_fingerprint: String,
