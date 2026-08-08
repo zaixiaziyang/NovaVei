@@ -30,11 +30,11 @@
     "tauri": "tauri"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.5",
+    "@biomejs/biome": "2.5.6",
     "@tauri-apps/cli": "2.11.4",
-    "@types/node": "24.13.3",
+    "@types/node": "26.1.2",
     "typescript": "7.0.2",
-    "vite": "8.1.5",
+    "vite": "8.2.0",
     "vitest": "4.1.10"
   },
   "dependencies": {
