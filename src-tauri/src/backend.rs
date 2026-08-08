@@ -216,6 +216,8 @@ pub struct SessionSummary {
     pub cwd: String,
     pub updated_at: i64,
     #[serde(default)]
+    pub message_count: i64,
+    #[serde(default)]
     pub is_pinned: bool,
     #[serde(default)]
     pub is_archived: bool,
@@ -617,7 +619,6 @@ struct ToolApprovalGrant {
 enum PermissionMode {
     Readonly,
     Ask,
-    AutoApprove,
     Full,
 }
 
@@ -625,7 +626,6 @@ impl PermissionMode {
     fn parse(value: Option<&str>) -> Self {
         match value.unwrap_or("ask").trim().to_ascii_lowercase().as_str() {
             "readonly" | "read-only" | "只读" => Self::Readonly,
-            "auto" | "auto-approve" | "替我审批" => Self::AutoApprove,
             "full" | "完全访问权限" => Self::Full,
             _ => Self::Ask,
         }
@@ -635,7 +635,6 @@ impl PermissionMode {
         match self {
             Self::Readonly => "readonly",
             Self::Ask => "ask",
-            Self::AutoApprove => "auto-approve",
             Self::Full => "full",
         }
     }
@@ -689,19 +688,6 @@ fn permission_requirement(mode: PermissionMode, action: ToolAction) -> Permissio
         PermissionMode::Readonly => PermissionRequirement::Deny,
         PermissionMode::Full => PermissionRequirement::Allow,
         PermissionMode::Ask => PermissionRequirement::Approval,
-        // "Auto approve" deliberately remains bounded: it covers the same
-        // medium-risk mutations the renderer permits without a prompt, while
-        // deletes, shell commands, MCP, delegation, and worktrees still
-        // require the explicit, one-use approval card.
-        PermissionMode::AutoApprove
-            if matches!(
-                action,
-                ToolAction::Write | ToolAction::Edit | ToolAction::MemoryWrite
-            ) =>
-        {
-            PermissionRequirement::Allow
-        }
-        PermissionMode::AutoApprove => PermissionRequirement::Approval,
     }
 }
 
@@ -1016,8 +1002,17 @@ impl AppState {
         let data_file = data_dir.join("chat-history.sqlite3");
         let history = HistoryStore::new(data_file.clone());
         let subagent_tasks = SubagentStore::new(data_file.clone());
+        // Startup password protection is a native boundary, not only a
+        // renderer overlay. While locked, initialize database handles but do
+        // not project or mutate durable user state until the password command
+        // succeeds and hydrates the in-memory view.
+        let startup_unlock_required = crate::secret_store::app_security_needs_unlock();
         if let Err(error) = history.initialize() {
             storage_errors.push(format!("initialize history store: {error}"));
+        } else if startup_unlock_required {
+            if let Err(error) = subagent_tasks.initialize() {
+                storage_errors.push(format!("initialize subagent task store: {error}"));
+            }
         } else if let Err(error) = history.mark_interrupted_turns(now_ms()) {
             // Do not continue into the subagent store after an interrupted-turn
             // recovery failure. Both stores share the persistence boundary, and
@@ -1044,14 +1039,12 @@ impl AppState {
         };
         let legacy_loaded = legacy_persisted.is_some();
         let persisted = legacy_persisted.unwrap_or_default();
-        // A portable database can contain password-encrypted settings and
+        // A locked startup can contain password-protected settings and
         // transcripts. Do not even project its session metadata into memory
-        // until the user has supplied the portable password; otherwise a
-        // startup path could create a replacement default session before the
-        // encrypted corpus is available.
-        let portable_unlock_required = crate::secret_store::portable_storage_needs_unlock();
-
-        let stored_sessions = if portable_unlock_required {
+        // until the user has supplied the password; otherwise a startup path
+        // could create a replacement default session before the protected
+        // corpus is available.
+        let stored_sessions = if startup_unlock_required {
             Vec::new()
         } else {
             match history.load_sessions() {
@@ -1062,7 +1055,7 @@ impl AppState {
                 }
             }
         };
-        let stored_session_run_summaries = if portable_unlock_required {
+        let stored_session_run_summaries = if startup_unlock_required {
             HashMap::new()
         } else {
             match history.load_session_run_summaries() {
@@ -1077,7 +1070,7 @@ impl AppState {
         // record opens a SQLite connection for every historical session. Load
         // the complete count projection once so long local histories do not
         // make first paint scale with the number of conversations.
-        let stored_message_counts = if portable_unlock_required {
+        let stored_message_counts = if startup_unlock_required {
             HashMap::new()
         } else {
             match history.load_message_counts() {
@@ -1088,7 +1081,7 @@ impl AppState {
                 }
             }
         };
-        let stored_goals = if portable_unlock_required {
+        let stored_goals = if startup_unlock_required {
             HashMap::new()
         } else {
             match history.load_session_goals() {
@@ -1099,7 +1092,7 @@ impl AppState {
                 }
             }
         };
-        let stored_settings = if portable_unlock_required {
+        let stored_settings = if startup_unlock_required {
             HashMap::new()
         } else {
             match history.load_settings() {
@@ -1129,6 +1122,7 @@ impl AppState {
                         title: record.title,
                         cwd: record.cwd,
                         updated_at: record.updated_at,
+                        message_count,
                         is_pinned: false,
                         is_archived: false,
                         last_run_status: last_run.map(|summary| summary.status.clone()),
@@ -1152,10 +1146,10 @@ impl AppState {
                 },
             );
         }
-        if !portable_unlock_required {
+        if !startup_unlock_required {
             merge_legacy_sessions(&mut sessions, persisted.sessions);
         }
-        let mut raw_settings = if portable_unlock_required {
+        let mut raw_settings = if startup_unlock_required {
             HashMap::new()
         } else {
             persisted.settings
@@ -1163,7 +1157,7 @@ impl AppState {
         // SQLite wins for scopes already migrated, while a legacy snapshot
         // can still supply scopes that were never written to SQLite.
         raw_settings.extend(stored_settings);
-        let (mut settings, settings_ready) = if portable_unlock_required {
+        let (mut settings, settings_ready) = if startup_unlock_required {
             (HashMap::new(), false)
         } else {
             match unprotect_settings(&raw_settings) {
@@ -1194,7 +1188,7 @@ impl AppState {
             false
         };
         let mut created_startup_session_id = None;
-        if sessions.is_empty() && !portable_unlock_required {
+        if sessions.is_empty() && !startup_unlock_required {
             let record = new_session_record("本地工具执行与权限".to_string(), current_workdir());
             created_startup_session_id = Some(record.summary.id.clone());
             sessions.insert(record.summary.id.clone(), record);
@@ -1249,7 +1243,7 @@ impl AppState {
         // so write only a newly-created starter session or reconciled settings.
         // In particular, do not hydrate and replace every transcript merely
         // because the process was restarted.
-        if !portable_unlock_required
+        if !startup_unlock_required
             && startup_persistence_decision(state.storage_recovery.is_ready(), settings_ready)
                 == StartupPersistenceDecision::Persist
         {
@@ -1539,6 +1533,194 @@ impl AppState {
         self.hydrate_unlocked_portable_storage()
     }
 
+    pub fn auto_unlock_portable_storage(
+        &self,
+    ) -> Result<crate::secret_store::PortableStorageStatus, String> {
+        let _persist_guard = self.persist_lock.lock();
+        if !self.storage_recovery.is_ready() {
+            return Err(
+                "portable storage recovery is required before it can be unlocked".to_string(),
+            );
+        }
+        crate::secret_store::auto_unlock_portable_storage()?;
+        self.hydrate_unlocked_portable_storage()
+    }
+
+    pub fn unlock_installed_app_storage(
+        &self,
+        password: &str,
+    ) -> Result<crate::secret_store::AppSecurityStatus, String> {
+        let _persist_guard = self.persist_lock.lock();
+        crate::secret_store::unlock_app_password(password)?;
+        if let Err(error) = self.hydrate_unlocked_installed_storage() {
+            crate::secret_store::clear_app_password_unlock();
+            return Err(error);
+        }
+        crate::secret_store::app_security_status()
+    }
+
+    pub fn set_installed_app_password(
+        &self,
+        current_password: Option<&str>,
+        new_password: &str,
+    ) -> Result<crate::secret_store::AppSecurityStatus, String> {
+        let _persist_guard = self.persist_lock.lock();
+        crate::secret_store::set_installed_app_password(current_password, new_password)?;
+        if let Err(error) = self.hydrate_unlocked_installed_storage() {
+            crate::secret_store::clear_app_password_unlock();
+            return Err(error);
+        }
+        crate::secret_store::app_security_status()
+    }
+
+    pub fn disable_installed_app_password(
+        &self,
+        current_password: Option<&str>,
+    ) -> Result<crate::secret_store::AppSecurityStatus, String> {
+        let _persist_guard = self.persist_lock.lock();
+        crate::secret_store::disable_installed_app_password(current_password)?;
+        if let Err(error) = self.hydrate_unlocked_installed_storage() {
+            crate::secret_store::clear_app_password_unlock();
+            return Err(error);
+        }
+        crate::secret_store::app_security_status()
+    }
+
+    pub fn set_portable_password_requirement(
+        &self,
+        required: bool,
+        current_password: Option<&str>,
+        new_password: Option<&str>,
+        recovery_setup: Option<crate::secret_store::PortableRecoverySetup>,
+    ) -> Result<crate::secret_store::AppSecurityStatus, String> {
+        let _persist_guard = self.persist_lock.lock();
+        self.require_durable_mutation()?;
+        crate::secret_store::set_portable_password_requirement(
+            required,
+            current_password,
+            new_password,
+            recovery_setup,
+        )?;
+        crate::secret_store::app_security_status()
+    }
+
+    /// Hydrate installed-mode user state after the startup password has been
+    /// verified. The caller holds `persist_lock`, matching the portable
+    /// unlock path so a renderer cannot observe a partially restored memory
+    /// projection.
+    fn hydrate_unlocked_installed_storage(&self) -> Result<(), String> {
+        if !self.settings_locked.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if !self.storage_recovery.is_ready() {
+            return Err(
+                "NovaVei storage recovery is required before state can be loaded".to_string(),
+            );
+        }
+
+        let previous_sessions = self.sessions.lock().clone();
+        let previous_settings = self.settings.lock().clone();
+        let previous_approved_workdirs = self.approved_workdirs.lock().clone();
+        let previous_settings_locked = self.settings_locked.load(Ordering::Acquire);
+
+        let hydrated = (|| -> Result<(), String> {
+            self.history
+                .mark_interrupted_turns(now_ms())
+                .map_err(|_| "mark interrupted turns failed".to_string())?;
+            self.subagent_tasks
+                .mark_interrupted_tasks(now_ms())
+                .map_err(|_| "mark interrupted subagent tasks failed".to_string())?;
+
+            let legacy_file = diagnostics::application_data_dir().join("state.json");
+            let legacy_persisted = match fs::read_to_string(&legacy_file) {
+                Ok(text) => Some(
+                    serde_json::from_str::<PersistedState>(&text)
+                        .map_err(|_| "parse legacy state failed".to_string())?,
+                ),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(_) => return Err("read legacy state failed".to_string()),
+            };
+            let legacy_loaded = legacy_persisted.is_some();
+            let persisted = legacy_persisted.unwrap_or_default();
+
+            let mut sessions = load_session_projection(&self.history)?;
+            merge_legacy_sessions(&mut sessions, persisted.sessions);
+
+            let mut raw_settings = persisted.settings;
+            let stored_settings = self
+                .history
+                .load_settings()
+                .map_err(|_| "read settings failed".to_string())?;
+            raw_settings.extend(stored_settings);
+            let settings = unprotect_settings(&raw_settings)
+                .map_err(|_| "unlock installed settings failed".to_string())?;
+
+            if sessions.is_empty() {
+                let record =
+                    new_session_record("本地工具执行与权限".to_string(), current_workdir());
+                self.history
+                    .upsert_session_metadata(&stored_session_from_record(&record))
+                    .map_err(|_| "initialize conversation store failed".to_string())?;
+                sessions.insert(record.summary.id.clone(), record);
+            }
+
+            let mut approved_workdirs = approved_project_workdirs(&settings);
+            if let Ok(current) = canonical_workdir(&current_workdir()) {
+                approved_workdirs.insert(current);
+            }
+            *self.sessions.lock() = sessions;
+            *self.settings.lock() = settings;
+            *self.approved_workdirs.lock() = approved_workdirs;
+            self.settings_locked.store(false, Ordering::Release);
+
+            if legacy_loaded {
+                self.persist_locked()?;
+                if self.history.secure_compact_once().is_ok() {
+                    retire_legacy_state(&legacy_file);
+                } else {
+                    diagnostics::record_event(
+                        "storage",
+                        "secure_compaction_failed",
+                        "failure",
+                        None,
+                    );
+                }
+            }
+            match self.history.encrypt_legacy_transcripts_once() {
+                Ok(true) => {
+                    if self.history.secure_compact_after_protection().is_err() {
+                        diagnostics::record_event(
+                            "storage",
+                            "transcript_encryption_compaction_failed",
+                            "failure",
+                            None,
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    diagnostics::record_event(
+                        "storage",
+                        "transcript_encryption_migration_failed",
+                        "failure",
+                        None,
+                    );
+                }
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = hydrated {
+            *self.sessions.lock() = previous_sessions;
+            *self.settings.lock() = previous_settings;
+            *self.approved_workdirs.lock() = previous_approved_workdirs;
+            self.settings_locked
+                .store(previous_settings_locked, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Hydration only publishes these projections at its end, but retain the
     /// pre-unlock state as a final fail-closed guard if publishing the key
     /// readiness flag itself fails. The caller holds `persist_lock` and has
@@ -1623,16 +1805,16 @@ fn load_session_projection(
 ) -> Result<HashMap<String, SessionRecord>, String> {
     let stored_sessions = history
         .load_sessions()
-        .map_err(|_| "read portable sessions failed".to_string())?;
+        .map_err(|_| "read sessions failed".to_string())?;
     let run_summaries = history
         .load_session_run_summaries()
-        .map_err(|_| "read portable session run summaries failed".to_string())?;
+        .map_err(|_| "read session run summaries failed".to_string())?;
     let goals = history
         .load_session_goals()
-        .map_err(|_| "read portable session goals failed".to_string())?;
+        .map_err(|_| "read session goals failed".to_string())?;
     let message_counts = history
         .load_message_counts()
-        .map_err(|_| "read portable session message counts failed".to_string())?;
+        .map_err(|_| "read session message counts failed".to_string())?;
     let mut sessions = HashMap::new();
     for record in stored_sessions {
         let message_count = message_counts.get(&record.id).copied().unwrap_or(0);
@@ -1647,6 +1829,7 @@ fn load_session_projection(
                     title: record.title,
                     cwd: record.cwd,
                     updated_at: record.updated_at,
+                    message_count,
                     is_pinned: false,
                     is_archived: false,
                     last_run_status: last_run.map(|summary| summary.status.clone()),
@@ -2063,6 +2246,7 @@ fn new_session_record(title: String, cwd: String) -> SessionRecord {
             title,
             cwd,
             updated_at: now_ms(),
+            message_count: 0,
             is_pinned: false,
             is_archived: false,
             last_run_status: None,
@@ -2371,6 +2555,81 @@ pub fn portable_storage_status() -> crate::secret_store::PortableStorageStatus {
     crate::secret_store::portable_storage_status()
 }
 
+#[tauri::command]
+pub fn app_security_status() -> Result<crate::secret_store::AppSecurityStatus, String> {
+    crate::secret_store::app_security_status()
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn app_security_unlock(
+    state: State<'_, Arc<AppState>>,
+    password: Option<String>,
+) -> Result<crate::secret_store::AppSecurityStatus, String> {
+    let state = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || {
+        if crate::storage::is_portable() {
+            let portable = crate::secret_store::portable_storage_status();
+            if portable.password_required {
+                let password = password
+                    .as_deref()
+                    .ok_or_else(|| "portable storage password is required".to_string())?;
+                state.unlock_portable_storage(password, None)?;
+            } else {
+                state.auto_unlock_portable_storage()?;
+            }
+            crate::secret_store::app_security_status()
+        } else {
+            let password = password
+                .as_deref()
+                .ok_or_else(|| "application password is required".to_string())?;
+            state.unlock_installed_app_storage(password)
+        }
+    })
+    .await
+    .map_err(|_| "application security unlock did not complete".to_string())?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn app_security_set_password(
+    state: State<'_, Arc<AppState>>,
+    current_password: Option<String>,
+    new_password: String,
+    recovery_setup: Option<crate::secret_store::PortableRecoverySetup>,
+) -> Result<crate::secret_store::AppSecurityStatus, String> {
+    let state = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || {
+        if crate::storage::is_portable() {
+            state.set_portable_password_requirement(
+                true,
+                current_password.as_deref(),
+                Some(new_password.as_str()),
+                recovery_setup,
+            )
+        } else {
+            state.set_installed_app_password(current_password.as_deref(), &new_password)
+        }
+    })
+    .await
+    .map_err(|_| "application security update did not complete".to_string())?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn app_security_disable_password(
+    state: State<'_, Arc<AppState>>,
+    current_password: Option<String>,
+) -> Result<crate::secret_store::AppSecurityStatus, String> {
+    let state = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || {
+        if crate::storage::is_portable() {
+            state.set_portable_password_requirement(false, current_password.as_deref(), None, None)
+        } else {
+            state.disable_installed_app_password(current_password.as_deref())
+        }
+    })
+    .await
+    .map_err(|_| "application security update did not complete".to_string())?
+}
+
 /// Unlock or initialize the password-protected portable data root, then
 /// hydrate the durable state that was intentionally withheld during startup.
 /// Argon2 derivation, legacy-row re-encryption, and the follow-up VACUUM can
@@ -2634,11 +2893,7 @@ pub fn sessions_list(state: State<'_, Arc<AppState>>) -> Vec<SessionSummary> {
         .sessions
         .lock()
         .values()
-        .map(|record| SessionSummary {
-            is_pinned: record.pinned_at.is_some(),
-            is_archived: record.archived_at.is_some(),
-            ..record.summary.clone()
-        })
+        .map(session_summary_value)
         .collect::<Vec<_>>();
     list.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
     list
@@ -2675,7 +2930,7 @@ pub fn sessions_create(
         .sessions
         .lock()
         .get(&id)
-        .map(|record| record.summary.clone())
+        .map(session_summary_value)
         .ok_or_else(|| "session creation failed".to_string())
 }
 
@@ -2792,25 +3047,6 @@ pub fn sessions_get(
         total_count,
         has_more_before,
     })
-}
-
-/// True when the session has no user-authored messages (reusable empty draft).
-#[tauri::command(rename_all = "camelCase")]
-pub fn sessions_is_blank(
-    state: State<'_, Arc<AppState>>,
-    session_id: String,
-) -> Result<bool, String> {
-    let session_id = session_id.trim().to_string();
-    if session_id.is_empty() {
-        return Err("session not found".to_string());
-    }
-    {
-        let sessions = state.sessions.lock();
-        if !sessions.contains_key(&session_id) {
-            return Err("session not found".to_string());
-        }
-    }
-    Ok(!state.history.has_user_message(&session_id)?)
 }
 
 /// Read the compact, local-only goal record for one durable session. This
@@ -6190,6 +6426,10 @@ fn default_setting(scope: &str, default_workdir: &str) -> Value {
             "workdirPolicy": WORKDIR_POLICY_PROJECT,
             "defaultPermissionTier": "ask",
             "globalSystemPrompt": "",
+            "security": {
+                "requirePlanForMutableTools": true,
+                "allowSubagentGlobalRead": false
+            },
         }),
         "projects" => json!({
             "version": PROJECT_SETTINGS_VERSION,
@@ -6247,6 +6487,69 @@ fn require_project_root_workdir_policy(state: &AppState) -> Result<(), String> {
     validate_system_workdir_policy(settings.get("system"))
 }
 
+fn normalize_system_security_settings(
+    security: Option<Value>,
+    legacy_require_plan: Option<Value>,
+    legacy_global_read: Option<Value>,
+) -> Result<Value, String> {
+    let mut require_plan = true;
+    let mut allow_global_read = false;
+    if let Some(security) = security {
+        let object = security
+            .as_object()
+            .ok_or_else(|| "system security settings must be an object".to_string())?;
+        if object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "requirePlanForMutableTools"
+                    | "require_plan_for_mutable_tools"
+                    | "allowSubagentGlobalRead"
+                    | "allow_subagent_global_read"
+            )
+        }) {
+            return Err("system security settings contain an unsupported field".to_string());
+        }
+        let camel = object.get("requirePlanForMutableTools");
+        let snake = object.get("require_plan_for_mutable_tools");
+        if let (Some(camel), Some(snake)) = (camel, snake) {
+            if camel != snake {
+                return Err("system security plan keys disagree".to_string());
+            }
+        }
+        if let Some(value) = camel.or(snake) {
+            require_plan = value
+                .as_bool()
+                .ok_or_else(|| "system security plan setting must be boolean".to_string())?;
+        }
+        let camel = object.get("allowSubagentGlobalRead");
+        let snake = object.get("allow_subagent_global_read");
+        if let (Some(camel), Some(snake)) = (camel, snake) {
+            if camel != snake {
+                return Err("system security global-read keys disagree".to_string());
+            }
+        }
+        if let Some(value) = camel.or(snake) {
+            allow_global_read = value
+                .as_bool()
+                .ok_or_else(|| "system security global-read setting must be boolean".to_string())?;
+        }
+    }
+    if let Some(value) = legacy_require_plan {
+        require_plan = value
+            .as_bool()
+            .ok_or_else(|| "system security plan setting must be boolean".to_string())?;
+    }
+    if let Some(value) = legacy_global_read {
+        allow_global_read = value
+            .as_bool()
+            .ok_or_else(|| "system security global-read setting must be boolean".to_string())?;
+    }
+    Ok(json!({
+        "requirePlanForMutableTools": require_plan,
+        "allowSubagentGlobalRead": allow_global_read,
+    }))
+}
+
 /// Canonicalize the small system-policy DTO before persisting it.  This is
 /// deliberately separate from capability issuance so a renderer cannot save
 /// an unsupported setting now and attempt to reinterpret it later.
@@ -6291,10 +6594,14 @@ fn normalize_system_settings_payload(mut payload: Value) -> Result<Value, String
         }
     }
     let permission = camel_permission.or(snake_permission);
+    // Legacy "auto-approve" values fall back to "ask": that tier was removed
+    // from the product surface and must never be reintroduced by settings
+    // normalization.
     let permission = match permission.as_ref().and_then(Value::as_str).map(str::trim) {
-        None | Some("") | Some("ask") => "ask",
+        None | Some("") | Some("ask") | Some("auto-approve") | Some("auto") | Some("auto_approve") => {
+            "ask"
+        }
         Some("readonly") | Some("read_only") => "readonly",
-        Some("auto-approve") | Some("auto") => "auto-approve",
         Some("full") => "full",
         Some(_) => return Err("default permission tier is invalid".to_string()),
     };
@@ -6302,6 +6609,16 @@ fn normalize_system_settings_payload(mut payload: Value) -> Result<Value, String
         "defaultPermissionTier".to_string(),
         Value::String(permission.to_string()),
     );
+    let security = normalize_system_security_settings(
+        object.remove("security"),
+        object
+            .remove("requirePlanForMutableTools")
+            .or_else(|| object.remove("require_plan_for_mutable_tools")),
+        object
+            .remove("allowSubagentGlobalRead")
+            .or_else(|| object.remove("allow_subagent_global_read")),
+    )?;
+    object.insert("security".to_string(), security);
     let camel_launch_behavior = object.remove("secondaryLaunchBehavior");
     let snake_launch_behavior = object.remove("secondary_launch_behavior");
     if let (Some(camel), Some(snake)) = (&camel_launch_behavior, &snake_launch_behavior) {
@@ -6375,7 +6692,6 @@ fn normalize_project_permission_tier(value: &str) -> Option<&'static str> {
     match value.trim().to_ascii_lowercase().as_str() {
         "readonly" | "read_only" | "read-only" => Some("readonly"),
         "ask" => Some("ask"),
-        "auto" | "auto-approve" | "auto_approve" => Some("auto-approve"),
         _ => None,
     }
 }
@@ -7056,6 +7372,190 @@ fn resolved_proxy_provider_id(
         .map(str::trim)
         .filter(|provider_id| !provider_id.is_empty())
         .map(str::to_string)
+}
+
+/// Resolve the provider/model used for one-click translation from the same
+/// native selection rules as the interactive runtime, never trusting a
+/// renderer-supplied model string on its own. Prefer the active session's
+/// durable model selection when a session id is supplied.
+fn resolve_translation_context(
+    state: &AppState,
+    session_id: Option<&str>,
+    requested_model: Option<&str>,
+) -> Result<(String, String), String> {
+    let session_selection = session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|id| {
+            let sessions = state.sessions.lock();
+            let record = sessions.get(id)?;
+            if let Some(raw) = record.selected_model_json.as_deref() {
+                if let Ok(selection) = parse_session_model_selection(raw) {
+                    return Some((selection.provider_id, selection.model_id));
+                }
+            }
+            let provider_id = record.provider_id.trim();
+            let model = record.model.trim();
+            if !provider_id.is_empty()
+                && provider_id != "embedded"
+                && !model.is_empty()
+                && model != "embedded"
+            {
+                return Some((provider_id.to_string(), model.to_string()));
+            }
+            None
+        });
+    let (requested_provider, requested_model) = match session_selection {
+        Some((provider_id, model_id)) => (Some(provider_id), Some(model_id)),
+        None => (
+            None,
+            requested_model
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        ),
+    };
+    let config = provider_runtime_config_for(
+        state,
+        requested_provider.as_deref(),
+        requested_model.as_deref(),
+    )
+    .map_err(|_| "no provider is configured for translation".to_string())?;
+    let provider_id = config
+        .pointer("/provider/id")
+        .or_else(|| config.pointer("/provider/providerId"))
+        .or_else(|| config.pointer("/provider/provider_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "translation provider is unavailable".to_string())?
+        .to_string();
+    let model = config
+        .pointer("/provider/defaultModel")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "translation model is unavailable".to_string())?
+        .to_string();
+    Ok((provider_id, model))
+}
+
+/// Read the raw (unredacted) provider record by id. Credentials never cross
+/// the IPC boundary; they are consumed natively inside the same call.
+fn raw_translation_provider(
+    settings: &HashMap<String, Value>,
+    provider_id: &str,
+) -> Result<Value, String> {
+    let providers = settings
+        .get("providers")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let candidates: Vec<Value> = match providers {
+        Value::Array(items) => items,
+        Value::Object(object) => object
+            .into_iter()
+            .filter_map(|(id, value)| match value {
+                Value::Object(mut record) => {
+                    record.entry("id".to_string()).or_insert(Value::String(id));
+                    Some(Value::Object(record))
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    candidates
+        .into_iter()
+        .find(|record| {
+            record
+                .get("id")
+                .or_else(|| record.get("providerId"))
+                .or_else(|| record.get("provider_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some_and(|id| id == provider_id)
+        })
+        .ok_or_else(|| "translation provider is unavailable".to_string())
+}
+
+fn translation_system_instruction(source_lang: &str, target_lang: &str) -> String {
+    let target = target_lang.trim();
+    if source_lang.eq_ignore_ascii_case("auto") || source_lang.trim().is_empty() {
+        format!(
+            "You are a professional translator. Detect the source language and translate \
+             the user-provided text into {target}. Return only the translation without \
+             explanations, quotes, or code fences. Preserve line breaks and technical terms."
+        )
+    } else {
+        format!(
+            "You are a professional translator. Translate the user-provided text from {source} \
+             into {target}. Return only the translation without explanations, quotes, or code \
+             fences. Preserve line breaks and technical terms.",
+            source = source_lang.trim()
+        )
+    }
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn get_active_translation_model(
+    state: State<'_, Arc<AppState>>,
+    session_id: Option<String>,
+) -> Result<String, String> {
+    Ok(resolve_translation_context(
+        &state,
+        session_id.as_deref(),
+        None,
+    )?
+    .1)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn translate_text(
+    state: State<'_, Arc<AppState>>,
+    text: String,
+    target_lang: Option<String>,
+    source_lang: Option<String>,
+    model: Option<String>,
+    session_id: Option<String>,
+) -> Result<String, String> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("translation text cannot be empty".to_string());
+    }
+    if text.chars().count() > crate::local_services::MAX_TRANSLATION_INPUT_CHARS {
+        return Err("translation text is too long".to_string());
+    }
+    let target_lang = target_lang
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "zh".to_string());
+    let source_lang = source_lang
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "auto".to_string());
+    if target_lang.chars().count() > 32 || source_lang.chars().count() > 32 {
+        return Err("translation language code is invalid".to_string());
+    }
+    let requested_model = model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let (provider_id, resolved_model) = resolve_translation_context(
+        &state,
+        session_id.as_deref(),
+        requested_model.as_deref(),
+    )?;
+    let provider = {
+        let settings = state.settings.lock();
+        let provider = raw_translation_provider(&settings, &provider_id)?;
+        provider
+            .as_object()
+            .cloned()
+            .ok_or_else(|| "translation provider is unavailable".to_string())?
+    };
+    let system = translation_system_instruction(&source_lang, &target_lang);
+    crate::local_services::translate_provider_text(&provider, &resolved_model, &system, &text)
+        .await
 }
 
 /// Return loopback transport metadata only to the live, capability-bound Pi
@@ -11446,6 +11946,7 @@ pub struct WorkspaceProjectRegistrationResponse {
 
 fn session_summary_value(record: &SessionRecord) -> SessionSummary {
     SessionSummary {
+        message_count: record.message_count,
         is_pinned: record.pinned_at.is_some(),
         is_archived: record.archived_at.is_some(),
         ..record.summary.clone()
@@ -13282,11 +13783,17 @@ fn decode_composer_pasted_image_ipc_payload(
     if body_start > payload.len() {
         return Err("pasted image IPC payload is truncated".to_string());
     }
+    let body = &payload[body_start..];
+    if body.is_empty() || body.len() as u64 > MAX_COMPOSER_MEDIA_BYTES {
+        return Err(format!(
+            "pasted image IPC body must contain 1 to {MAX_COMPOSER_MEDIA_BYTES} bytes"
+        ));
+    }
     let header =
         serde_json::from_slice(&payload[COMPOSER_PASTED_IMAGE_IPC_PREFIX_BYTES..body_start])
             .map_err(|_| "pasted image IPC header is invalid".to_string())?;
     validate_composer_pasted_image_ipc_header(&header)?;
-    Ok((header, &payload[body_start..]))
+    Ok((header, body))
 }
 
 /// Stage an image copied from the composer clipboard. The renderer sends a
@@ -13937,7 +14444,7 @@ fn sensitive_read_permission_requirement(mode: PermissionMode) -> PermissionRequ
     match mode {
         PermissionMode::Readonly => PermissionRequirement::Deny,
         PermissionMode::Full => PermissionRequirement::Allow,
-        PermissionMode::Ask | PermissionMode::AutoApprove => PermissionRequirement::Approval,
+        PermissionMode::Ask => PermissionRequirement::Approval,
     }
 }
 
@@ -17264,7 +17771,7 @@ fn session_metadata_search_records(
     sessions
         .values()
         .map(|record| SessionMetadataSearchRecord {
-            summary: record.summary.clone(),
+            summary: session_summary_value(record),
             model: record.model.clone(),
             provider_id: record.provider_id.clone(),
         })
@@ -17582,6 +18089,7 @@ fn update_history_payload(
             title: title.clone(),
             cwd: cwd.clone(),
             updated_at,
+            message_count: 0,
             is_pinned: false,
             is_archived: false,
             last_run_status: None,
@@ -17615,7 +18123,7 @@ fn update_history_payload(
     if selected_model_json.is_some() {
         record.selected_model_json = selected_model_json;
     }
-    Ok((record.summary.clone(), previous))
+    Ok((session_summary_value(record), previous))
 }
 
 #[tauri::command]
@@ -17684,6 +18192,7 @@ fn mutate_segmented_history(
             title: input.conversation.title.trim().to_string(),
             cwd: cwd.clone(),
             updated_at: header.updated_at,
+            message_count: 0,
             is_pinned: false,
             is_archived: false,
             last_run_status: None,
@@ -18189,6 +18698,68 @@ fn branch_session(
 }
 
 #[tauri::command]
+pub fn chat_history_truncate(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    message_id: String,
+) -> Result<ChatHistorySummary, String> {
+    state.require_persistence_ready()?;
+    let id = id.trim().to_string();
+    let message_id = message_id.trim().to_string();
+    if id.is_empty() || message_id.is_empty() {
+        return Err("history conversation and message ids are required".to_string());
+    }
+    let _persist_guard = state.persist_lock.lock();
+    if state
+        .active_runs
+        .lock()
+        .values()
+        .any(|run| run.session_id == id)
+    {
+        return Err("cannot truncate a session while its agent run is active".to_string());
+    }
+    let removed = state
+        .sessions
+        .lock()
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| "history conversation not found".to_string())?;
+    // Durable truncation runs inside the history store's own transaction.
+    state.history.truncate_session(&id, &message_id)?;
+    // Keep only the messages strictly before the anchor (created_at is the
+    // sort key, id the tie-breaker), matching the durable delete exactly.
+    let mut session = removed;
+    let anchor = session
+        .messages
+        .iter()
+        .find(|message| message.id == message_id)
+        .map(|message| (message.created_at, message.id.as_str()));
+    session.messages = match anchor {
+        Some((anchor_created_at, anchor_id)) => session
+            .messages
+            .iter()
+            .filter(|message| {
+                message.created_at < anchor_created_at
+                    || (message.created_at == anchor_created_at
+                        && message.id.as_str() < anchor_id)
+            })
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    };
+    session.messages_complete = false;
+    session.messages_loaded = true;
+    state.sessions.lock().insert(id.clone(), session);
+    let record = state
+        .sessions
+        .lock()
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| "history conversation not found".to_string())?;
+    Ok(history_summary(&record))
+}
+
+#[tauri::command]
 pub fn chat_history_delete(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
     state.require_persistence_ready()?;
     let id = id.trim().to_string();
@@ -18527,6 +19098,11 @@ mod tests {
 
         assert!(decode_composer_pasted_image_ipc_payload(
             &composer_pasted_image_ipc_payload_for_test(&[0xff], &body),
+        )
+        .is_err());
+
+        assert!(decode_composer_pasted_image_ipc_payload(
+            &composer_pasted_image_ipc_payload_for_test(header, &[]),
         )
         .is_err());
 
@@ -19053,6 +19629,18 @@ mod tests {
             .next()
             .cloned()
             .expect("test state has a session");
+        {
+            let mut sessions = state.sessions.lock();
+            let record = sessions
+                .get_mut(&session_id)
+                .expect("test state has the selected session");
+            record.message_count = 3;
+        }
+        let count_summary = sessions_list(state.clone())
+            .into_iter()
+            .find(|summary| summary.id == session_id)
+            .expect("session with updated count should be listed");
+        assert_eq!(count_summary.message_count, 3);
 
         chat_history_set_pinned(state.clone(), session_id.clone(), true)
             .expect("pin mutation should succeed");
@@ -19570,7 +20158,6 @@ mod tests {
         for mode in [
             PermissionMode::Readonly,
             PermissionMode::Ask,
-            PermissionMode::AutoApprove,
             PermissionMode::Full,
         ] {
             assert_eq!(permission_requirement(mode, ToolAction::Read), Allow);
@@ -19593,30 +20180,6 @@ mod tests {
             );
             assert_eq!(permission_requirement(PermissionMode::Full, action), Allow);
         }
-        assert_eq!(
-            permission_requirement(PermissionMode::AutoApprove, ToolAction::Write),
-            Allow
-        );
-        assert_eq!(
-            permission_requirement(PermissionMode::AutoApprove, ToolAction::Edit),
-            Allow
-        );
-        assert_eq!(
-            permission_requirement(PermissionMode::AutoApprove, ToolAction::MemoryWrite),
-            Allow
-        );
-        assert_eq!(
-            permission_requirement(PermissionMode::AutoApprove, ToolAction::Delete),
-            Approval
-        );
-        assert_eq!(
-            permission_requirement(PermissionMode::AutoApprove, ToolAction::Shell),
-            Approval
-        );
-        assert_eq!(
-            permission_requirement(PermissionMode::AutoApprove, ToolAction::GitCommit),
-            Approval
-        );
         assert_eq!(PermissionMode::parse(Some("unknown")), PermissionMode::Ask);
     }
 
@@ -19912,10 +20475,6 @@ mod tests {
         );
         assert_eq!(
             sensitive_read_permission_requirement(PermissionMode::Ask),
-            Approval
-        );
-        assert_eq!(
-            sensitive_read_permission_requirement(PermissionMode::AutoApprove),
             Approval
         );
         assert_eq!(
@@ -20669,10 +21228,6 @@ mod tests {
         );
         assert_eq!(
             permission_requirement(PermissionMode::Ask, ToolAction::Mcp),
-            Approval
-        );
-        assert_eq!(
-            permission_requirement(PermissionMode::AutoApprove, ToolAction::Mcp),
             Approval
         );
         assert_eq!(
@@ -21731,11 +22286,12 @@ mod tests {
             Some("project")
         );
         assert!(normalized.get("workdir_policy").is_none());
+        // Legacy auto-approve is folded back to ask rather than retained.
         assert_eq!(
             normalized
                 .get("defaultPermissionTier")
                 .and_then(Value::as_str),
-            Some("auto-approve")
+            Some("ask")
         );
         assert!(normalized.get("default_permission_tier").is_none());
         assert!(normalize_system_settings_payload(json!({
@@ -21744,6 +22300,92 @@ mod tests {
         .is_err());
         assert!(normalize_system_settings_payload(json!({
             "defaultPermissionTier": "unrestricted"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn system_settings_default_to_strict_security_boundaries() {
+        let defaulted = default_setting("system", "C:\\Workspace");
+        assert_eq!(
+            defaulted["security"]["requirePlanForMutableTools"],
+            json!(true)
+        );
+        assert_eq!(
+            defaulted["security"]["allowSubagentGlobalRead"],
+            json!(false)
+        );
+
+        let normalized = normalize_system_settings_payload(json!({})).unwrap();
+        assert_eq!(
+            normalized["security"]["requirePlanForMutableTools"],
+            json!(true)
+        );
+        assert_eq!(
+            normalized["security"]["allowSubagentGlobalRead"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn system_settings_canonicalize_legacy_security_fields() {
+        let normalized = normalize_system_settings_payload(json!({
+            "require_plan_for_mutable_tools": false,
+            "allowSubagentGlobalRead": true
+        }))
+        .unwrap();
+        assert!(normalized.get("require_plan_for_mutable_tools").is_none());
+        assert!(normalized.get("allowSubagentGlobalRead").is_none());
+        assert_eq!(
+            normalized["security"]["requirePlanForMutableTools"],
+            json!(false)
+        );
+        assert_eq!(
+            normalized["security"]["allowSubagentGlobalRead"],
+            json!(true)
+        );
+
+        let canonical = normalize_system_settings_payload(json!({
+            "security": {
+                "require_plan_for_mutable_tools": true,
+                "allow_subagent_global_read": false
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            canonical["security"]["requirePlanForMutableTools"],
+            json!(true)
+        );
+        assert_eq!(
+            canonical["security"]["allowSubagentGlobalRead"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn system_settings_reject_invalid_security_fields() {
+        assert!(normalize_system_settings_payload(json!({
+            "security": "strict"
+        }))
+        .is_err());
+        assert!(normalize_system_settings_payload(json!({
+            "security": {
+                "requirePlanForMutableTools": "yes"
+            }
+        }))
+        .is_err());
+        assert!(normalize_system_settings_payload(json!({
+            "security": {
+                "allowSubagentGlobalRead": false,
+                "allow_subagent_global_read": true
+            }
+        }))
+        .is_err());
+        assert!(normalize_system_settings_payload(json!({
+            "security": {
+                "requirePlanForMutableTools": true,
+                "unexpected": false
+            }
         }))
         .is_err());
     }
@@ -21778,19 +22420,20 @@ mod tests {
     fn project_permission_preferences_are_canonical_and_never_persist_full_access() {
         let entry = json!({
             "preferences": {
-                "permission": "auto"
+                "permission": "ask"
             }
         });
         let normalized =
             normalize_project_preferences(entry.as_object().expect("project entry is an object"))
-                .expect("auto permission should normalize")
+                .expect("ask permission should normalize")
                 .expect("permission preference should be retained");
         assert_eq!(
             normalized.get("permission").and_then(Value::as_str),
-            Some("auto-approve")
+            Some("ask")
         );
 
-        for permission in ["full", "unrestricted", ""] {
+        // Legacy auto-approve is no longer a durable project preference.
+        for permission in ["full", "unrestricted", "auto", "auto-approve", ""] {
             let entry = json!({
                 "preferences": { "permission": permission }
             });
@@ -21924,6 +22567,126 @@ mod tests {
             None
         );
         cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn translation_context_resolves_the_default_provider_and_model() {
+        let (state, path) = test_state();
+        state.settings.lock().insert(
+            "providers".to_string(),
+            json!([
+                {
+                    "id": "default-provider",
+                    "enabled": true,
+                    "isDefault": true,
+                    "baseUrl": "https://default.example.test/v1",
+                    "models": [{"id": "default-model", "enabled": true}],
+                    "defaultModel": "default-model"
+                },
+                {
+                    "id": "second-provider",
+                    "enabled": true,
+                    "baseUrl": "https://second.example.test/v1",
+                    "models": [{"id": "second-model", "enabled": true}],
+                    "defaultModel": "second-model"
+                }
+            ]),
+        );
+        assert_eq!(
+            resolve_translation_context(&state, None, None).unwrap(),
+            (
+                "default-provider".to_string(),
+                "default-model".to_string()
+            )
+        );
+        assert_eq!(
+            resolve_translation_context(&state, None, Some("second-model")).unwrap(),
+            (
+                "second-provider".to_string(),
+                "second-model".to_string()
+            )
+        );
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn translation_context_prefers_the_active_session_model_selection() {
+        let (state, path) = test_state();
+        state.settings.lock().insert(
+            "providers".to_string(),
+            json!([
+                {
+                    "id": "default-provider",
+                    "enabled": true,
+                    "isDefault": true,
+                    "baseUrl": "https://default.example.test/v1",
+                    "models": [{"id": "default-model", "enabled": true}],
+                    "defaultModel": "default-model"
+                },
+                {
+                    "id": "session-provider",
+                    "enabled": true,
+                    "baseUrl": "https://session.example.test/v1",
+                    "models": [{"id": "session-model", "enabled": true}],
+                    "defaultModel": "session-model"
+                }
+            ]),
+        );
+        let session_id = state.sessions.lock().keys().next().unwrap().clone();
+        {
+            let mut sessions = state.sessions.lock();
+            let record = sessions.get_mut(&session_id).unwrap();
+            record.selected_model_json = Some(
+                json!({"providerId": "session-provider", "modelId": "session-model"}).to_string(),
+            );
+        }
+        assert_eq!(
+            resolve_translation_context(&state, Some(&session_id), None).unwrap(),
+            (
+                "session-provider".to_string(),
+                "session-model".to_string()
+            )
+        );
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn translation_context_rejects_disabled_or_missing_providers() {
+        let (state, path) = test_state();
+        state.settings.lock().insert(
+            "providers".to_string(),
+            json!([{
+                "id": "disabled-provider",
+                "enabled": false,
+                "baseUrl": "https://disabled.example.test/v1",
+                "models": [{"id": "disabled-model", "enabled": true}],
+                "defaultModel": "disabled-model"
+            }]),
+        );
+        assert!(resolve_translation_context(&state, None, None).is_err());
+        assert!(resolve_translation_context(&state, None, Some("missing-model")).is_err());
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn raw_translation_provider_reads_the_unredacted_record_by_id() {
+        let settings = HashMap::from([(
+            "providers".to_string(),
+            json!([{
+                "id": "native-provider",
+                "enabled": true,
+                "baseUrl": "https://native.example.test/v1",
+                "models": [{"id": "native-model", "enabled": true}],
+                "defaultModel": "native-model",
+                "apiKey": "native-secret"
+            }]),
+        )]);
+        let record = raw_translation_provider(&settings, "native-provider").unwrap();
+        assert_eq!(
+            record.pointer("/apiKey").and_then(Value::as_str),
+            Some("native-secret")
+        );
+        assert!(raw_translation_provider(&settings, "missing-provider").is_err());
     }
 
     #[test]
@@ -23648,6 +24411,7 @@ mod tests {
                         title: "meta".to_string(),
                         cwd: current_workdir(),
                         updated_at: 1,
+                        message_count: 2,
                         is_pinned: false,
                         is_archived: false,
                         last_run_status: None,

@@ -134,6 +134,13 @@ const MAX_CRON_CLAIM_LIMIT: usize = CRON_WORKER_POOL_SIZE;
 const MAX_CRON_SHELL_TIMEOUT_MS: u64 = 120_000;
 const MAX_CRON_PROMPT_TIMEOUT_MS: u64 = 120_000;
 const MAX_CRON_PROMPT_MESSAGES: usize = 1;
+// One-click translation of native service details uses the same native
+// provider boundary as Prompt Cron, with a tighter interactive timeout and
+// its own bounded input/output ceilings.
+pub(crate) const MAX_TRANSLATION_INPUT_CHARS: usize = 64 * 1024;
+const MAX_TRANSLATION_OUTPUT_CHARS: usize = 16 * 1024;
+const MAX_TRANSLATION_RESPONSE_BYTES: usize = 128 * 1024;
+const MAX_TRANSLATION_TIMEOUT_MS: u64 = 45_000;
 // Shell and Prompt jobs have a two minute execution ceiling. Keep the lease
 // comfortably above that ceiling so a healthy native executor is never
 // recovered while it is still completing bounded I/O.
@@ -231,7 +238,7 @@ pub struct LocalServices {
     database_path: PathBuf,
     initialization_lock: Mutex<()>,
     initialization_error: Mutex<Option<String>>,
-    /// A locked portable instance deliberately skips eager initialization. Keep
+    /// A locked instance deliberately skips eager initialization. Keep
     /// that state distinct from "last initialization did not fail" so the
     /// first post-unlock operation still creates and migrates its store.
     initialized: AtomicBool,
@@ -244,6 +251,20 @@ pub struct LocalServices {
     /// started Agent call cannot disclose content after revocation completes.
     knowledge_access_lock: RwLock<()>,
     knowledge_agent_access: Mutex<HashMap<String, KnowledgeAgentAccess>>,
+    security_gate: LocalServicesSecurityGate,
+}
+
+type LocalServicesSecurityGate = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+fn default_local_services_security_gate() -> Result<(), String> {
+    if !crate::secret_store::app_security_needs_unlock() {
+        return Ok(());
+    }
+    if crate::storage::is_portable() {
+        Err("portable storage is locked; unlock it before using local services".to_string())
+    } else {
+        Err("application password is required".to_string())
+    }
 }
 
 impl LocalServices {
@@ -252,6 +273,16 @@ impl LocalServices {
     }
 
     fn from_root(data_root: PathBuf) -> Self {
+        Self::from_root_with_security_gate(
+            data_root,
+            Arc::new(default_local_services_security_gate),
+        )
+    }
+
+    fn from_root_with_security_gate(
+        data_root: PathBuf,
+        security_gate: LocalServicesSecurityGate,
+    ) -> Self {
         let service = Self {
             skills_root: data_root.join(SKILLS_DIRECTORY),
             database_path: data_root.join(DATABASE_FILE),
@@ -265,10 +296,11 @@ impl LocalServices {
             knowledge_fts_available: AtomicBool::new(false),
             knowledge_access_lock: RwLock::new(()),
             knowledge_agent_access: Mutex::new(HashMap::new()),
+            security_gate,
         };
-        // A portable package must not create its database, Skills directory,
-        // FTS tables, or Cron recovery state before its password is unlocked.
-        if !crate::secret_store::portable_storage_needs_unlock() {
+        // A locked package must not create its database, Skills directory, FTS
+        // tables, or Cron recovery state before the startup password is done.
+        if service.check_security_ready().is_ok() {
             let _ = service.initialize();
         }
         service
@@ -276,7 +308,15 @@ impl LocalServices {
 
     #[cfg(test)]
     fn for_test(data_root: PathBuf) -> Self {
-        Self::from_root(data_root)
+        Self::from_root_with_security_gate(data_root, Arc::new(|| Ok(())))
+    }
+
+    #[cfg(test)]
+    fn for_test_with_security_gate(
+        data_root: PathBuf,
+        security_gate: LocalServicesSecurityGate,
+    ) -> Self {
+        Self::from_root_with_security_gate(data_root, security_gate)
     }
 
     #[cfg(test)]
@@ -292,9 +332,7 @@ impl LocalServices {
     /// builtin Skills. It is safe to call this again after a transient error.
     pub fn initialize(&self) -> Result<(), String> {
         let _guard = self.initialization_lock.lock();
-        if crate::secret_store::portable_storage_needs_unlock() {
-            let error =
-                "portable storage is locked; unlock it before using local services".to_string();
+        if let Err(error) = self.check_security_ready() {
             *self.initialization_error.lock() = Some(error.clone());
             return Err(error);
         }
@@ -351,12 +389,12 @@ impl LocalServices {
         Ok(())
     }
 
+    fn check_security_ready(&self) -> Result<(), String> {
+        (self.security_gate)()
+    }
+
     fn ensure_ready(&self) -> Result<(), String> {
-        if crate::secret_store::portable_storage_needs_unlock() {
-            return Err(
-                "portable storage is locked; unlock it before using local services".to_string(),
-            );
-        }
+        self.check_security_ready()?;
         if !self.initialized.load(Ordering::Acquire) || self.initialization_error.lock().is_some() {
             self.initialize()?;
         }
@@ -7943,6 +7981,160 @@ async fn execute_prompt_job(data_root: &Path, payload: &Value) -> Result<(String
     Ok((bound_cron_output_text(text), true))
 }
 
+/// Perform one bounded provider completion for one-click translation. The
+/// caller has already resolved the provider record and model from native
+/// settings; this function applies the same credential binding, redirect,
+/// timeout, and response bounds as Prompt Cron without ever returning the
+/// underlying credentials or provider error details to the renderer.
+pub(crate) async fn translate_provider_text(
+    provider: &Map<String, Value>,
+    model: &str,
+    system_instruction: &str,
+    user_text: &str,
+) -> Result<String, String> {
+    if user_text.trim().is_empty() {
+        return Err("translation text cannot be empty".to_string());
+    }
+    if user_text.chars().count() > MAX_TRANSLATION_INPUT_CHARS {
+        return Err("translation text is too long".to_string());
+    }
+    if !cron_provider_secret_binding_matches(provider) {
+        return Err(
+            "translation provider credentials are not valid for the configured endpoint"
+                .to_string(),
+        );
+    }
+    let protocol = cron_provider_protocol(provider);
+    let api_key = cron_provider_api_key(provider)
+        .ok_or_else(|| "translation provider has no credentials".to_string())?;
+    let use_system_proxy = provider
+        .get("useSystemProxy")
+        .or_else(|| provider.get("use_system_proxy"))
+        .or_else(|| provider.get("systemProxy"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let mut client_builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(StdDuration::from_millis(MAX_TRANSLATION_TIMEOUT_MS));
+    if !use_system_proxy {
+        client_builder = client_builder.no_proxy();
+    }
+    let client = client_builder
+        .build()
+        .map_err(|_| "translation client could not be initialized".to_string())?;
+
+    let (url, request_body, headers) =
+        if protocol.contains("anthropic") || protocol.contains("claude") {
+            let url = cron_provider_base_url(provider, &protocol)?;
+            let body = json!({
+                "model": model,
+                // MCP registry descriptions can be multi-kilobyte; keep headroom
+                // for CJK expansions without silently truncating the translation.
+                "max_tokens": 4096,
+                "system": system_instruction,
+                "messages": [{
+                    "role": "user",
+                    "content": user_text,
+                }],
+            });
+            let headers = vec![
+                ("x-api-key".to_string(), api_key),
+                ("anthropic-version".to_string(), "2023-06-01".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+            ];
+            (url, body, headers)
+        } else if protocol.contains("gemini") || protocol.contains("google") {
+            let mut base = cron_provider_base_url(provider, &protocol)?;
+            if base.ends_with("/chat/completions") {
+                base.truncate(base.len() - "/chat/completions".len());
+            }
+            let model_id = model.strip_prefix("models/").unwrap_or(model);
+            let url = format!(
+                "{}/models/{}:generateContent",
+                base.trim_end_matches('/'),
+                model_id
+            );
+            let body = json!({
+                "system_instruction": { "parts": [{ "text": system_instruction }] },
+                "contents": [{
+                    "role": "user",
+                    "parts": [{ "text": user_text }],
+                }],
+            });
+            let headers = vec![
+                ("x-goog-api-key".to_string(), api_key),
+                ("content-type".to_string(), "application/json".to_string()),
+            ];
+            (url, body, headers)
+        } else {
+            let url = cron_provider_base_url(provider, &protocol)?;
+            let body = json!({
+                "model": model,
+                "messages": [
+                    { "role": "system", "content": system_instruction },
+                    { "role": "user", "content": user_text },
+                ],
+                "stream": false,
+                "n": 1,
+            });
+            let headers = vec![
+                ("authorization".to_string(), format!("Bearer {api_key}")),
+                ("content-type".to_string(), "application/json".to_string()),
+            ];
+            (url, body, headers)
+        };
+
+    let mut request = client
+        .post(&url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::USER_AGENT, "NovaVei/0.1");
+    for (name, value) in headers {
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| "translation has an invalid credential header".to_string())?;
+        let header_value = HeaderValue::from_str(&value)
+            .map_err(|_| "translation has an invalid credential header".to_string())?;
+        request = request.header(header_name, header_value);
+    }
+    let mut response = request
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|_| "translation request failed".to_string())?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "translation response failed".to_string())?
+    {
+        let remaining = MAX_TRANSLATION_RESPONSE_BYTES.saturating_sub(bytes.len());
+        if chunk.len() > remaining {
+            bytes.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() >= MAX_TRANSLATION_RESPONSE_BYTES {
+            break;
+        }
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "translation provider returned status {}",
+            status.as_u16()
+        ));
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "translation provider returned an invalid response".to_string())?;
+    let mut text = extract_completion_text(&value)
+        .ok_or_else(|| "translation provider returned no completion text".to_string())?;
+    if text.chars().count() > MAX_TRANSLATION_OUTPUT_CHARS {
+        text = text.chars().take(MAX_TRANSLATION_OUTPUT_CHARS).collect();
+        text.push_str("\n…[truncated]");
+    }
+    Ok(text)
+}
+
 // ---------------------------------------------------------------------------
 // Tauri command surface
 
@@ -8464,6 +8656,16 @@ mod tests {
             .expect("a test-native Enable approval should activate this Cron job")
     }
 
+    fn security_gate_from_lock_flag(locked: Arc<AtomicBool>) -> LocalServicesSecurityGate {
+        Arc::new(move || {
+            if locked.load(Ordering::Acquire) {
+                Err("application password is required".to_string())
+            } else {
+                Ok(())
+            }
+        })
+    }
+
     #[test]
     fn initialization_is_reentrant_and_seeds_builtins() {
         let root = TestDirectory::new("initialize");
@@ -8482,6 +8684,63 @@ mod tests {
             .iter()
             .any(|skill| skill.name == "skills-installer" && skill.built_in));
         assert!(service.database_path().is_file());
+    }
+
+    #[test]
+    fn security_gate_defers_initialization_and_blocks_knowledge_base_reads() {
+        let root = TestDirectory::new("security-gate-locked");
+        let locked = Arc::new(AtomicBool::new(true));
+        let service = LocalServices::for_test_with_security_gate(
+            root.path.clone(),
+            security_gate_from_lock_flag(Arc::clone(&locked)),
+        );
+
+        assert!(!service.database_path().exists());
+        assert_eq!(
+            service.initialize().unwrap_err(),
+            "application password is required"
+        );
+        assert_eq!(
+            service
+                .knowledge_base_search("deployment", None, Some(1))
+                .unwrap_err(),
+            "application password is required"
+        );
+        assert!(!service.database_path().exists());
+
+        locked.store(false, Ordering::Release);
+        assert!(service.knowledge_base_list().is_ok());
+        assert!(service.database_path().is_file());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn security_gate_blocks_manual_cron_run_now() {
+        let root = TestDirectory::new("security-gate-cron");
+        let locked = Arc::new(AtomicBool::new(false));
+        let service = LocalServices::for_test_with_security_gate(
+            root.path.clone(),
+            security_gate_from_lock_flag(Arc::clone(&locked)),
+        );
+        let job = confirmed_test_cron_upsert(
+            &service,
+            CronUpsertInput {
+                id: None,
+                name: "Locked manual run".to_string(),
+                kind: "prompt".to_string(),
+                schedule: "hourly".to_string(),
+                payload: json!({"prompt": "This must not run while locked."}),
+                enabled: false,
+            },
+        );
+
+        locked.store(true, Ordering::Release);
+        assert_eq!(
+            service.cron_run_now(&job.id, None).await.unwrap_err(),
+            "application password is required"
+        );
+
+        locked.store(false, Ordering::Release);
+        assert!(service.cron_runs(&job.id, None).unwrap().is_empty());
     }
 
     #[test]
@@ -9530,6 +9789,93 @@ mod tests {
             .unwrap()
             .insert("dangerousConfirmed".to_string(), Value::Bool(true));
         assert!(serde_json::from_value::<CronUpsertInput>(forged_renderer_input).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn translate_provider_text_round_trips_an_openai_completion() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8_192];
+            let read = socket.read(&mut request).await.unwrap();
+            let body = String::from_utf8_lossy(&request[..read]);
+            assert!(body.contains("\"role\":\"system\""));
+            assert!(body.contains("professional translator"));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"choices\":[{\"message\":{\"content\":\"\xe4\xbd\xa0\xe5\xa5\xbd\xef\xbc\x8c\xe4\xb8\x96\xe7\x95\x8c\"}}]}",
+                )
+                .await
+                .unwrap();
+        });
+
+        let provider = json!({
+            "id": "translation-provider",
+            "type": "openai",
+            "baseUrl": format!("http://{addr}"),
+            "apiKey": "native-secret",
+            "enabled": true,
+            "model": "translation-model"
+        });
+        let provider = serde_json::from_value::<Map<String, Value>>(provider).unwrap();
+        let result = translate_provider_text(
+            &provider,
+            "translation-model",
+            "You are a professional translator. Detect the source language and translate the user-provided text into zh.",
+            "Hello world",
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(result, "你好，世界");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn translate_provider_text_rejects_a_stale_credential_binding() {
+        let provider = json!({
+            "id": "translation-provider",
+            "type": "openai",
+            "baseUrl": "https://api.openai.com/v1",
+            "apiKey": "native-secret",
+            "__credentialBinding": {
+                "authFamily": "anthropic",
+                "endpoint": "https://api.openai.com/v1"
+            }
+        });
+        let provider = serde_json::from_value::<Map<String, Value>>(provider).unwrap();
+        let error = translate_provider_text(&provider, "model", "system", "hello")
+            .await
+            .unwrap_err();
+        assert!(error.contains("not valid for the configured endpoint"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn translate_provider_text_bounds_its_input_before_network() {
+        let provider = json!({
+            "id": "translation-provider",
+            "type": "openai",
+            "baseUrl": "https://api.openai.com/v1",
+            "apiKey": "native-secret"
+        });
+        let provider = serde_json::from_value::<Map<String, Value>>(provider).unwrap();
+        assert_eq!(
+            translate_provider_text(&provider, "model", "system", "   ")
+                .await
+                .unwrap_err(),
+            "translation text cannot be empty"
+        );
+        let oversized = "x".repeat(MAX_TRANSLATION_INPUT_CHARS + 1);
+        assert_eq!(
+            translate_provider_text(&provider, "model", "system", &oversized)
+                .await
+                .unwrap_err(),
+            "translation text is too long"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

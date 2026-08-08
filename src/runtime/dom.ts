@@ -5,6 +5,11 @@ import { renderComposerMessageMedia } from "./attachments";
 import { renderMarkdown } from "./markdown";
 import { formatMessageTimestamp } from "./message-time";
 import { displayPath } from "./path-display";
+import { decorateUserMessage } from "./message-edit";
+import {
+  contextualCheckpointFrom,
+  renderContextCheckpoint,
+} from "./context-checkpoint";
 import {
   planExecutionFollowUpText,
   PlanConfirmationCards,
@@ -410,7 +415,9 @@ function appendUserMessage(
   message.dataset.floorId = id;
   message.dataset.messageId = id;
   if (messageId) message.dataset.liveMessageId = messageId;
+  if (text) message.dataset.historyContent = text;
   renderComposerMessageMedia(message, text, sessionId);
+  decorateUserMessage(message);
   axis.appendChild(message);
   window.__novaveiFloorNav?.refresh?.();
 }
@@ -2273,8 +2280,7 @@ function boundedProjectPreferences(
   if (
     preferences.permission !== undefined &&
     permission !== "readonly" &&
-    permission !== "ask" &&
-    permission !== "auto-approve"
+    permission !== "ask"
   ) {
     return undefined;
   }
@@ -2867,7 +2873,6 @@ function selectedPermission() {
   if (
     pickerPermission === "readonly" ||
     pickerPermission === "ask" ||
-    pickerPermission === "auto-approve" ||
     pickerPermission === "full"
   ) {
     return pickerPermission;
@@ -3739,8 +3744,8 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
   const pendingWorktreeTaskIds = new Set<string>();
   const queuedPromptsBySession = new Map<string, QueuedComposerPrompt[]>();
   const pausedPromptQueues = new Set<string>();
-  let queueDrainInFlight = false;
-  let queueRunner: (() => void) | undefined;
+  const queueDrainInFlight = new Set<string>();
+  let queueRunner: ((sessionId?: string) => void) | undefined;
   let disposeSubagentTaskListener: (() => void) | undefined;
   let disposeSubagentMessageListener: (() => void) | undefined;
   const subagentTasksForSession = (sessionId: string | undefined) => {
@@ -4609,7 +4614,14 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       toast(state.status === "completed" ? "已完成" : "已取消");
     }
     if (["completed", "cancelled", "error"].includes(state.status))
-      queueRunner?.();
+      queueRunner?.(state.sessionId?.trim());
+    if (assistantTerminal && activeNode) {
+      const checkpoint = contextualCheckpointFrom(
+        asRecord(state.contextTrim)?.compaction,
+        activePresentation?.model,
+      );
+      renderContextCheckpoint(activeNode, checkpoint);
+    }
     window.__novaveiFloorNav?.refresh?.();
   };
 
@@ -4622,14 +4634,26 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       toast(message || "请先在设置中配置供应商。");
       return undefined;
     }
-    const selection = selectedModelSelection();
-    const model = looksLikeDisplayModel(input.model)
-      ? (selection.modelId ?? input.model)
-      : input.model;
-    const nativeSessionId = window.__novaveiHost?.getSessionId();
-    const nativeWorkdir = window.__novaveiHost?.getWorkdir();
+    let cachedSelection: ReturnType<typeof selectedModelSelection> | undefined;
+    const selection = () => (cachedSelection ??= selectedModelSelection());
+    const model =
+      input.providerId && input.model
+        ? input.model
+        : looksLikeDisplayModel(input.model)
+          ? (selection().modelId ?? input.model)
+          : input.model;
+    const nativeSessionId = window.__novaveiHost?.getSessionId()?.trim();
+    const nativeWorkdir = window.__novaveiHost?.getWorkdir()?.trim();
+    const requestSessionId = input.sessionId?.trim();
+    const requestWorkdir = input.cwd?.trim();
+    const shouldBindToVisibleSession =
+      !requestSessionId ||
+      !nativeSessionId ||
+      requestSessionId === nativeSessionId;
     const originalText = input.text;
-    const composerAttachments = window.__novaveiComposerAttachments;
+    const composerAttachments = shouldBindToVisibleSession
+      ? window.__novaveiComposerAttachments
+      : undefined;
     let attachmentPayload:
       | ReturnType<NonNullable<typeof composerAttachments>["prepare"]>
       | undefined;
@@ -4648,20 +4672,24 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
     }
     const displayText =
       attachmentPayload?.displayText ?? input.displayText ?? input.text;
+    const reasoning = input.reasoning ?? selectedReasoning();
+    const permission = input.permission ?? selectedPermission();
     const request: Omit<PiRunInput, "requestId"> = {
       ...input,
       text: runtimeText,
       displayText,
       images: attachmentPayload?.images ?? input.images,
-      providerId: input.providerId || selection.providerId,
+      providerId: input.providerId || selection().providerId,
       model,
-      reasoning: input.reasoning ?? selectedReasoning(),
-      permission: selectedPermission(),
-      sessionId: nativeSessionId || input.sessionId,
-      cwd: nativeWorkdir || input.cwd || selectedWorkdir(),
+      reasoning,
+      permission,
+      sessionId: requestSessionId || nativeSessionId,
+      cwd: requestWorkdir || nativeWorkdir || selectedWorkdir(),
     };
     const queueSessionId = request.sessionId?.trim() || "__novavei-default__";
-    const activeState = controller.getState();
+    const activeState = request.sessionId
+      ? controller.getSessionState(request.sessionId)
+      : controller.getState();
     const activeForThisSession =
       activeState.sessionId?.trim() === request.sessionId?.trim() &&
       [
@@ -4682,7 +4710,9 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       const queued = queuedPromptsBySession.get(queueSessionId) ?? [];
       queued.push(request);
       queuedPromptsBySession.set(queueSessionId, queued);
-      const queuedComposer = element<HTMLTextAreaElement>("composerInput");
+      const queuedComposer = shouldBindToVisibleSession
+        ? element<HTMLTextAreaElement>("composerInput")
+        : null;
       if (queuedComposer) {
         queuedComposer.value = "";
         queuedComposer.dispatchEvent(new Event("input", { bubbles: true }));
@@ -4691,11 +4721,12 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       return undefined;
     }
     const submissionPresentation: AssistantPresentation = {
-      model: modelLabel(),
-      reasoning: request.reasoning ?? selectedReasoning(),
-      permission: permissionLabel(),
+      model: input.model ?? modelLabel(),
+      reasoning,
+      permission: input.permission ?? permissionLabel(),
     };
-    pendingPresentation = submissionPresentation;
+    if (shouldBindToVisibleSession)
+      pendingPresentation = submissionPresentation;
     const optimisticSessionId = request.sessionId?.trim();
     const optimisticText = displayText.trim() || "[附件]";
     const optimisticTurn: LiveTurnContext | undefined = optimisticSessionId
@@ -4721,7 +4752,7 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
     // A normal host session-change event selects this already. Selecting here
     // as well closes the short bootstrap race where a ready Composer can send
     // before the initial session notification has reached this module.
-    controller.selectSession(request.sessionId);
+    if (shouldBindToVisibleSession) controller.selectSession(request.sessionId);
     const hostAcceptedOptimisticMessage =
       optimisticTurn &&
       publishLiveTranscriptMessage({
@@ -4731,13 +4762,15 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
         content: optimisticTurn.displayText,
         createdAt: optimisticTurn.createdAt,
       });
-    if (!hostAcceptedOptimisticMessage)
+    if (!hostAcceptedOptimisticMessage && shouldBindToVisibleSession)
       appendUserMessage(
         optimisticText,
         request.sessionId,
         optimisticTurn?.userMessageId,
       );
-    const composer = element<HTMLTextAreaElement>("composerInput");
+    const composer = shouldBindToVisibleSession
+      ? element<HTMLTextAreaElement>("composerInput")
+      : null;
     // The optimistic transcript can be rendered before a transport accepts the
     // turn. Keep the exact visible draft long enough to recover it if that
     // acceptance fails, without overwriting text the user starts typing while
@@ -4778,6 +4811,7 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
         : `${message} 输入草稿已保留，可检查后重试。`;
     };
     const renderSubmissionFailure = (message: string) => {
+      if (!shouldBindToVisibleSession) return;
       if (
         optimisticTurn &&
         publishLiveTranscriptMessage({
@@ -4892,9 +4926,17 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
     }
   };
 
-  const drainQueuedPrompts = () => {
-    if (queueDrainInFlight) return;
-    const state = controller.getState();
+  const drainQueuedPrompts = (targetSessionId?: string) => {
+    const sessionId =
+      targetSessionId?.trim() ||
+      controller.getState().sessionId?.trim() ||
+      window.__novaveiHost?.getSessionId?.()?.trim() ||
+      "__novavei-default__";
+    if (queueDrainInFlight.has(sessionId)) return;
+    const state =
+      sessionId === "__novavei-default__"
+        ? controller.getState()
+        : controller.getSessionState(sessionId);
     if (
       [
         "starting",
@@ -4905,24 +4947,26 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
       ].includes(state.status)
     )
       return;
-    const sessionId =
-      state.sessionId?.trim() ??
-      window.__novaveiHost?.getSessionId?.()?.trim() ??
-      "__novavei-default__";
     if (pausedPromptQueues.has(sessionId)) return;
     const queued = queuedPromptsBySession.get(sessionId);
     const next = queued?.shift();
     if (!next) return;
     if (!queued?.length) queuedPromptsBySession.delete(sessionId);
-    queueDrainInFlight = true;
+    queueDrainInFlight.add(sessionId);
     void submit(next).finally(() => {
-      queueDrainInFlight = false;
+      queueDrainInFlight.delete(sessionId);
       // A synchronous/test transport may reach its terminal state before the
       // current stack unwinds; defer to keep the queue strictly sequential.
-      window.queueMicrotask(drainQueuedPrompts);
+      window.queueMicrotask(() => drainQueuedPrompts(sessionId));
     });
   };
   queueRunner = drainQueuedPrompts;
+  const unsubscribeQueuedPromptDrainer = controller.subscribeSessionState(
+    (sessionId, state) => {
+      if (["completed", "cancelled", "error"].includes(state.status))
+        drainQueuedPrompts(sessionId);
+    },
+  );
 
   const cancel = (options?: { resumeQueuedPrompt?: boolean }) => {
     const sessionId =
@@ -4974,6 +5018,7 @@ export function createDomPiRuntime(controller: PiRuntimeController) {
     ready: controller.ready,
     dispose: () => {
       unsubscribe();
+      unsubscribeQueuedPromptDrainer();
       send?.removeEventListener("click", onSendClick);
       window.removeEventListener(
         "novavei:providers-changed",

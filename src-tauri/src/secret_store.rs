@@ -14,6 +14,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
@@ -28,8 +29,10 @@ const PORTABLE_MARKER: &str = "__novavei_portable_v1:";
 const PORTABLE_TRANSCRIPT_MARKER: &str = "__novavei_portable_msg_v1:";
 const PORTABLE_LOCAL_SERVICE_MARKER: &str = "__novavei_portable_local_v1:";
 const PORTABLE_KEY_FILE: &str = "portable.json";
+const APP_SECURITY_FILE: &str = "security.json";
 const PORTABLE_SCHEMA_VERSION: u8 = 2;
 const PORTABLE_LEGACY_SCHEMA_VERSION: u8 = 1;
+const APP_SECURITY_SCHEMA_VERSION: u8 = 1;
 const PORTABLE_SALT_BYTES: usize = 16;
 const PORTABLE_KEY_BYTES: usize = 32;
 const PORTABLE_NONCE_BYTES: usize = 12;
@@ -41,12 +44,14 @@ const MAX_RECOVERY_ANSWER_BYTES: usize = 1024;
 const MIN_RECOVERY_QUESTION_CHARS: usize = 6;
 const MIN_RECOVERY_ANSWER_CHARS: usize = 4;
 const PORTABLE_VERIFIER: &[u8] = b"NovaVei portable storage verifier v1";
+const APP_PASSWORD_VERIFIER: &[u8] = b"NovaVei application password verifier v1";
 
 static PORTABLE_KEY: OnceLock<Mutex<Option<[u8; PORTABLE_KEY_BYTES]>>> = OnceLock::new();
 // A pending portable data key may be temporarily installed while AppState
 // hydrates encrypted rows. The renderer must not treat that intermediate state
 // as an unlocked application: only a completed hydration marks it ready.
 static PORTABLE_KEY_READY: AtomicBool = AtomicBool::new(false);
+static APP_PASSWORD_READY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,11 +59,25 @@ pub struct PortableStorageStatus {
     pub portable: bool,
     pub initialized: bool,
     pub unlocked: bool,
+    pub password_required: bool,
+    pub password_configured: bool,
     /// Recovery prompts are intentionally returned so the user can answer
     /// them before their data key has been restored. Answers never cross this
     /// boundary in the opposite direction and are never persisted as text.
     pub recovery_configured: bool,
     pub recovery_questions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSecurityStatus {
+    pub portable: bool,
+    pub password_required: bool,
+    pub password_configured: bool,
+    pub unlocked: bool,
+    pub portable_initialized: bool,
+    pub portable_recovery_configured: bool,
+    pub portable_recovery_questions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,11 +99,31 @@ pub struct PortableRecoverySetup {
 #[serde(rename_all = "camelCase")]
 struct PortableKeyFile {
     schema_version: u8,
-    password_salt: String,
-    password_wrapped_key: String,
-    recovery_salt: String,
+    #[serde(default = "default_true")]
+    password_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password_salt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password_wrapped_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_salt: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     recovery_questions: Vec<String>,
-    recovery_wrapped_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_wrapped_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_unlock_wrapped_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppSecurityFile {
+    schema_version: u8,
+    password_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password_salt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password_verifier: Option<String>,
 }
 
 #[derive(Debug)]
@@ -97,26 +136,46 @@ fn portable_key_slot() -> &'static Mutex<Option<[u8; PORTABLE_KEY_BYTES]>> {
     PORTABLE_KEY.get_or_init(|| Mutex::new(None))
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Report portable storage state without exposing its path, password, salts,
 /// encrypted key wrappers, or recovery answers to the WebView. The custom
 /// recovery prompts are returned only so the user can answer them.
 pub fn portable_storage_status() -> PortableStorageStatus {
     let portable = crate::storage::is_portable();
-    let (initialized, recovery_configured, recovery_questions) = if portable {
+    let (
+        initialized,
+        password_required,
+        password_configured,
+        recovery_configured,
+        recovery_questions,
+    ) = if portable {
         portable_key_file_path()
             .ok()
             .filter(|path| path.exists())
             .map(|path| match read_portable_key_config(&path) {
-                Ok(PortableKeyConfig::Current(config))
-                    if validate_recovery_questions(&config.recovery_questions).is_ok() =>
-                {
-                    (true, true, config.recovery_questions)
+                Ok(PortableKeyConfig::Current(config)) => {
+                    let recovery_configured = portable_recovery_configured(&config);
+                    (
+                        true,
+                        config.password_required && portable_password_configured(&config),
+                        portable_password_configured(&config),
+                        recovery_configured,
+                        if recovery_configured {
+                            config.recovery_questions
+                        } else {
+                            Vec::new()
+                        },
+                    )
                 }
-                _ => (true, false, Vec::new()),
+                Ok(PortableKeyConfig::Legacy(_)) => (true, true, true, false, Vec::new()),
+                _ => (true, true, false, false, Vec::new()),
             })
-            .unwrap_or((false, false, Vec::new()))
+            .unwrap_or((false, false, false, false, Vec::new()))
     } else {
-        (false, false, Vec::new())
+        (false, false, false, false, Vec::new())
     };
     let unlocked = portable
         && PORTABLE_KEY_READY.load(Ordering::Acquire)
@@ -128,6 +187,8 @@ pub fn portable_storage_status() -> PortableStorageStatus {
         portable,
         initialized,
         unlocked,
+        password_required,
+        password_configured,
         recovery_configured,
         recovery_questions,
     }
@@ -135,6 +196,111 @@ pub fn portable_storage_status() -> PortableStorageStatus {
 
 pub fn portable_storage_needs_unlock() -> bool {
     crate::storage::is_portable() && !portable_storage_status().unlocked
+}
+
+pub fn app_security_needs_unlock() -> bool {
+    if crate::storage::is_portable() {
+        return portable_storage_needs_unlock();
+    }
+    installed_app_security_needs_unlock().unwrap_or(true)
+}
+
+fn installed_app_security_needs_unlock() -> Result<bool, String> {
+    if crate::storage::is_portable() {
+        return Ok(false);
+    }
+    let config = read_app_security_config()?;
+    let password_required = config.password_required && app_password_configured(&config);
+    Ok(password_required && !APP_PASSWORD_READY.load(Ordering::Acquire))
+}
+
+fn require_installed_app_security_unlocked() -> Result<(), String> {
+    if installed_app_security_needs_unlock()? {
+        Err("application password is required".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+pub fn app_security_status() -> Result<AppSecurityStatus, String> {
+    if crate::storage::is_portable() {
+        let status = portable_storage_status();
+        return Ok(AppSecurityStatus {
+            portable: true,
+            password_required: status.password_required,
+            password_configured: status.password_configured,
+            unlocked: status.unlocked,
+            portable_initialized: status.initialized,
+            portable_recovery_configured: status.recovery_configured,
+            portable_recovery_questions: status.recovery_questions,
+        });
+    }
+    let config = read_app_security_config()?;
+    let password_configured = app_password_configured(&config);
+    let password_required = config.password_required && password_configured;
+    Ok(AppSecurityStatus {
+        portable: false,
+        password_required,
+        password_configured,
+        unlocked: !password_required || APP_PASSWORD_READY.load(Ordering::Acquire),
+        portable_initialized: false,
+        portable_recovery_configured: false,
+        portable_recovery_questions: Vec::new(),
+    })
+}
+
+pub fn unlock_app_password(password: &str) -> Result<AppSecurityStatus, String> {
+    let config = read_app_security_config()?;
+    if !config.password_required {
+        APP_PASSWORD_READY.store(true, Ordering::Release);
+        return app_security_status();
+    }
+    validate_portable_password(password)?;
+    verify_app_password(&config, password)?;
+    APP_PASSWORD_READY.store(true, Ordering::Release);
+    app_security_status()
+}
+
+pub fn clear_app_password_unlock() {
+    APP_PASSWORD_READY.store(false, Ordering::Release);
+}
+
+pub fn set_installed_app_password(
+    current_password: Option<&str>,
+    new_password: &str,
+) -> Result<AppSecurityStatus, String> {
+    validate_portable_password(new_password)?;
+    let config = read_app_security_config()?;
+    if config.password_required && app_password_configured(&config) {
+        let current = current_password.ok_or_else(|| {
+            "current application password is required before changing it".to_string()
+        })?;
+        verify_app_password(&config, current)?;
+    }
+    let next = new_app_security_file(new_password)?;
+    replace_app_security_file(&next)?;
+    APP_PASSWORD_READY.store(true, Ordering::Release);
+    app_security_status()
+}
+
+pub fn disable_installed_app_password(
+    current_password: Option<&str>,
+) -> Result<AppSecurityStatus, String> {
+    let config = read_app_security_config()?;
+    if config.password_required && app_password_configured(&config) {
+        let current = current_password.ok_or_else(|| {
+            "current application password is required before disabling it".to_string()
+        })?;
+        verify_app_password(&config, current)?;
+    }
+    replace_app_security_file(&AppSecurityFile {
+        schema_version: APP_SECURITY_SCHEMA_VERSION,
+        password_required: false,
+        password_salt: None,
+        password_verifier: None,
+    })?;
+    APP_PASSWORD_READY.store(true, Ordering::Release);
+    app_security_status()
 }
 
 /// Create or unlock the portable key envelope. A random data-encryption key
@@ -156,10 +322,16 @@ pub fn unlock_portable_storage(
     let key = match fs::read_to_string(&path) {
         Ok(contents) => match parse_portable_key_config(&contents)? {
             PortableKeyConfig::Current(config) => {
-                if recovery_setup.is_some() {
+                if recovery_setup.is_some() && portable_recovery_configured(&config) {
                     return Err("portable recovery is already configured".to_string());
                 }
-                unwrap_password_key(&config, password)?
+                let key = unwrap_password_key(&config, password)?;
+                if let Some(recovery) = recovery_setup {
+                    let mut upgraded = config;
+                    set_portable_recovery_fields(&mut upgraded, &key, &recovery)?;
+                    replace_portable_key_file(&path, &upgraded)?;
+                }
+                key
             }
             PortableKeyConfig::Legacy(config) => {
                 let key = unlock_legacy_key(&config, password)?;
@@ -235,11 +407,149 @@ pub fn recover_portable_storage(
     getrandom::fill(&mut password_salt)
         .map_err(|_| "generate portable storage salt failed".to_string())?;
     let mut password_key = derive_portable_key(new_password.as_bytes(), &password_salt)?;
-    config.password_salt = hex_encode(&password_salt);
-    config.password_wrapped_key = encrypt_portable_bytes(&password_key, &key)?;
+    config.password_required = true;
+    config.password_salt = Some(hex_encode(&password_salt));
+    config.password_wrapped_key = Some(encrypt_portable_bytes(&password_key, &key)?);
+    config.auto_unlock_wrapped_key = None;
     password_key.fill(0);
     replace_portable_key_file(&path, &config)?;
     install_portable_key(key)?;
+    Ok(portable_storage_status())
+}
+
+pub fn auto_unlock_portable_storage() -> Result<PortableStorageStatus, String> {
+    if !crate::storage::is_portable() {
+        return Err("portable storage is not active for this application".to_string());
+    }
+    if !crate::storage::portable_marker_valid() {
+        return Err("portable distribution marker is invalid; repair the portable package before unlocking data".to_string());
+    }
+    let path = portable_key_file_path()?;
+    let key = match fs::read_to_string(&path) {
+        Ok(contents) => match parse_portable_key_config(&contents)? {
+            PortableKeyConfig::Current(config) => {
+                if config.password_required {
+                    return Err("portable storage password is required".to_string());
+                }
+                unwrap_auto_unlock_key(&config)?
+            }
+            PortableKeyConfig::Legacy(_) => {
+                return Err("portable storage password is required".to_string())
+            }
+        },
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let mut key = [0_u8; PORTABLE_KEY_BYTES];
+            getrandom::fill(&mut key)
+                .map_err(|_| "generate portable storage key failed".to_string())?;
+            let config = new_portable_auto_unlock_key_file(&key)?;
+            fs::create_dir_all(crate::storage::application_data_dir())
+                .map_err(|_| "create portable storage directory failed".to_string())?;
+            let serialized = serde_json::to_vec_pretty(&config)
+                .map_err(|_| "serialize portable storage configuration failed".to_string())?;
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    file.write_all(&serialized)
+                        .and_then(|_| file.write_all(b"\n"))
+                        .and_then(|_| file.sync_all())
+                        .map_err(|_| "write portable storage configuration failed".to_string())?;
+                    key
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    return auto_unlock_portable_storage()
+                }
+                Err(_) => return Err("create portable storage configuration failed".to_string()),
+            }
+        }
+        Err(_) => return Err("read portable storage configuration failed".to_string()),
+    };
+    install_portable_key(key)?;
+    Ok(portable_storage_status())
+}
+
+pub fn set_portable_password_requirement(
+    required: bool,
+    current_password: Option<&str>,
+    new_password: Option<&str>,
+    recovery_setup: Option<PortableRecoverySetup>,
+) -> Result<PortableStorageStatus, String> {
+    if !crate::storage::is_portable() {
+        return Err("portable storage is not active for this application".to_string());
+    }
+    if !crate::storage::portable_marker_valid() {
+        return Err("portable distribution marker is invalid; repair the portable package before unlocking data".to_string());
+    }
+    let key = portable_key()?;
+    let path = portable_key_file_path()?;
+    let mut config = match fs::read_to_string(&path) {
+        Ok(contents) => match parse_portable_key_config(&contents)? {
+            PortableKeyConfig::Current(config) => config,
+            PortableKeyConfig::Legacy(legacy) => {
+                let current = current_password.ok_or_else(|| {
+                    "current portable storage password is required before changing it".to_string()
+                })?;
+                let legacy_key = unlock_legacy_key(&legacy, current)?;
+                if legacy_key != key {
+                    return Err("portable storage password is incorrect".to_string());
+                }
+                PortableKeyFile {
+                    schema_version: PORTABLE_SCHEMA_VERSION,
+                    password_required: true,
+                    password_salt: None,
+                    password_wrapped_key: None,
+                    recovery_salt: None,
+                    recovery_questions: Vec::new(),
+                    recovery_wrapped_key: None,
+                    auto_unlock_wrapped_key: None,
+                }
+            }
+        },
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            new_portable_auto_unlock_key_file(&key)?
+        }
+        Err(_) => return Err("read portable storage configuration failed".to_string()),
+    };
+    if config.password_required && portable_password_configured(&config) {
+        let current = current_password.ok_or_else(|| {
+            "current portable storage password is required before changing it".to_string()
+        })?;
+        let verified = unwrap_password_key(&config, current)?;
+        if verified != key {
+            return Err("portable storage password is incorrect".to_string());
+        }
+    }
+    if required {
+        let password = new_password
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "new portable storage password is required".to_string())?;
+        set_portable_password_fields(&mut config, &key, password)?;
+        if let Some(recovery) = recovery_setup {
+            if portable_recovery_configured(&config) {
+                return Err("portable recovery is already configured".to_string());
+            }
+            set_portable_recovery_fields(&mut config, &key, &recovery)?;
+        } else if !portable_recovery_configured(&config) {
+            return Err(
+                "portable recovery questions are required before enabling a portable password"
+                    .to_string(),
+            );
+        }
+        config.password_required = true;
+        config.auto_unlock_wrapped_key = None;
+    } else {
+        if recovery_setup.is_some() {
+            return Err(
+                "portable recovery questions can only be set when enabling a password".to_string(),
+            );
+        }
+        config.password_required = false;
+        config.auto_unlock_wrapped_key = Some(wrap_auto_unlock_key(&key)?);
+    }
+    replace_portable_key_file(&path, &config)?;
     Ok(portable_storage_status())
 }
 
@@ -284,6 +594,7 @@ pub fn protect_settings(
 pub fn unprotect_settings(
     settings: &HashMap<String, Value>,
 ) -> Result<HashMap<String, Value>, String> {
+    require_installed_app_security_unlocked()?;
     settings
         .iter()
         .map(|(scope, value)| {
@@ -319,6 +630,9 @@ pub fn protect_transcript_text(value: &str) -> Result<String, String> {
 /// Reverse [`protect_transcript_text`]. Plaintext legacy rows are returned as
 /// written so pre-encryption databases still load.
 pub fn unprotect_transcript_text(value: &str) -> Result<String, String> {
+    if !crate::storage::is_portable() {
+        require_installed_app_security_unlocked()?;
+    }
     if crate::storage::is_portable() && value.starts_with(PORTABLE_TRANSCRIPT_MARKER) {
         return portable_decrypt_string(value, PORTABLE_TRANSCRIPT_MARKER);
     }
@@ -360,6 +674,7 @@ pub fn protect_portable_local_service_text(value: &str) -> Result<String, String
 /// callers must rewrite it before exposing LocalServices to IPC.
 pub fn unprotect_portable_local_service_text(value: &str) -> Result<String, String> {
     if !crate::storage::is_portable() {
+        require_installed_app_security_unlocked()?;
         return Ok(value.to_string());
     }
     if value.starts_with(PORTABLE_LOCAL_SERVICE_MARKER) {
@@ -546,6 +861,59 @@ fn validate_recovery_questions(questions: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn portable_password_configured(config: &PortableKeyFile) -> bool {
+    config.password_salt.is_some() && config.password_wrapped_key.is_some()
+}
+
+fn portable_recovery_configured(config: &PortableKeyFile) -> bool {
+    config.recovery_salt.is_some()
+        && config.recovery_wrapped_key.is_some()
+        && validate_recovery_questions(&config.recovery_questions).is_ok()
+}
+
+fn portable_auto_unlock_configured(config: &PortableKeyFile) -> bool {
+    config.auto_unlock_wrapped_key.is_some()
+}
+
+fn validate_portable_key_file(config: &PortableKeyFile) -> Result<(), String> {
+    if config.schema_version != PORTABLE_SCHEMA_VERSION {
+        return Err("portable storage configuration version is unsupported".to_string());
+    }
+    match (&config.password_salt, &config.password_wrapped_key) {
+        (Some(salt), Some(wrapped)) => {
+            decode_portable_salt(salt)?;
+            if wrapped.is_empty() {
+                return Err("portable storage configuration is invalid".to_string());
+            }
+        }
+        (None, None) => {}
+        _ => return Err("portable storage configuration is invalid".to_string()),
+    }
+    match (
+        &config.recovery_salt,
+        config.recovery_questions.is_empty(),
+        &config.recovery_wrapped_key,
+    ) {
+        (Some(salt), false, Some(wrapped)) => {
+            decode_portable_salt(salt)?;
+            validate_recovery_questions(&config.recovery_questions)
+                .map_err(|_| "portable storage configuration is invalid".to_string())?;
+            if wrapped.is_empty() {
+                return Err("portable storage configuration is invalid".to_string());
+            }
+        }
+        (None, true, None) => {}
+        _ => return Err("portable storage configuration is invalid".to_string()),
+    }
+    if config.password_required && !portable_password_configured(config) {
+        return Err("portable storage configuration is invalid".to_string());
+    }
+    if !config.password_required && !portable_auto_unlock_configured(config) {
+        return Err("portable storage configuration is invalid".to_string());
+    }
+    Ok(())
+}
+
 fn parse_portable_key_config(contents: &str) -> Result<PortableKeyConfig, String> {
     let value: Value = serde_json::from_str(contents)
         .map_err(|_| "portable storage configuration is invalid".to_string())?;
@@ -562,8 +930,7 @@ fn parse_portable_key_config(contents: &str) -> Result<PortableKeyConfig, String
         version if version == PORTABLE_SCHEMA_VERSION as u64 => {
             let config: PortableKeyFile = serde_json::from_value(value)
                 .map_err(|_| "portable storage configuration is invalid".to_string())?;
-            validate_recovery_questions(&config.recovery_questions)
-                .map_err(|_| "portable storage configuration is invalid".to_string())?;
+            validate_portable_key_file(&config)?;
             Ok(PortableKeyConfig::Current(config))
         }
         _ => Err("portable storage configuration version is unsupported".to_string()),
@@ -597,9 +964,17 @@ fn unwrap_password_key(
     config: &PortableKeyFile,
     password: &str,
 ) -> Result<[u8; PORTABLE_KEY_BYTES], String> {
-    let salt = decode_portable_salt(&config.password_salt)?;
+    let salt = config
+        .password_salt
+        .as_ref()
+        .ok_or_else(|| "portable storage password is not configured".to_string())?;
+    let salt = decode_portable_salt(salt)?;
+    let wrapped = config
+        .password_wrapped_key
+        .as_ref()
+        .ok_or_else(|| "portable storage password is not configured".to_string())?;
     let mut password_key = derive_portable_key(password.as_bytes(), &salt)?;
-    let result = unwrap_portable_key(&password_key, &config.password_wrapped_key)
+    let result = unwrap_portable_key(&password_key, wrapped)
         .map_err(|_| "portable storage password is incorrect or data is damaged".to_string());
     password_key.fill(0);
     result
@@ -609,9 +984,17 @@ fn unwrap_recovery_key(
     config: &PortableKeyFile,
     answers: &[String],
 ) -> Result<[u8; PORTABLE_KEY_BYTES], String> {
-    let salt = decode_portable_salt(&config.recovery_salt)?;
+    let salt = config
+        .recovery_salt
+        .as_ref()
+        .ok_or_else(|| "portable storage configuration is unavailable for recovery".to_string())?;
+    let salt = decode_portable_salt(salt)?;
+    let wrapped = config
+        .recovery_wrapped_key
+        .as_ref()
+        .ok_or_else(|| "portable storage configuration is unavailable for recovery".to_string())?;
     let mut recovery_key = derive_recovery_key(answers, &salt)?;
-    let result = unwrap_portable_key(&recovery_key, &config.recovery_wrapped_key)
+    let result = unwrap_portable_key(&recovery_key, wrapped)
         .map_err(|_| "portable recovery answers are incorrect or data is damaged".to_string());
     recovery_key.fill(0);
     result
@@ -637,12 +1020,88 @@ fn new_portable_key_file(
     recovery_key.fill(0);
     Ok(PortableKeyFile {
         schema_version: PORTABLE_SCHEMA_VERSION,
-        password_salt: hex_encode(&password_salt),
-        password_wrapped_key,
-        recovery_salt: hex_encode(&recovery_salt),
+        password_required: true,
+        password_salt: Some(hex_encode(&password_salt)),
+        password_wrapped_key: Some(password_wrapped_key),
+        recovery_salt: Some(hex_encode(&recovery_salt)),
         recovery_questions: recovery.questions.clone(),
-        recovery_wrapped_key,
+        recovery_wrapped_key: Some(recovery_wrapped_key),
+        auto_unlock_wrapped_key: None,
     })
+}
+
+fn new_portable_auto_unlock_key_file(
+    data_key: &[u8; PORTABLE_KEY_BYTES],
+) -> Result<PortableKeyFile, String> {
+    Ok(PortableKeyFile {
+        schema_version: PORTABLE_SCHEMA_VERSION,
+        password_required: false,
+        password_salt: None,
+        password_wrapped_key: None,
+        recovery_salt: None,
+        recovery_questions: Vec::new(),
+        recovery_wrapped_key: None,
+        auto_unlock_wrapped_key: Some(wrap_auto_unlock_key(data_key)?),
+    })
+}
+
+fn set_portable_password_fields(
+    config: &mut PortableKeyFile,
+    data_key: &[u8; PORTABLE_KEY_BYTES],
+    password: &str,
+) -> Result<(), String> {
+    let mut password_salt = [0_u8; PORTABLE_SALT_BYTES];
+    getrandom::fill(&mut password_salt)
+        .map_err(|_| "generate portable storage salt failed".to_string())?;
+    let mut password_key = derive_portable_key(password.as_bytes(), &password_salt)?;
+    let password_wrapped_key = encrypt_portable_bytes(&password_key, data_key)?;
+    config.password_salt = Some(hex_encode(&password_salt));
+    config.password_wrapped_key = Some(password_wrapped_key);
+    password_key.fill(0);
+    Ok(())
+}
+
+fn set_portable_recovery_fields(
+    config: &mut PortableKeyFile,
+    data_key: &[u8; PORTABLE_KEY_BYTES],
+    recovery: &PortableRecoverySetup,
+) -> Result<(), String> {
+    validate_recovery_setup(recovery)?;
+    let mut recovery_salt = [0_u8; PORTABLE_SALT_BYTES];
+    getrandom::fill(&mut recovery_salt)
+        .map_err(|_| "generate portable storage salt failed".to_string())?;
+    let mut recovery_key = derive_recovery_key(&recovery.answers, &recovery_salt)?;
+    let recovery_wrapped_key = encrypt_portable_bytes(&recovery_key, data_key)?;
+    config.recovery_salt = Some(hex_encode(&recovery_salt));
+    config.recovery_questions = recovery.questions.clone();
+    config.recovery_wrapped_key = Some(recovery_wrapped_key);
+    recovery_key.fill(0);
+    Ok(())
+}
+
+fn wrap_auto_unlock_key(data_key: &[u8; PORTABLE_KEY_BYTES]) -> Result<String, String> {
+    let mut digest = Sha256::new();
+    digest.update(b"NovaVei portable auto unlock wrapper v1");
+    let mut wrapping_key = [0_u8; PORTABLE_KEY_BYTES];
+    wrapping_key.copy_from_slice(&digest.finalize());
+    let result = encrypt_portable_bytes(&wrapping_key, data_key);
+    wrapping_key.fill(0);
+    result
+}
+
+fn unwrap_auto_unlock_key(config: &PortableKeyFile) -> Result<[u8; PORTABLE_KEY_BYTES], String> {
+    let wrapped = config
+        .auto_unlock_wrapped_key
+        .as_ref()
+        .ok_or_else(|| "portable storage password is required".to_string())?;
+    let mut digest = Sha256::new();
+    digest.update(b"NovaVei portable auto unlock wrapper v1");
+    let mut wrapping_key = [0_u8; PORTABLE_KEY_BYTES];
+    wrapping_key.copy_from_slice(&digest.finalize());
+    let result = unwrap_portable_key(&wrapping_key, wrapped)
+        .map_err(|_| "portable storage configuration is damaged".to_string());
+    wrapping_key.fill(0);
+    result
 }
 
 fn decode_portable_salt(encoded: &str) -> Result<Vec<u8>, String> {
@@ -746,6 +1205,126 @@ fn portable_key_file_path() -> Result<std::path::PathBuf, String> {
         return Err("portable storage is not active for this application".to_string());
     }
     Ok(crate::storage::application_data_dir().join(PORTABLE_KEY_FILE))
+}
+
+fn app_security_file_path() -> std::path::PathBuf {
+    crate::storage::application_data_dir().join(APP_SECURITY_FILE)
+}
+
+fn app_password_configured(config: &AppSecurityFile) -> bool {
+    config.password_salt.is_some() && config.password_verifier.is_some()
+}
+
+fn validate_app_security_file(config: &AppSecurityFile) -> Result<(), String> {
+    if config.schema_version != APP_SECURITY_SCHEMA_VERSION {
+        return Err("application security configuration version is unsupported".to_string());
+    }
+    match (&config.password_salt, &config.password_verifier) {
+        (Some(salt), Some(verifier)) => {
+            decode_portable_salt(salt)?;
+            if verifier.is_empty() {
+                return Err("application security configuration is invalid".to_string());
+            }
+        }
+        (None, None) => {}
+        _ => return Err("application security configuration is invalid".to_string()),
+    }
+    if config.password_required != app_password_configured(config) {
+        return Err("application security configuration is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn default_app_security_file() -> AppSecurityFile {
+    AppSecurityFile {
+        schema_version: APP_SECURITY_SCHEMA_VERSION,
+        password_required: false,
+        password_salt: None,
+        password_verifier: None,
+    }
+}
+
+fn read_app_security_config() -> Result<AppSecurityFile, String> {
+    let path = app_security_file_path();
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(default_app_security_file()),
+        Err(_) => return Err("read application security configuration failed".to_string()),
+    };
+    let config: AppSecurityFile = serde_json::from_str(&contents)
+        .map_err(|_| "application security configuration is invalid".to_string())?;
+    validate_app_security_file(&config)?;
+    Ok(config)
+}
+
+fn new_app_security_file(password: &str) -> Result<AppSecurityFile, String> {
+    let mut salt = [0_u8; PORTABLE_SALT_BYTES];
+    getrandom::fill(&mut salt)
+        .map_err(|_| "generate application password salt failed".to_string())?;
+    let mut password_key = derive_portable_key(password.as_bytes(), &salt)?;
+    let verifier = encrypt_portable_bytes(&password_key, APP_PASSWORD_VERIFIER)?;
+    password_key.fill(0);
+    Ok(AppSecurityFile {
+        schema_version: APP_SECURITY_SCHEMA_VERSION,
+        password_required: true,
+        password_salt: Some(hex_encode(&salt)),
+        password_verifier: Some(verifier),
+    })
+}
+
+fn verify_app_password(config: &AppSecurityFile, password: &str) -> Result<(), String> {
+    let salt = config
+        .password_salt
+        .as_ref()
+        .ok_or_else(|| "application password is not configured".to_string())?;
+    let verifier = config
+        .password_verifier
+        .as_ref()
+        .ok_or_else(|| "application password is not configured".to_string())?;
+    let salt = decode_portable_salt(salt)?;
+    let mut password_key = derive_portable_key(password.as_bytes(), &salt)?;
+    let decrypted = decrypt_portable_bytes(&password_key, verifier)
+        .map_err(|_| "application password is incorrect".to_string())?;
+    password_key.fill(0);
+    if decrypted == APP_PASSWORD_VERIFIER {
+        Ok(())
+    } else {
+        Err("application password is incorrect".to_string())
+    }
+}
+
+fn replace_app_security_file(config: &AppSecurityFile) -> Result<(), String> {
+    fs::create_dir_all(crate::storage::application_data_dir())
+        .map_err(|_| "create application security directory failed".to_string())?;
+    let path = app_security_file_path();
+    let parent = path
+        .parent()
+        .ok_or_else(|| "application security configuration path is invalid".to_string())?;
+    let mut random = [0_u8; 8];
+    getrandom::fill(&mut random)
+        .map_err(|_| "generate application security temporary name failed".to_string())?;
+    let temporary = parent.join(format!(".security-{}.tmp", hex_encode(&random)));
+    let serialized = serde_json::to_vec_pretty(config)
+        .map_err(|_| "serialize application security configuration failed".to_string())?;
+    let write_result = (|| -> Result<(), String> {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|_| "write application security configuration failed".to_string())?;
+        file.write_all(&serialized)
+            .and_then(|_| file.write_all(b"\n"))
+            .and_then(|_| file.sync_all())
+            .map_err(|_| "write application security configuration failed".to_string())?;
+        fs::rename(&temporary, &path)
+            .map_err(|_| "replace application security configuration failed".to_string())?;
+        Ok(())
+    })();
+    if write_result.is_err() && temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
 }
 
 fn derive_portable_key(password: &[u8], salt: &[u8]) -> Result<[u8; PORTABLE_KEY_BYTES], String> {
@@ -1109,8 +1688,9 @@ mod tests {
         let replacement_salt = [31_u8; PORTABLE_SALT_BYTES];
         let mut replacement_key =
             derive_portable_key(replacement_password.as_bytes(), &replacement_salt).unwrap();
-        config.password_salt = hex_encode(&replacement_salt);
-        config.password_wrapped_key = encrypt_portable_bytes(&replacement_key, &data_key).unwrap();
+        config.password_salt = Some(hex_encode(&replacement_salt));
+        config.password_wrapped_key =
+            Some(encrypt_portable_bytes(&replacement_key, &data_key).unwrap());
         replacement_key.fill(0);
 
         assert_eq!(
@@ -1138,6 +1718,55 @@ mod tests {
         };
         assert!(validate_recovery_setup(&duplicate_questions).is_err());
         assert!(validate_recovery_answers(&["one".to_string()]).is_err());
+    }
+
+    #[test]
+    fn app_security_config_requires_password_material_to_match_the_flag() {
+        let mut enabled = new_app_security_file("desktop application password").unwrap();
+        assert!(validate_app_security_file(&enabled).is_ok());
+
+        enabled.password_required = false;
+        assert!(validate_app_security_file(&enabled).is_err());
+
+        enabled.password_salt = None;
+        assert!(validate_app_security_file(&enabled).is_err());
+
+        enabled.password_verifier = None;
+        assert!(validate_app_security_file(&enabled).is_ok());
+    }
+
+    #[test]
+    fn portable_auto_unlock_wrapper_restores_the_data_key_without_a_password() {
+        let data_key = [55_u8; PORTABLE_KEY_BYTES];
+        let config = new_portable_auto_unlock_key_file(&data_key).unwrap();
+
+        assert!(!config.password_required);
+        assert!(!portable_password_configured(&config));
+        assert_eq!(unwrap_auto_unlock_key(&config).unwrap(), data_key);
+
+        let serialized = serde_json::to_string(&config).unwrap();
+        let PortableKeyConfig::Current(parsed) = parse_portable_key_config(&serialized).unwrap()
+        else {
+            panic!("auto-unlock config should remain readable")
+        };
+        assert_eq!(unwrap_auto_unlock_key(&parsed).unwrap(), data_key);
+    }
+
+    #[test]
+    fn portable_password_requirement_removes_auto_unlock_material() {
+        let data_key = [77_u8; PORTABLE_KEY_BYTES];
+        let mut config = new_portable_auto_unlock_key_file(&data_key).unwrap();
+        set_portable_password_fields(&mut config, &data_key, "fresh portable password").unwrap();
+        config.password_required = true;
+        config.auto_unlock_wrapped_key = None;
+
+        assert!(config.password_required);
+        assert!(portable_password_configured(&config));
+        assert!(config.auto_unlock_wrapped_key.is_none());
+        assert_eq!(
+            unwrap_password_key(&config, "fresh portable password").unwrap(),
+            data_key
+        );
     }
 
     #[test]

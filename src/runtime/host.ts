@@ -13,6 +13,7 @@ import {
   createAssistantThinkingPanel,
   renderAssistantThinkingTools,
 } from "./dom";
+import { decorateUserMessage } from "./message-edit";
 import { renderMarkdown } from "./markdown";
 import {
   applyFullMessageTimestampPreference,
@@ -44,6 +45,7 @@ export type SessionSummary = {
    */
   workspaceStatus?: WorkspaceLocationStatus;
   updatedAt?: number;
+  messageCount?: number;
   isPinned?: boolean;
   isArchived?: boolean;
   lastRunStatus?: PersistedSessionRunStatus;
@@ -76,7 +78,7 @@ export type ProjectModelPreference = {
  * Durable project-level interaction policy. Full access is intentionally
  * absent: it always uses a fresh, one-use grant for one exact run.
  */
-export type ProjectPermissionPreference = "readonly" | "ask" | "auto-approve";
+export type ProjectPermissionPreference = "readonly" | "ask";
 
 /**
  * Per-project defaults are deliberately separate from a conversation's saved
@@ -1124,6 +1126,14 @@ function sessionRecord(value: unknown): SessionSummary | null {
       ? rawLastRunFinishedAt
       : undefined;
   const workspaceStatus = workspaceLocationStatusFromRecord(record);
+  const rawMessageCount = optionalNumber(
+    record.messageCount,
+    record.message_count,
+  );
+  const messageCount =
+    rawMessageCount !== undefined && rawMessageCount >= 0
+      ? Math.floor(rawMessageCount)
+      : undefined;
   return {
     id,
     title:
@@ -1145,6 +1155,7 @@ function sessionRecord(value: unknown): SessionSummary | null {
       : {}),
     ...(lastRunStatus ? { lastRunStatus } : {}),
     ...(lastRunFinishedAt !== undefined ? { lastRunFinishedAt } : {}),
+    ...(messageCount !== undefined ? { messageCount } : {}),
     ...(workspaceStatus ? { workspaceStatus } : {}),
   };
 }
@@ -1220,8 +1231,7 @@ function readProjectPreferences(
   if (
     preferences.permission !== undefined &&
     permission !== "readonly" &&
-    permission !== "ask" &&
-    permission !== "auto-approve"
+    permission !== "ask"
   )
     return undefined;
   if (!hasModel && !reasoning && !permission) return undefined;
@@ -1845,6 +1855,26 @@ function notifyTranscriptWindowRendered(
  * Render only a DOM window of pageState.messages to keep long transcripts light.
  * Full history remains in memory; scroll handlers shift `domStart`.
  */
+/**
+ * Capture nodes rendered by the live streaming path so a terminal history
+ * rebuild can adopt the exact same DOM node instead of destroying and
+ * recreating it. This preserves cursor position, collapsed thinking state and
+ * in-flight Markdown rendering across the "streamed → final" transition.
+ *
+ * The map is keyed by the stable `data-live-message-id`; matching is done
+ * against `message.liveId`. Only currently-connected nodes are captured so a
+ * virtual-window page swap (which already removed the node) falls back to a
+ * normal history render.
+ */
+function captureLiveTranscriptNodes(): Map<string, HTMLElement> {
+  const map = new Map<string, HTMLElement>();
+  for (const node of transcriptMessageNodes(transcriptAxis())) {
+    const liveId = node.dataset.liveMessageId?.trim();
+    if (liveId) map.set(liveId, node);
+  }
+  return map;
+}
+
 function renderMessageWindow(
   pageState: SessionMessagePageState,
   sessionId: string,
@@ -1878,10 +1908,13 @@ function renderMessageWindow(
     options.preserveScrollHeight ?? transcript?.scrollHeight ?? 0;
   const previousTop = options.preserveScrollTop ?? transcript?.scrollTop ?? 0;
 
+  // Save streamed nodes before the container is cleared so appendHistoryMessage
+  // can re-adopt the very same element for its history twin.
+  const liveNodes = captureLiveTranscriptNodes();
   clearTranscript();
   const defaults = historyMessageDefaults(renderHistory);
   for (const message of visible) {
-    appendHistoryMessage(message, sessionId, defaults);
+    appendHistoryMessage(message, sessionId, defaults, liveNodes);
   }
 
   const hiddenAbove = pageState.domStart;
@@ -2072,24 +2105,102 @@ function messageToolValueSignature(value: unknown) {
   }
 }
 
+type AdoptLiveNodeOptions = {
+  role: string;
+  id: string;
+  sessionId: string;
+  message: MessageRecord;
+};
+
+/**
+ * Re-adopt a previously streamed live node as its history twin. The same DOM
+ * element is appended back onto the axis with its history identity set; the
+ * text / thinking / collapsed panels are untouched, so Markdown state, focus
+ * and folding survive the "streamed → terminal" transition without a rebuild.
+ *
+ * Returns false (and leaves message untouched) when there is no live node to
+ * adopt — the caller then renders the normal history row. Only connected
+ * nodes captured by `captureLiveTranscriptNodes` are reusable; a node that was
+ * scrubbed by virtual-window paging still falls back to a fresh render.
+ */
+function adoptLiveTranscriptNode(
+  axis: HTMLElement,
+  liveId: string,
+  liveNodes: ReadonlyMap<string, HTMLElement> | undefined,
+  options: AdoptLiveNodeOptions,
+): HTMLElement | null {
+  const node = liveNodes?.get(liveId);
+  if (!node) return null;
+  // Guard against adopting a node for the wrong role (e.g. a user bubble
+  // captured under an assistant's history rebind). The capturer keys only by
+  // liveId; the role must also agree with the node's own class.
+  const nodeClass = options.role === "assistant" ? "msg-assistant" : "msg-user";
+  if (!node.classList.contains(nodeClass)) return null;
+  node.dataset.messageId = options.id;
+  node.dataset.novaveiHistory = "true";
+  node.dataset.historySessionId = options.sessionId;
+  const persistedMessageId =
+    typeof options.message.id === "string" ? options.message.id.trim() : "";
+  const turnId =
+    typeof options.message.turnId === "string"
+      ? options.message.turnId.trim()
+      : "";
+  if (persistedMessageId) node.dataset.historyMessageId = persistedMessageId;
+  if (turnId) node.dataset.historyTurnId = turnId;
+  // Keep data-live-message-id so the live layer's rebind marks this row as its
+  // streamed origin, but never flip the render mode back into "streaming".
+  axis.appendChild(node);
+  return node;
+}
+
 function appendHistoryMessage(
   message: MessageRecord,
   sessionId: string,
   defaults: HistoryMessageDefaults,
+  liveNodes?: ReadonlyMap<string, HTMLElement>,
 ) {
   const axis = transcriptAxis();
   if (!axis) return;
   const content = typeof message.content === "string" ? message.content : "";
   const role = (message.role ?? "").toLowerCase();
   const id = stableMessageId(message);
+  const liveId = message.liveId?.trim();
+
   if (role === "user") {
+    const reused = liveId
+      ? adoptLiveTranscriptNode(axis, liveId, liveNodes, {
+          role,
+          id,
+          sessionId,
+          message,
+        })
+      : null;
+    if (reused) {
+      // Adopted live nodes already carry decorateUserMessage from their live
+      // render; grant them the durable identity the edit guard needs.
+      if (reused.dataset.historyMessageId === undefined) {
+        const persistedId =
+          typeof message.id === "string" && message.id.trim()
+            ? message.id.trim()
+            : undefined;
+        if (persistedId) reused.dataset.historyMessageId = persistedId;
+      }
+      return;
+    }
     const item = document.createElement("div");
     item.className = "msg-user";
     item.dataset.floorId = id;
     item.dataset.messageId = id;
-    if (message.liveId) item.dataset.liveMessageId = message.liveId;
+    if (liveId) item.dataset.liveMessageId = liveId;
     item.dataset.novaveiHistory = "true";
+    const persistedId =
+      typeof message.id === "string" && message.id.trim()
+        ? message.id.trim()
+        : undefined;
+    if (persistedId) item.dataset.historyMessageId = persistedId;
+    if (content) item.dataset.historyContent = content;
     renderComposerMessageMedia(item, content, sessionId);
+    decorateUserMessage(item);
     axis.appendChild(item);
     return;
   }
@@ -2097,7 +2208,7 @@ function appendHistoryMessage(
     const item = document.createElement("div");
     item.className = "tool-row";
     item.dataset.messageId = id;
-    if (message.liveId) item.dataset.liveMessageId = message.liveId;
+    if (liveId) item.dataset.liveMessageId = liveId;
     item.dataset.novaveiHistory = "true";
     item.setAttribute("role", "status");
     const label = document.createElement("span");
@@ -2109,6 +2220,15 @@ function appendHistoryMessage(
     return;
   }
   const article = document.createElement("article");
+  if (liveId) {
+    const reused = adoptLiveTranscriptNode(axis, liveId, liveNodes, {
+      role,
+      id,
+      sessionId,
+      message,
+    });
+    if (reused) return;
+  }
   article.className = "msg-assistant";
   article.dataset.messageId = id;
   if (message.liveId) article.dataset.liveMessageId = message.liveId;
@@ -3980,35 +4100,6 @@ export function installNativeShell(): NativeShellApi | undefined {
     clearSessionLoadNotice();
   };
 
-  const findReusableDraftSession = async (cwd: string) => {
-    const candidates = sessions.filter(
-      (session) => pathKey(session.cwd) === pathKey(cwd),
-    );
-    for (const candidate of candidates) {
-      try {
-        const isBlank = await invoke<boolean>("sessions_is_blank", {
-          sessionId: candidate.id,
-          session_id: candidate.id,
-        });
-        if (isBlank) return candidate;
-      } catch {
-        // Fall back to a paged sessions_get only when the blank probe is
-        // unavailable (older host / mock).
-        const page = parseSessionsGetResponse(
-          await invoke<unknown>("sessions_get", sessionsGetArgs(candidate.id)),
-        );
-        if (
-          !page.messages.some(
-            (message) => message.role?.trim().toLowerCase() === "user",
-          )
-        ) {
-          return candidate;
-        }
-      }
-    }
-    return undefined;
-  };
-
   const createSession = async (cwd?: string) => {
     const previousShellState = nativeShellState;
     const previousWorkdirKey = pathKey(workdir);
@@ -4080,14 +4171,62 @@ export function installNativeShell(): NativeShellApi | undefined {
     }
   };
 
+  const findReusableDraftSession = async (cwd: string) => {
+    const targetKey = pathKey(cwd);
+    const candidates = sessions.filter(
+      (session) => !session.isArchived && pathKey(session.cwd) === targetKey,
+    );
+    const probeDraft = async (candidate: SessionSummary) => {
+      try {
+        const page = parseSessionsGetResponse(
+          await invoke<unknown>(
+            "sessions_get",
+            sessionsGetArgs(candidate.id, {
+              limit: 1,
+            }),
+          ),
+        );
+        candidate.messageCount = Math.max(0, page.totalCount);
+        return page.totalCount === 0 && page.messages.length === 0
+          ? candidate
+          : undefined;
+      } catch {
+        // Fall through to the next candidate. A missing/failed probe should
+        // never block creating or reopening a different draft.
+        return undefined;
+      }
+    };
+    const unknown: SessionSummary[] = [];
+    for (const candidate of candidates) {
+      if (sessionRuns.has(candidate.id)) continue;
+      if (candidate.messageCount === 0) return candidate;
+      if (candidate.messageCount !== undefined && candidate.messageCount > 0)
+        continue;
+      const cached = sessionMessagePages.get(candidate.id);
+      if (cached && cached.totalCount === 0 && cached.messages.length === 0)
+        return candidate;
+      if (cached && cached.totalCount > 0) continue;
+      unknown.push(candidate);
+    }
+    const batchSize = 4;
+    for (let index = 0; index < unknown.length; index += batchSize) {
+      const results = await Promise.all(
+        unknown.slice(index, index + batchSize).map(probeDraft),
+      );
+      const draft = results.find((candidate): candidate is SessionSummary =>
+        Boolean(candidate),
+      );
+      if (draft) return draft;
+    }
+    return undefined;
+  };
+
   const createNewChat = async () => {
     const requestedCwd =
       workdir && workdirTrusted
         ? workdir
         : projects.find((project) => workspaceIsReadyForTools(project.path))
             ?.path;
-    // There may already be an empty draft while another conversation is
-    // selected. Reopen that draft instead of creating a second blank session.
     if (requestedCwd) {
       const draft = await findReusableDraftSession(requestedCwd);
       if (draft) {
@@ -4095,8 +4234,6 @@ export function installNativeShell(): NativeShellApi | undefined {
         node<HTMLTextAreaElement>("composerInput")?.focus();
         return;
       }
-    }
-    if (requestedCwd) {
       await createSession(requestedCwd);
     } else {
       await pickWorkspace();

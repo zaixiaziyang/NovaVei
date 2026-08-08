@@ -2420,6 +2420,26 @@ function object(value: unknown): UnknownRecord {
   return asRecord(value) || {};
 }
 
+function stableSettingsValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableSettingsValue);
+  const record = asRecord(value);
+  if (!record) return value;
+  const result: UnknownRecord = {};
+  for (const key of Object.keys(record).sort()) {
+    const item = record[key];
+    if (item !== undefined) result[key] = stableSettingsValue(item);
+  }
+  return result;
+}
+
+function settingsPayloadSignature(value: UnknownRecord): string {
+  try {
+    return JSON.stringify(stableSettingsValue(value));
+  } catch {
+    return "";
+  }
+}
+
 function selectedData(selector: string, attribute: string) {
   return document.querySelector<HTMLElement>(`${selector}.on`)?.dataset[
     attribute
@@ -2448,6 +2468,28 @@ const DEFAULT_HISTORY_MESSAGE_PAGE_SIZE = 80;
 const HISTORY_MESSAGE_PAGE_SIZE_STORAGE_KEY = "novavei.historyMessagePageSize";
 const SECONDARY_LAUNCH_FOCUS_EXISTING = "focus-existing";
 const SECONDARY_LAUNCH_NEW_WINDOW = "new-window";
+type PermissionTier = "readonly" | "ask";
+
+const SECURITY_DEFAULTS = {
+  requirePlanForMutableTools: true,
+  allowSubagentGlobalRead: false,
+} as const;
+
+const PERMISSION_SETTINGS_COPY = {
+  zh: {
+    noProject: "未打开已登记项目；当前项目权限暂不可保存。",
+    projectRoot: (path: string) => `当前项目：${path}`,
+    savedProject: "已保存当前项目权限",
+    savedDefault: "已保存新项目默认权限",
+  },
+  en: {
+    noProject:
+      "No registered project is open; current project permission cannot be saved yet.",
+    projectRoot: (path: string) => `Current project: ${path}`,
+    savedProject: "Current project permission saved",
+    savedDefault: "New project default permission saved",
+  },
+} as const;
 
 function normalizeSecondaryLaunchBehavior(value: unknown) {
   return value === SECONDARY_LAUNCH_NEW_WINDOW
@@ -2465,6 +2507,101 @@ function applySecondaryLaunchBehavior(value: unknown) {
       button.setAttribute("aria-checked", String(selected));
       button.tabIndex = selected ? 0 : -1;
     });
+}
+
+function permissionSettingsCopy() {
+  const locale = document.documentElement.lang.toLowerCase().startsWith("en")
+    ? "en"
+    : "zh";
+  return PERMISSION_SETTINGS_COPY[locale];
+}
+
+function normalizePermissionTier(value: unknown): PermissionTier {
+  if (typeof value !== "string") return "ask";
+  switch (value.trim().toLowerCase()) {
+    case "readonly":
+    case "read_only":
+    case "read-only":
+      return "readonly";
+    default:
+      return "ask";
+  }
+}
+
+function applySegmentRadioButtons(
+  selector: string,
+  dataKey: string,
+  value: string,
+) {
+  document.querySelectorAll<HTMLButtonElement>(selector).forEach((button) => {
+    const selected = button.dataset[dataKey] === value;
+    button.classList.toggle("on", selected);
+    button.setAttribute("aria-checked", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+  });
+}
+
+function applyDefaultPermissionTier(value: unknown) {
+  applySegmentRadioButtons(
+    "[data-default-permission-tier]",
+    "defaultPermissionTier",
+    normalizePermissionTier(value),
+  );
+}
+
+function applyProjectPermissionTier(value: unknown) {
+  applySegmentRadioButtons(
+    "[data-project-permission-tier]",
+    "projectPermissionTier",
+    normalizePermissionTier(value),
+  );
+}
+
+function selectedPermissionTier(
+  selector: string,
+  dataKey: string,
+  fallback: unknown,
+) {
+  return normalizePermissionTier(
+    document.querySelector<HTMLElement>(`${selector}.on`)?.dataset[dataKey] ??
+      fallback,
+  );
+}
+
+function securitySettingsFrom(value: unknown) {
+  const source = object(value);
+  return {
+    requirePlanForMutableTools:
+      source.requirePlanForMutableTools ??
+      source.require_plan_for_mutable_tools ??
+      SECURITY_DEFAULTS.requirePlanForMutableTools,
+    allowSubagentGlobalRead:
+      source.allowSubagentGlobalRead ??
+      source.allow_subagent_global_read ??
+      SECURITY_DEFAULTS.allowSubagentGlobalRead,
+  };
+}
+
+function currentSecuritySettings(previous: unknown) {
+  const existing = securitySettingsFrom(previous);
+  const requirePlan = element<HTMLInputElement>("requirePlanForMutableTools");
+  const allowGlobalRead = element<HTMLInputElement>("allowSubagentGlobalRead");
+  return {
+    requirePlanForMutableTools:
+      requirePlan?.checked ?? Boolean(existing.requirePlanForMutableTools),
+    allowSubagentGlobalRead:
+      allowGlobalRead?.checked ?? Boolean(existing.allowSubagentGlobalRead),
+  };
+}
+
+function applySecuritySettings(value: unknown) {
+  const settings = securitySettingsFrom(value);
+  const requirePlan = element<HTMLInputElement>("requirePlanForMutableTools");
+  const allowGlobalRead = element<HTMLInputElement>("allowSubagentGlobalRead");
+  if (requirePlan)
+    requirePlan.checked = Boolean(settings.requirePlanForMutableTools);
+  if (allowGlobalRead)
+    allowGlobalRead.checked = Boolean(settings.allowSubagentGlobalRead);
 }
 
 function normalizeHistoryMessagePageSize(value: unknown): number {
@@ -2511,15 +2648,15 @@ function currentSystemPayload(previous: UnknownRecord) {
   // The native boundary intentionally supports only exact session project
   // roots. Drop an old snake_case/"extra" value while saving so the settings
   // UI cannot recreate an unsupported filesystem policy.
-  // Permission state is owned by permission-picker.ts. Leave it out of this
-  // appearance patch so the native locked merge always retains the latest
-  // permission-picker state.
   const system = { ...previous };
   delete system.workdir_policy;
-  delete system.defaultPermissionTier;
   delete system.default_permission_tier;
   delete system.fullPermissionConfirmedRoots;
   delete system.secondary_launch_behavior;
+  delete system.requirePlanForMutableTools;
+  delete system.require_plan_for_mutable_tools;
+  delete system.allowSubagentGlobalRead;
+  delete system.allow_subagent_global_read;
   const scale = selectedData("[data-ui-scale]", "uiScale");
   const secondaryLaunchBehavior = normalizeSecondaryLaunchBehavior(
     selectedData(
@@ -2547,6 +2684,12 @@ function currentSystemPayload(previous: UnknownRecord) {
     uiFont: uiFont?.value || "system",
     codeFont: codeFont?.value || "system",
     workdirPolicy: "project",
+    defaultPermissionTier: selectedPermissionTier(
+      "[data-default-permission-tier]",
+      "defaultPermissionTier",
+      system.defaultPermissionTier,
+    ),
+    security: currentSecuritySettings(system.security),
     historyMessagePageSize: pageSize,
     globalSystemPrompt: globalSystemPrompt?.value ?? "",
     secondaryLaunchBehavior,
@@ -2561,6 +2704,7 @@ function installSettings() {
   let saveTimer: number | undefined;
   let localSaveRevision = 0;
   let mergedSystemRevision = 0;
+  let appliedSystemSignature = "";
   // The desktop shell publishes app health before it treats local settings as
   // trustworthy. Keep this false until that authoritative write projection is
   // explicitly enabled; browser preview returns above and retains its static
@@ -2584,6 +2728,9 @@ function installSettings() {
     "#historyMessagePageSize",
     "#globalSystemPrompt",
     "[data-secondary-launch-behavior]",
+    "[data-security-setting]",
+    "[data-default-permission-tier]",
+    "[data-project-permission-tier]",
   ].join(", ");
   const setPersistentSettingsControlsEnabled = (enabled: boolean) => {
     document
@@ -2622,14 +2769,75 @@ function installSettings() {
       codePointCount(globalSystemPrompt.value),
     );
   };
+  const syncPermissionSettingsPanel = () => {
+    const copy = permissionSettingsCopy();
+    const host = hostApi();
+    const root = host?.getWorkdir?.()?.trim() || "";
+    const defaultTier = normalizePermissionTier(previous.defaultPermissionTier);
+    const projectTier = normalizePermissionTier(
+      host?.getCurrentProjectPreferences?.()?.permission ?? defaultTier,
+    );
+    applyDefaultPermissionTier(defaultTier);
+    applyProjectPermissionTier(projectTier);
+    const rootText = element<HTMLElement>("projectPermissionRoot");
+    if (rootText)
+      rootText.textContent = root ? copy.projectRoot(root) : copy.noProject;
+    document
+      .querySelectorAll<HTMLButtonElement>("[data-project-permission-tier]")
+      .forEach((button) => {
+        button.disabled = !settingsWritable || !root || !host;
+      });
+  };
+  const persistProjectPermissionTier = async (permission: PermissionTier) => {
+    const host = hostApi();
+    const root = host?.getWorkdir?.()?.trim();
+    if (!settingsWritable || !host || !root) {
+      syncPermissionSettingsPanel();
+      toast(permissionSettingsCopy().noProject);
+      return;
+    }
+    document
+      .querySelectorAll<HTMLButtonElement>("[data-project-permission-tier]")
+      .forEach((button) => {
+        button.disabled = true;
+      });
+    try {
+      const saved = await host.saveCurrentProjectPreferences({ permission });
+      applyProjectPermissionTier(saved?.permission ?? permission);
+      toast(permissionSettingsCopy().savedProject);
+    } catch (error) {
+      toast(errorText(error));
+      syncPermissionSettingsPanel();
+    } finally {
+      syncPermissionSettingsPanel();
+    }
+  };
   window.addEventListener("novavei:language-changed", () => {
     applyShortcutHintVisibility(currentShortcutHintVisibility());
     updateGlobalPromptCounter();
+    syncPermissionSettingsPanel();
   });
+  window.addEventListener(
+    "novavei:session-changed",
+    syncPermissionSettingsPanel,
+  );
+  window.addEventListener(
+    "novavei:current-project-changed",
+    syncPermissionSettingsPanel,
+  );
+  window.addEventListener(
+    "novavei:project-preferences-changed",
+    syncPermissionSettingsPanel,
+  );
+  window.addEventListener(
+    "novavei:workdir-changed",
+    syncPermissionSettingsPanel,
+  );
   window.addEventListener("novavei:system-settings-merged", (event) => {
     const detail = event instanceof CustomEvent ? object(event.detail) : {};
     previous = { ...previous, ...detail };
     mergedSystemRevision += 1;
+    syncPermissionSettingsPanel();
   });
   const scheduleSave = () => {
     if (hydrating || !settingsWritable) return;
@@ -2638,26 +2846,88 @@ function installSettings() {
       saveTimer = undefined;
       if (!settingsWritable) return;
       const payload = currentSystemPayload(previous);
+      const signature = settingsPayloadSignature(payload);
+      if (signature && signature === appliedSystemSignature) return;
       previous = payload;
       localSaveRevision += 1;
       publishHistoryMessagePageSize(
         Number(payload.historyMessagePageSize) ||
           DEFAULT_HISTORY_MESSAGE_PAGE_SIZE,
       );
-      void invoke("settings_save_system", { payload }).catch((error) => {
-        if (settingsWritable) toast(errorText(error));
-      });
+      void invoke("settings_save_system", { payload })
+        .then(() => {
+          if (signature) appliedSystemSignature = signature;
+        })
+        .catch((error) => {
+          if (settingsWritable) toast(errorText(error));
+        });
     }, 180);
   };
   document.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : null;
+    const projectPermissionChoice = target?.closest<HTMLButtonElement>(
+      "[data-project-permission-tier]",
+    );
+    if (projectPermissionChoice) {
+      const permission = normalizePermissionTier(
+        projectPermissionChoice.dataset.projectPermissionTier,
+      );
+      if (
+        permission ===
+        selectedPermissionTier(
+          "[data-project-permission-tier]",
+          "projectPermissionTier",
+          previous.defaultPermissionTier,
+        )
+      ) {
+        return;
+      }
+      applyProjectPermissionTier(permission);
+      if (!hydrating) void persistProjectPermissionTier(permission);
+      return;
+    }
+    const defaultPermissionChoice = target?.closest<HTMLButtonElement>(
+      "[data-default-permission-tier]",
+    );
+    if (defaultPermissionChoice) {
+      const permission = normalizePermissionTier(
+        defaultPermissionChoice.dataset.defaultPermissionTier,
+      );
+      if (
+        permission ===
+        selectedPermissionTier(
+          "[data-default-permission-tier]",
+          "defaultPermissionTier",
+          previous.defaultPermissionTier,
+        )
+      ) {
+        return;
+      }
+      applyDefaultPermissionTier(permission);
+      window.__novaveiPermission?.set(permission);
+      if (!hydrating) {
+        scheduleSave();
+        toast(permissionSettingsCopy().savedDefault);
+      }
+      return;
+    }
     const launchBehaviorChoice = target?.closest<HTMLButtonElement>(
       "[data-secondary-launch-behavior]",
     );
     if (launchBehaviorChoice) {
-      applySecondaryLaunchBehavior(
+      const behavior = normalizeSecondaryLaunchBehavior(
         launchBehaviorChoice.dataset.secondaryLaunchBehavior,
       );
+      if (
+        behavior ===
+        selectedData(
+          "[data-secondary-launch-behavior]",
+          "secondaryLaunchBehavior",
+        )
+      ) {
+        return;
+      }
+      applySecondaryLaunchBehavior(behavior);
       if (!hydrating) scheduleSave();
       return;
     }
@@ -2670,15 +2940,26 @@ function installSettings() {
       window.setTimeout(scheduleSave, 0);
     }
   });
+  window.addEventListener("novavei:theme-changed", (event) => {
+    const detail = event instanceof CustomEvent ? object(event.detail) : {};
+    if (detail?.silent === true) return;
+    scheduleSave();
+  });
   document.addEventListener("keydown", (event) => {
     const target = event.target;
     if (!(target instanceof HTMLButtonElement)) return;
-    if (!target.matches("[data-secondary-launch-behavior]")) return;
+    const selector = target.matches("[data-secondary-launch-behavior]")
+      ? "[data-secondary-launch-behavior]"
+      : target.matches("[data-default-permission-tier]")
+        ? "[data-default-permission-tier]"
+        : target.matches("[data-project-permission-tier]")
+          ? "[data-project-permission-tier]"
+          : undefined;
+    if (!selector) return;
+    const container = target.closest(".settings-seg") ?? document;
     const controls = [
-      ...document.querySelectorAll<HTMLButtonElement>(
-        "[data-secondary-launch-behavior]",
-      ),
-    ];
+      ...container.querySelectorAll<HTMLButtonElement>(selector),
+    ].filter((control) => !control.disabled);
     const current = controls.indexOf(target);
     if (current < 0 || !controls.length) return;
     let next = current;
@@ -2712,6 +2993,8 @@ function installSettings() {
           ? target.checked
           : currentMessageTimestampPreference();
       applyMessageTimestampPreference(checked);
+      scheduleSave();
+    } else if (target?.matches("[data-security-setting]")) {
       scheduleSave();
     } else if (
       target?.matches(
@@ -2815,6 +3098,8 @@ function installSettings() {
         );
         const policy = element<HTMLSelectElement>("workdirPolicy");
         if (policy) policy.value = "project";
+        applyDefaultPermissionTier(system.defaultPermissionTier);
+        applySecuritySettings(system.security);
         const historyMessagePageSizeSelect = element<HTMLSelectElement>(
           "historyMessagePageSize",
         );
@@ -2838,15 +3123,21 @@ function installSettings() {
         }
         applySecondaryLaunchBehavior(system.secondaryLaunchBehavior);
         updateGlobalPromptCounter();
+        syncPermissionSettingsPanel();
+        appliedSystemSignature = settingsPayloadSignature(
+          currentSystemPayload(previous),
+        );
         hydrating = false;
         settingsHydrated = true;
         if (needsWorkdirPolicyMigration && settingsWritable) {
           // `extra` was once a UI-only setting. Convert it immediately rather
           // than leaving a saved value that native workspace commands reject.
           const payload = currentSystemPayload(previous);
+          const signature = settingsPayloadSignature(payload);
           previous = payload;
           void invoke("settings_save_system", { payload })
             .then(() => {
+              if (signature) appliedSystemSignature = signature;
               toast(
                 document.documentElement.lang.toLowerCase().startsWith("en")
                   ? "Extra workspace paths are not supported; the policy was reset to project root only."
@@ -2869,6 +3160,7 @@ function installSettings() {
     const health = event instanceof CustomEvent ? object(event.detail) : {};
     settingsWritable = health.writes === "enabled";
     setPersistentSettingsControlsEnabled(settingsWritable);
+    syncPermissionSettingsPanel();
     if (!settingsWritable) {
       cancelPendingSave();
       settingsHydrated = false;
@@ -2879,6 +3171,7 @@ function installSettings() {
   // Native hydration is asynchronous. Start disabled so no settings load or
   // debounced save can race the app-health recovery decision.
   setPersistentSettingsControlsEnabled(false);
+  syncPermissionSettingsPanel();
   window.addEventListener("novavei:app-health-changed", onAppHealthChanged);
 }
 

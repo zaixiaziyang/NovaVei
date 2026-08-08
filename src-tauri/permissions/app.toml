@@ -15,8 +15,16 @@ commands.allow = ["storage_recovery_status", "app_health"]
 
 [[permission]]
 identifier = "allow-portable-storage-unlock"
-description = "Allow explicit initialization, unlocking, and recovery of password-protected portable storage"
-commands.allow = ["portable_storage_status", "portable_storage_unlock", "portable_storage_recover"]
+description = "Allow explicit initialization, unlocking, recovery, and optional app password management"
+commands.allow = [
+  "portable_storage_status",
+  "app_security_status",
+  "app_security_unlock",
+  "app_security_set_password",
+  "app_security_disable_password",
+  "portable_storage_unlock",
+  "portable_storage_recover"
+]
 
 [[permission]]
 identifier = "allow-storage-mode-switch"
@@ -118,7 +126,7 @@ commands.allow = ["subagent_message_send", "subagent_messages_list"]
 [[permission]]
 identifier = "allow-sessions-get"
 description = "Allow reading messages for a session"
-commands.allow = ["sessions_get", "sessions_is_blank"]
+commands.allow = ["sessions_get"]
 
 [[permission]]
 identifier = "allow-session-goals"
@@ -227,6 +235,7 @@ commands.allow = [
   "chat_history_set_archived",
   "chat_history_bulk_set_archived",
   "chat_history_branch",
+  "chat_history_truncate",
   "chat_history_delete",
   "chat_history_bulk_delete",
   "history_context_load"
@@ -310,3 +319,8 @@ commands.allow = [
   "browser_agent_click",
   "browser_agent_type"
 ]
+
+[[permission]]
+identifier = "allow-translation"
+description = "Allow one-click translation of displayed native service details using the active provider model"
+commands.allow = ["get_active_translation_model", "translate_text"]

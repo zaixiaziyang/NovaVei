@@ -12,6 +12,8 @@
 /coverage/
 *.test.*
 *.spec.*
+!/src/**/*.test.*
+!/src/**/*.spec.*
 /scripts/*
 !/scripts/copy-portable.mjs
 !/scripts/ci-supply-chain-audit.mjs

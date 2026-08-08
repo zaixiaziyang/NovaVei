@@ -121,6 +121,12 @@ fn start_cron_scheduler(
             // Tokio's first interval tick completes immediately, so overdue
             // jobs are checked once during startup and then at a bounded rate.
             interval.tick().await;
+            if !secret_store::app_security_status()
+                .map(|status| status.unlocked)
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let permits = worker_pool.reserve_slots(CRON_SCHEDULER_CLAIM_LIMIT);
             if permits.is_empty() {
                 // Workers are still busy. Do not claim a run into a memory
@@ -333,11 +339,13 @@ pub fn run() {
             build_main_window(app.handle(), "main".to_string())?;
             install_system_tray(app.handle())?;
 
-            // Stored Cron jobs can run shell, HTTP, or prompt work. Do not
-            // execute any of them while a removable drive is still locked.
+            // Stored Cron jobs can run shell, HTTP, or prompt work. The
+            // scheduler itself rechecks the startup password before every due
+            // claim, so installed builds resume after unlock without running
+            // while the app is locked.
             // Portable scheduling stays deliberately paused for this process;
             // it requires an explicit future re-enable flow after unlock.
-            if !secret_store::portable_storage_needs_unlock() && !storage::is_portable() {
+            if !storage::is_portable() {
                 start_cron_scheduler(app.handle().clone(), local_services);
             }
             Ok(())
@@ -350,6 +358,10 @@ pub fn run() {
             backend::diagnostics_export,
             backend::storage_recovery_status,
             backend::portable_storage_status,
+            backend::app_security_status,
+            backend::app_security_unlock,
+            backend::app_security_set_password,
+            backend::app_security_disable_password,
             backend::portable_storage_unlock,
             backend::portable_storage_recover,
             backend::app_health,
@@ -379,7 +391,6 @@ pub fn run() {
             backend::composer_media_load,
             backend::composer_media_discard,
             backend::sessions_get,
-            backend::sessions_is_blank,
             backend::session_goal_get,
             backend::session_goal_set,
             backend::session_goal_progress_update,
@@ -448,6 +459,10 @@ pub fn run() {
             mcp_registry::mcp_registry_list,
             mcp_registry::mcp_registry_get,
             mcp_registry::mcp_registry_remote_draft,
+            // One-click translation of displayed native service details uses
+            // the active provider model through the native credential path.
+            backend::get_active_translation_model,
+            backend::translate_text,
             // Local Skills, durable Memory, and native Cron services
             local_services::skills_list,
             local_services::skills_read,
@@ -505,6 +520,7 @@ pub fn run() {
             backend::chat_history_set_archived,
             backend::chat_history_bulk_set_archived,
             backend::chat_history_branch,
+            backend::chat_history_truncate,
             backend::chat_history_delete,
             backend::chat_history_bulk_delete,
             backend::chat_history_share_get,

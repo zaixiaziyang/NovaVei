@@ -12,6 +12,7 @@ const SURFACE_IDS = [
   "overlayMcp",
   "overlaySettings",
   "overlayCouncil",
+  "overlayTranslation",
   "searchPalette",
 ] as const;
 

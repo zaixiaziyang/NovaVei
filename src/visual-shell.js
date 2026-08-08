@@ -7,6 +7,7 @@
         mcp: document.getElementById("overlayMcp"),
         settings: document.getElementById("overlaySettings"),
         council: document.getElementById("overlayCouncil"),
+        translation: document.getElementById("overlayTranslation"),
       };
 
       const I18N = {
@@ -92,6 +93,8 @@
           "settings.navAria": "设置分区",
           "settings.nav.providers": "供应商",
           "settings.nav.system": "系统",
+          "settings.nav.security": "安全",
+          "settings.nav.permissions": "权限",
           "settings.nav.tools": "工具",
           "settings.tools.tabsAria": "工具类型",
           "settings.tools.tabMcp": "MCP",
@@ -249,6 +252,28 @@
           "settings.system.userColorCustom": "自定义",
           "settings.system.language": "语言",
           "settings.system.languageHint": "切换后设置面板与主界面文案会同步更新。",
+          "settings.security.title": "安全设置",
+          "settings.security.hint": "这些选项控制 Agent 运行时的高风险边界。原生端仍会对文件、Shell、浏览器、MCP 和权限授权做最终校验。",
+          "settings.security.requirePlan": "高风险操作需要执行计划",
+          "settings.security.requirePlanHelp": "写入、删除、Shell、MCP、浏览器操作和实现子任务会先展示结构化计划；执行后仍保留逐工具权限检查。",
+          "settings.security.allowGlobalRead": "允许子任务请求项目外只读",
+          "settings.security.allowGlobalReadHelp": "关闭时，子任务即使请求 GlobalRead 也会被拦截；开启后仍需要一次性权限批准，且只能读取单个文件，不能写入。",
+          "settings.security.boundaries": "当前边界",
+          "settings.security.boundaryWorkspace": "工作区文件、终端和 Git 操作绑定当前会话的项目根。",
+          "settings.security.boundaryFull": "完全访问不会保存为默认值，只能生成当前运行的一次性授权。",
+          "settings.security.boundarySecrets": "供应商密钥和 MCP 凭据由原生设置保存，界面只看到脱敏状态。",
+          "settings.permissions.title": "权限设置",
+          "settings.permissions.hint": "设置默认交互权限。当前项目的权限优先于新项目默认值；完全访问只在发送栏为单次运行临时启用。",
+          "settings.permissions.projectDefault": "当前项目默认权限",
+          "settings.permissions.newProjectDefault": "新项目默认权限",
+          "settings.permissions.newProjectHelp": "当项目尚未保存自己的权限偏好时使用此默认值。",
+          "settings.permissions.readonly": "只读",
+          "settings.permissions.ask": "请求批准",
+          "settings.permissions.projectRootLoading": "正在读取当前项目…",
+          "settings.permissions.noProject": "未打开已登记项目；当前项目权限暂不可保存。",
+          "settings.permissions.projectRoot": "当前项目：{path}",
+          "settings.permissions.savedProject": "已保存当前项目权限",
+          "settings.permissions.savedDefault": "已保存新项目默认权限",
           "settings.mcp.runtime": "MCP 运行时",
           "settings.mcp.hint": "MCP 配置与连接能力尚未接入。",
           "settings.mcp.openHub": "打开 MCP 中心",
@@ -285,15 +310,34 @@
           "settings.system.tabAppearance": "外观",
           "settings.system.tabBehavior": "行为",
           "settings.system.tabPortable": "便携",
+          "settings.system.tabSecurity": "安全",
           "settings.portable.title": "运行模式",
           "settings.portable.description": "选择应用在下次启动时使用本机数据目录，或使用 EXE 同级的便携数据目录。",
           "settings.portable.optionsAria": "选择运行模式",
           "settings.portable.installedTitle": "本机版",
           "settings.portable.installedDescription": "数据保存在当前 Windows 用户的应用数据目录中。",
           "settings.portable.portableTitle": "便携版",
-          "settings.portable.portableDescription": "数据保存在 EXE 同级的 novavei 文件夹中，并在启动时受密码保护。",
+          "settings.portable.portableDescription": "数据保存在 EXE 同级的 novavei 文件夹中，可在系统安全设置中决定是否需要启动密码。",
           "settings.portable.isolation": "切换不会移动、复制或删除现有对话、设置和凭据；两种模式的数据保持隔离。",
           "settings.portable.apply": "切换运行模式",
+          "settings.appSecurity.title": "启动密码",
+          "settings.appSecurity.description": "本机版和便携版都可以独立设置下次启动是否需要密码。",
+          "settings.appSecurity.requirement": "启动时需要密码",
+          "settings.appSecurity.off": "关闭",
+          "settings.appSecurity.on": "开启",
+          "settings.appSecurity.currentPassword": "当前密码",
+          "settings.appSecurity.newPassword": "新密码",
+          "settings.appSecurity.confirmPassword": "确认新密码",
+          "settings.appSecurity.recoveryIntro": "便携版首次开启启动密码时，需要同时设置三组安全问题，忘记密码时可用于恢复当前便携数据。",
+          "settings.appSecurity.recoveryQuestion1": "安全问题 1",
+          "settings.appSecurity.recoveryQuestion2": "安全问题 2",
+          "settings.appSecurity.recoveryQuestion3": "安全问题 3",
+          "settings.appSecurity.recoveryAnswer1": "答案 1",
+          "settings.appSecurity.recoveryAnswer2": "答案 2",
+          "settings.appSecurity.recoveryAnswer3": "答案 3",
+          "settings.appSecurity.passwordHelp": "密码至少 12 个字符；关闭密码不会删除对话或设置。",
+          "settings.appSecurity.refresh": "刷新状态",
+          "settings.appSecurity.save": "保存启动密码",
           "settings.system.uiFont": "界面字体",
           "settings.system.codeFont": "代码字体",
           "settings.system.fontSystem": "系统默认",
@@ -473,6 +517,8 @@
           "settings.navAria": "Settings sections",
           "settings.nav.providers": "Providers",
           "settings.nav.system": "System",
+          "settings.nav.security": "Security",
+          "settings.nav.permissions": "Permissions",
           "settings.nav.tools": "Tools",
           "settings.tools.tabsAria": "Tool types",
           "settings.tools.tabMcp": "MCP",
@@ -630,6 +676,28 @@
           "settings.system.userColorCustom": "Custom",
           "settings.system.language": "Language",
           "settings.system.languageHint": "Updates settings and shell labels immediately.",
+          "settings.security.title": "Security settings",
+          "settings.security.hint": "These options control high-risk Agent runtime boundaries. Native code still performs final checks for files, shell, browser, MCP, and permission grants.",
+          "settings.security.requirePlan": "Require an execution plan for high-risk actions",
+          "settings.security.requirePlanHelp": "Writes, deletes, shell, MCP, browser actions, and implementation subagents first show a structured plan. Per-tool permission checks still apply after Execute.",
+          "settings.security.allowGlobalRead": "Allow subagents to request outside-project read-only access",
+          "settings.security.allowGlobalReadHelp": "When off, subagent GlobalRead requests are blocked. When on, they still require one-use approval and can read only one file, never write.",
+          "settings.security.boundaries": "Current boundaries",
+          "settings.security.boundaryWorkspace": "Workspace files, terminal, and Git operations are bound to the current session project root.",
+          "settings.security.boundaryFull": "Full access is never saved as a default; it only mints a one-use grant for the current run.",
+          "settings.security.boundarySecrets": "Provider keys and MCP credentials are saved by native settings; the UI sees only redacted status.",
+          "settings.permissions.title": "Permission settings",
+          "settings.permissions.hint": "Set default interaction permissions. The current project preference wins over the new-project default. Full access remains a one-run choice in the composer.",
+          "settings.permissions.projectDefault": "Current project default permission",
+          "settings.permissions.newProjectDefault": "New project default permission",
+          "settings.permissions.newProjectHelp": "Used when a project has not saved its own permission preference.",
+          "settings.permissions.readonly": "Read-only",
+          "settings.permissions.ask": "Ask",
+          "settings.permissions.projectRootLoading": "Reading current project…",
+          "settings.permissions.noProject": "No registered project is open; current project permission cannot be saved yet.",
+          "settings.permissions.projectRoot": "Current project: {path}",
+          "settings.permissions.savedProject": "Current project permission saved",
+          "settings.permissions.savedDefault": "New project default permission saved",
           "settings.mcp.runtime": "MCP runtime",
           "settings.mcp.hint": "MCP configuration and connections are not connected yet.",
           "settings.mcp.openHub": "Open MCP Hub",
@@ -666,15 +734,34 @@
           "settings.system.tabAppearance": "Appearance",
           "settings.system.tabBehavior": "Behavior",
           "settings.system.tabPortable": "Portable",
+          "settings.system.tabSecurity": "Security",
           "settings.portable.title": "Run mode",
           "settings.portable.description": "Choose whether the next launch uses the installed app-data directory or the portable directory beside the EXE.",
           "settings.portable.optionsAria": "Choose run mode",
           "settings.portable.installedTitle": "Installed",
           "settings.portable.installedDescription": "Data stays in this Windows user's application-data directory.",
           "settings.portable.portableTitle": "Portable",
-          "settings.portable.portableDescription": "Data stays in the novavei folder beside the EXE and is password-protected at startup.",
+          "settings.portable.portableDescription": "Data stays in the novavei folder beside the EXE; System security controls whether startup requires a password.",
           "settings.portable.isolation": "Switching never moves, copies, or deletes existing chats, settings, or credentials; the two modes keep separate data.",
           "settings.portable.apply": "Switch run mode",
+          "settings.appSecurity.title": "Startup password",
+          "settings.appSecurity.description": "Installed and portable modes can each decide whether the next launch requires a password.",
+          "settings.appSecurity.requirement": "Require a password at startup",
+          "settings.appSecurity.off": "Off",
+          "settings.appSecurity.on": "On",
+          "settings.appSecurity.currentPassword": "Current password",
+          "settings.appSecurity.newPassword": "New password",
+          "settings.appSecurity.confirmPassword": "Confirm new password",
+          "settings.appSecurity.recoveryIntro": "When a portable build first enables a startup password, it also needs three recovery questions so a forgotten password can restore the current portable data.",
+          "settings.appSecurity.recoveryQuestion1": "Security question 1",
+          "settings.appSecurity.recoveryQuestion2": "Security question 2",
+          "settings.appSecurity.recoveryQuestion3": "Security question 3",
+          "settings.appSecurity.recoveryAnswer1": "Answer 1",
+          "settings.appSecurity.recoveryAnswer2": "Answer 2",
+          "settings.appSecurity.recoveryAnswer3": "Answer 3",
+          "settings.appSecurity.passwordHelp": "Password must contain at least 12 characters; disabling it does not delete chats or settings.",
+          "settings.appSecurity.refresh": "Refresh status",
+          "settings.appSecurity.save": "Save startup password",
           "settings.system.uiFont": "UI font",
           "settings.system.codeFont": "Code font",
           "settings.system.fontSystem": "System default",
@@ -936,8 +1023,15 @@
         else if (themePref !== "system") themePref = theme;
         syncThemeButton();
         syncThemeSeg();
+        window.dispatchEvent(new CustomEvent("novavei:theme-changed", {
+          detail: { theme, preference: themePref, silent: opts.silent === true },
+        }));
         if (opts.silent) return;
         toast(t("theme.switched") + " " + (theme === "light" ? "Light" : "Dark") + " · Luminous Quiet");
+      }
+      function toggleThemePreference() {
+        const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+        setTheme(next, { pref: next });
       }
       let uiScale = 100;
       let userAccent = "#0A84FF";
@@ -1678,6 +1772,7 @@
       });
 
       document.getElementById("btnSettings").addEventListener("click", () => openOverlay("settings"));
+      document.getElementById("btnTranslation").addEventListener("click", () => openOverlay("translation"));
       document.getElementById("openMcpFromSettings")?.addEventListener("click", () => openOverlay("mcp"));
       document.getElementById("openSkillsFromSettings")?.addEventListener("click", () => openOverlay("skills"));
 
@@ -2350,7 +2445,7 @@
 
       document.getElementById("btnCommand")?.addEventListener("click", openSearchPalette);
       document.getElementById("btnTheme")?.addEventListener("click", () => {
-        setTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
+        toggleThemePreference();
       });
 
       document.getElementById("sessionSearch")?.addEventListener("input", (e) => {
@@ -2535,9 +2630,12 @@
           const selected = btn.dataset.systemTab === name;
           btn.classList.toggle("on", selected);
           btn.setAttribute("aria-selected", String(selected));
+          btn.tabIndex = selected ? 0 : -1;
         });
         document.querySelectorAll("[data-system-panel]").forEach((panel) => {
-          panel.classList.toggle("on", panel.dataset.systemPanel === name);
+          const selected = panel.dataset.systemPanel === name;
+          panel.classList.toggle("on", selected);
+          panel.hidden = !selected;
         });
       }
       document.querySelectorAll("[data-system-tab]").forEach((btn) => {
@@ -4654,7 +4752,7 @@
         }
         if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "l") {
           e.preventDefault();
-          setTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
+          toggleThemePreference();
         }
       });
 
@@ -4689,6 +4787,8 @@
         let touchRevealed = !isCoarse;
         let markerBudget = isCoarse ? MAX_MARKERS_TOUCH : MAX_MARKERS;
         let floorsCache = [];
+        let jumpTargetMessageId = null;
+        let jumpRealignment = null;
 
         function conversationId() {
           const nativeHost = window.__novaveiHost;
@@ -4858,14 +4958,59 @@
         }
 
         function jumpTo(rowKey) {
-          const floor = floorsCache.find((f) => f.rowKey === rowKey);
+          let floor = floorsCache.find((f) => f.rowKey === rowKey);
           if (!floor?.el) return;
+          // Scroll to the floor element start. Track the target messageId so a
+          // virtual-window rebuild mid-flight can re-locate by identity rather
+          // than a stale DOM reference.
+          jumpTargetMessageId = floor.messageId || floor.rowKey;
           floor.el.scrollIntoView({ block: "start", behavior: "smooth" });
           activeRowKey = rowKey;
           if (isCoarse) setExpanded(false);
           else render();
-          // re-sync after smooth scroll settles
-          setTimeout(reportAnchor, 320);
+          // Multi-frame re-alignment: smooth scroll + any page-window rebuild
+          // settle over a few frames. Repeated reportAnchor/rAF pairs absorb
+          // WebView2 smooth-scroll latency and DPR rounding instead of relying
+          // on a single 320ms timer.
+          cancelJumpRealignment();
+          jumpRealignment = requestAnimationFrame(function align(frameCount) {
+            if (frameCount > 6) {
+              closeJumpRealignment();
+              return;
+            }
+            // If the DOM was rebuilt since we started, re-locate by identity.
+            const liveFloor = floorsCache.find(
+              (f) =>
+                messageIdOf(f.el) === jumpTargetMessageId ||
+                f.rowKey === jumpTargetMessageId,
+            );
+            if (liveFloor && liveFloor.el !== floor.el) {
+              floor = liveFloor;
+            }
+            if (liveFloor && liveFloor.el.isConnected) {
+              liveFloor.el.scrollIntoView({ block: "start", behavior: "auto" });
+            }
+            activeRowKey = liveFloor ? liveFloor.rowKey : rowKey;
+            reportAnchor();
+            render();
+            jumpRealignment = requestAnimationFrame(align.bind(null, frameCount + 1));
+          }, 0);
+        }
+
+        function messageIdOf(el) {
+          return el?.dataset?.messageId || el?.dataset?.floorId || null;
+        }
+
+        function cancelJumpRealignment() {
+          if (jumpRealignment != null) {
+            cancelAnimationFrame(jumpRealignment);
+            jumpRealignment = null;
+          }
+        }
+        function closeJumpRealignment() {
+          cancelAnimationFrame(jumpRealignment);
+          jumpRealignment = null;
+          jumpTargetMessageId = null;
         }
 
         function updateMarkerBudget() {
