@@ -680,6 +680,7 @@ impl SubagentStore {
         agent_identity_exists(&connection, session_id, agent_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn save_message(
         &self,
         id: &str,

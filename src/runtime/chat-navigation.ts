@@ -1,3 +1,9 @@
+import {
+  createScrollFollowState,
+  scrollFollow,
+  type FollowState,
+} from "./scroll-follow-core";
+
 const BOTTOM_THRESHOLD_PX = 72;
 const CONTROL_ID = "novaveiReturnToLatest";
 const STYLE_ID = "novaveiReturnToLatestStyles";
@@ -129,9 +135,12 @@ export function installTranscriptNavigation() {
   button.appendChild(label);
   stage.appendChild(button);
 
-  let followingLatest = isNearBottom(transcript);
+  let followingState: FollowState = createScrollFollowState();
   let scrollFrame: number | undefined;
   let contentFrame: number | undefined;
+  let lastScrollTop = transcript.scrollTop;
+
+  const trailing = () => followingState.trailing;
 
   const updateCopy = () => {
     const text = copy();
@@ -145,7 +154,10 @@ export function installTranscriptNavigation() {
   };
 
   const scrollToLatest = () => {
-    followingLatest = true;
+    followingState = scrollFollow(followingState, {
+      type: "history-key",
+      active: true,
+    }).state;
     transcript.scrollTop = transcript.scrollHeight;
     updateVisibility();
   };
@@ -154,7 +166,6 @@ export function installTranscriptNavigation() {
     if (scrollFrame !== undefined) return;
     scrollFrame = window.requestAnimationFrame(() => {
       scrollFrame = undefined;
-      followingLatest = isNearBottom(transcript);
       updateVisibility();
     });
   };
@@ -166,11 +177,11 @@ export function installTranscriptNavigation() {
       // A session load can replace the transcript and synchronously set its
       // scrollTop before observers run. Trust the actual viewport first.
       if (isNearBottom(transcript)) {
-        followingLatest = true;
+        followingState = createScrollFollowState();
         updateVisibility();
         return;
       }
-      if (followingLatest) {
+      if (trailing()) {
         scrollToLatest();
         return;
       }
@@ -193,14 +204,41 @@ export function installTranscriptNavigation() {
   );
 
   const onScroll = () => {
-    // Update this synchronously so a token-render MutationObserver queued in
-    // the same frame cannot yank a reader back down after they scroll upward.
-    if (!isNearBottom(transcript)) followingLatest = false;
+    // Feed the pure state machine. Update synchronously so a token-render
+    // MutationObserver queued in the same frame cannot yank a reader back
+    // down after they scroll upward.
+    const deltaY = transcript.scrollTop - lastScrollTop;
+    lastScrollTop = transcript.scrollTop;
+    const out = scrollFollow(followingState, {
+      type: "scroll",
+      deltaY,
+      scrollTop: transcript.scrollTop,
+      clientHeight: transcript.clientHeight,
+      scrollHeight: transcript.scrollHeight,
+    });
+    followingState = out.state;
+    // Note: mutation-observers reuse `trailing()` to decide whether to keep
+    // pulling latest; a reattach scroll is applied here via the decision.
+    if (out.decision.reason === "reattach") {
+      transcript.scrollTop = transcript.scrollHeight;
+    }
     queueViewportSync();
   };
   const onTranscriptContentChanged = () => queueContentReconciliation();
   const onLanguageChange = () => updateCopy();
   transcript.addEventListener("scroll", onScroll, { passive: true });
+  transcript.addEventListener("pointerdown", () => {
+    followingState = scrollFollow(followingState, {
+      type: "pointer",
+      phase: "down",
+    }).state;
+  });
+  transcript.addEventListener("pointerup", () => {
+    followingState = scrollFollow(followingState, {
+      type: "pointer",
+      phase: "up",
+    }).state;
+  });
   window.addEventListener(
     TRANSCRIPT_CONTENT_CHANGED_EVENT,
     onTranscriptContentChanged,

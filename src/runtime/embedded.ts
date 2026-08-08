@@ -47,7 +47,11 @@ import {
 } from "./pi/provider";
 import { preparePiProxyRequest, type PiInvoke } from "./pi/proxy";
 import { streamByApi } from "./pi/stream";
-import { isPlanGatedTool, PlanConfirmationGate } from "./plan-confirmation";
+import {
+  isPlanGatedTool,
+  PLAN_CONFIRMATION_SYSTEM_PROMPT,
+  PlanConfirmationGate,
+} from "./plan-confirmation";
 import type {
   PiContextLoader,
   PiNativeCancel,
@@ -108,7 +112,6 @@ function validateInteractiveToolRegistry(tools: readonly AgentTool[]) {
 export type EmbeddedPermissionMode =
   | "readonly"
   | "ask"
-  | "auto-approve"
   | "full";
 
 export type EmbeddedProviderConfig = PiProviderConfig;
@@ -224,6 +227,48 @@ export function globalSystemPromptFromSettings(
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
+function readBoolean(
+  record: RecordValue | undefined,
+  ...keys: string[]
+): boolean | undefined {
+  for (const key of keys) {
+    const value = record?.[key];
+    if (typeof value === "boolean") return value;
+  }
+  return undefined;
+}
+
+function securitySettingsFromSystem(system: unknown) {
+  const source = asRecord(system);
+  const security = asRecord(source?.security);
+  return {
+    requirePlanForMutableTools:
+      readBoolean(
+        security,
+        "requirePlanForMutableTools",
+        "require_plan_for_mutable_tools",
+      ) ??
+      readBoolean(
+        source,
+        "requirePlanForMutableTools",
+        "require_plan_for_mutable_tools",
+      ) ??
+      true,
+    allowSubagentGlobalRead:
+      readBoolean(
+        security,
+        "allowSubagentGlobalRead",
+        "allow_subagent_global_read",
+      ) ??
+      readBoolean(
+        source,
+        "allowSubagentGlobalRead",
+        "allow_subagent_global_read",
+      ) ??
+      false,
+  };
+}
+
 export function appendSystemPromptSection(
   basePrompt: string,
   section: string | undefined,
@@ -262,13 +307,6 @@ function normalisePermission(
 ): EmbeddedPermissionMode {
   const normalized = (value ?? "ask").trim().toLowerCase();
   if (normalized === "readonly" || normalized === "只读") return "readonly";
-  if (
-    normalized === "auto-approve" ||
-    normalized === "auto" ||
-    normalized === "替我审批"
-  ) {
-    return "auto-approve";
-  }
   if (normalized === "full" || normalized === "完全访问权限") return "full";
   return "ask";
 }
@@ -1198,11 +1236,15 @@ function createDelegateReadOnlyTool(
     Pick<PiRunHandle, "requestId" | "sessionId" | "conversationId" | "turnId">
   >,
   parentInput: PiRunInput,
+  subagentGlobalReadAllowed: boolean,
 ): AgentTool | undefined {
   if (!parentCapabilityToken) return undefined;
+  const globalReadPolicy = subagentGlobalReadAllowed
+    ? "Set allow_global_read to true only when the user asked for this child to inspect absolute paths outside the project: this always shows a separate confirmation and grants GlobalRead only to this task."
+    : "The app Security setting currently disables allow_global_read; keep it false and ask the user to enable that setting before any child inspects absolute paths outside the project.";
   return createTool(
     "DelegateReadOnly",
-    "Delegate one bounded read-only research task. The child can only ProjectRead, List, and Grep in the current workspace by default. Set agent_id to reuse a stable private research identity, and resume=true only when continuing that same identity's prior final report. Set allow_global_read to true only when the user asked for this child to inspect absolute paths outside the project: this always shows a separate confirmation and grants GlobalRead only to this task. The child can never write outside the project, run shell commands, use MCP/Skills/Memory/Cron, or delegate further.",
+    `Delegate one bounded read-only research task. The child can only ProjectRead, List, and Grep in the current workspace by default. Set agent_id to reuse a stable private research identity, and resume=true only when continuing that same identity's prior final report. ${globalReadPolicy} The child can never write outside the project, run shell commands, use MCP/Skills/Memory/Cron, or delegate further.`,
     Type.Object(
       {
         title: Type.String({ minLength: 1, maxLength: 120 }),
@@ -1225,6 +1267,11 @@ function createDelegateReadOnlyTool(
       const resume = input.resume === true;
       if (!title || !task)
         throw new Error("DelegateReadOnly requires title and task");
+      if (allowGlobalRead && !subagentGlobalReadAllowed) {
+        throw new Error(
+          "子任务项目外只读已被安全设置禁用；请先在设置中开启该权限。",
+        );
+      }
 
       const start = subagentStartResponse(
         await invoke("subagent_task_start", {
@@ -1349,11 +1396,15 @@ function createDelegateWorktreeTool(
     Pick<PiRunHandle, "requestId" | "sessionId" | "conversationId" | "turnId">
   >,
   parentInput: PiRunInput,
+  subagentGlobalReadAllowed: boolean,
 ): AgentTool | undefined {
   if (!parentCapabilityToken) return undefined;
+  const globalReadPolicy = subagentGlobalReadAllowed
+    ? "Set allow_global_read to true only when the user asked for this child to inspect absolute paths outside the project: the approval card explicitly includes it and grants GlobalRead only to this task."
+    : "The app Security setting currently disables allow_global_read; keep it false and ask the user to enable that setting before any child inspects absolute paths outside the project.";
   return createTool(
     "DelegateWorktree",
-    "Delegate one bounded implementation task to an isolated Git worktree. This always requires explicit user approval. Set agent_id to reuse a stable private implementation identity, and resume=true only when continuing that same identity's prior final report. The child can use ProjectRead, List, Grep, Write, Edit, and Delete in its detached checkout. Set allow_global_read to true only when the user asked for this child to inspect absolute paths outside the project: the approval card explicitly includes it and grants GlobalRead only to this task. The child can never write outside the project, run shell commands, use MCP/Skills/Memory/Cron, update goals, or delegate further. Its patch is collected for review and is never applied automatically.",
+    `Delegate one bounded implementation task to an isolated Git worktree. This always requires explicit user approval. Set agent_id to reuse a stable private implementation identity, and resume=true only when continuing that same identity's prior final report. The child can use ProjectRead, List, Grep, Write, Edit, and Delete in its detached checkout. ${globalReadPolicy} The child can never write outside the project, run shell commands, use MCP/Skills/Memory/Cron, update goals, or delegate further. Its patch is collected for review and is never applied automatically.`,
     Type.Object(
       {
         title: Type.String({ minLength: 1, maxLength: 120 }),
@@ -1376,6 +1427,11 @@ function createDelegateWorktreeTool(
       const resume = input.resume === true;
       if (!title || !task)
         throw new Error("DelegateWorktree requires title and task");
+      if (allowGlobalRead && !subagentGlobalReadAllowed) {
+        throw new Error(
+          "子任务项目外只读已被安全设置禁用；请先在设置中开启该权限。",
+        );
+      }
 
       const start = worktreeSubagentStartResponse(
         await invoke("worktree_task_start", {
@@ -2046,21 +2102,16 @@ class PermissionBroker {
     );
     const risk = sensitiveWorkspaceRead ? "high" : toolRisk(name);
     const lowRisk = risk === "low";
-    // Full mode is the user's explicit exception; Ask and auto-approve still
-    // require a one-use approval for credential-bearing paths. The native
-    // command repeats this check and remains the final authority.
+    // Full mode is the user's explicit exception. Ask mode still requires a
+    // one-use approval for credential-bearing paths. The native command
+    // repeats this check and remains the final authority.
     const requiresApproval =
       requiresExplicitUserApproval(name, context.args) ||
       (sensitiveWorkspaceRead && this.mode !== "full");
     // Non-sensitive inspection and the native-bounded goal progress update are
-    // safe under all four UI modes. Credential-bearing paths are an exception.
+    // safe under all three UI modes. Credential-bearing paths are an exception.
     if (lowRisk && !requiresApproval) return undefined;
-    if (
-      !requiresApproval &&
-      (this.mode === "full" ||
-        (this.mode === "auto-approve" && risk === "medium"))
-    )
-      return undefined;
+    if (!requiresApproval && this.mode === "full") return undefined;
     if (this.mode === "readonly")
       return { block: true, reason: "当前权限为只读，已阻止该工具。" };
     const id = context.toolCall.id;
@@ -2960,15 +3011,25 @@ export function createEmbeddedPiTransport(
         loadedContext?.systemPrompt ??
         options.systemPrompt ??
         "You are NovaVei.";
+      const securitySettings = securitySettingsFromSystem(settings.system);
+      const requirePlanForMutableTools =
+        runKind === "interactive" &&
+        securitySettings.requirePlanForMutableTools;
       const promptWithGlobalSetting = appendSystemPromptSection(
         baseSystemPrompt,
         globalSystemPromptFromSettings(settings.system),
+      );
+      const promptWithPlanPolicy = appendSystemPromptSection(
+        promptWithGlobalSetting,
+        requirePlanForMutableTools
+          ? PLAN_CONFIRMATION_SYSTEM_PROMPT
+          : undefined,
       );
       const context: Context = {
         messages: loadedContext?.messages ?? [],
         systemPrompt: appendSystemPromptSection(
           appendSystemPromptSection(
-            promptWithGlobalSetting,
+            promptWithPlanPolicy,
             BROWSER_AGENT_SYSTEM_PROMPT,
           ),
           localServices.systemPromptAppendix,
@@ -2995,6 +3056,7 @@ export function createEmbeddedPiTransport(
         capabilityToken,
         handle,
         approvedNativeInput,
+        securitySettings.allowSubagentGlobalRead,
       );
       if (delegateReadOnly) parentTools.push(delegateReadOnly);
       const delegateWorktree = createDelegateWorktreeTool(
@@ -3003,6 +3065,7 @@ export function createEmbeddedPiTransport(
         capabilityToken,
         handle,
         approvedNativeInput,
+        securitySettings.allowSubagentGlobalRead,
       );
       if (delegateWorktree) parentTools.push(delegateWorktree);
       if (runKind === "interactive")
@@ -3023,9 +3086,10 @@ export function createEmbeddedPiTransport(
         contextFit.metadata.compaction = manualCompaction;
       const boundedContext = contextFit.context;
       const turnReasoning = effectiveInput.reasoning ?? config.reasoning;
-      // Plan-review cards are intentionally disabled. Native per-tool
-      // permission checks below remain the authority for risky operations.
-      const plan = new PlanConfirmationGate(approvedPlanContinuation, false);
+      const plan = new PlanConfirmationGate(
+        approvedPlanContinuation,
+        requirePlanForMutableTools,
+      );
       const agent = new Agent({
         initialState: {
           systemPrompt: boundedContext.systemPrompt ?? "You are NovaVei.",
@@ -3049,15 +3113,29 @@ export function createEmbeddedPiTransport(
           }),
         getApiKey: () => runtimeApiKey,
         beforeToolCall: async (toolContext, signal) => {
-          // PermissionBroker and the native capability boundary are the only
-          // remaining approval path. Full access reaches this check as
-          // `full`, so ordinary tool calls do not create a confirmation card.
+          const planBlock = await plan.checkTool(
+            toolContext.toolCall.name,
+            toolContext.args,
+            signal,
+          );
+          if (planBlock) return planBlock;
           const permissionBlock = await permission.check(
             toolContext,
             signal,
             handle,
           );
           if (permissionBlock) return permissionBlock;
+          if (
+            !plan.canProceedAfterPermission(
+              toolContext.toolCall.name,
+              toolContext.args,
+            )
+          ) {
+            return {
+              block: true,
+              reason: "执行计划确认已失效；本轮写入或命令未执行。",
+            };
+          }
           return undefined;
         },
         toolExecution: "sequential",

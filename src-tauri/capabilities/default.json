@@ -32,6 +32,7 @@
     "allow-settings",
     "allow-mcp-runtime",
     "allow-mcp-registry",
+    "allow-translation",
     "allow-local-services",
     "allow-skills-catalog",
     "allow-chat-history",

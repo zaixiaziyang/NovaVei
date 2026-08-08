@@ -846,6 +846,183 @@ impl HistoryStore {
             .map_err(|error| format!("count history messages: {error}"))
     }
 
+    /// Truncate a session's durable transcript at an anchor message (inclusive).
+    ///
+    /// Everything at or after `anchor_message_id` in the chronologically
+    /// ordered transcript is removed from the durable store: messages, their
+    /// turns, turn events, tool calls, permission requests, and any segmented
+    /// checkpoint that referenced the removed tail. The session row itself is
+    /// retained (the caller resends from the anchor afterwards).
+    ///
+    /// The anchor must already exist in the messages table; otherwise an error
+    /// is returned and nothing is written.
+    pub fn truncate_session(
+        &self,
+        session_id: &str,
+        anchor_message_id: &str,
+    ) -> Result<usize, String> {
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("begin session truncate: {error}"))?;
+
+        // Locate the anchor with the same ordering used when reading a page.
+        let anchor = transaction
+            .query_row(
+                "SELECT id, created_at FROM messages
+                 WHERE session_id = ?1 AND id = ?2",
+                params![session_id, anchor_message_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("find truncate anchor: {error}"))?;
+        let Some((_anchor_id, anchor_created_at)) = anchor else {
+            return Err("history truncate anchor message not found".to_string());
+        };
+
+        // Remove the anchor and everything after it (created_at is the page
+        // sort key; id is the tie-breaker for messages sharing a timestamp).
+        let removed = transaction
+            .execute(
+                "DELETE FROM messages
+                 WHERE session_id = ?1
+                   AND (created_at > ?2 OR (created_at = ?2 AND id >= ?3))",
+                params![session_id, anchor_created_at, anchor_message_id],
+            )
+            .map_err(|error| format!("truncate history messages: {error}"))?;
+
+        // Turns belonging to the removed tail can no longer be traced back to
+        // a kept message. Remove them and their audit rows together.
+        let mut kept_turn_statement = transaction
+            .prepare(
+                "SELECT DISTINCT turn_id FROM messages
+                 WHERE session_id = ?1 AND turn_id IS NOT NULL",
+            )
+            .map_err(|error| format!("prepare kept turn ids: {error}"))?;
+        let kept_turn_ids = kept_turn_statement
+            .query_map(params![session_id], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("query kept turn ids: {error}"))?;
+        let kept_turn_ids = kept_turn_ids
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read kept turn ids: {error}"))?;
+        drop(kept_turn_statement);
+
+        if !kept_turn_ids.is_empty() {
+            // Build a dynamic IN-list. SQLite caps parameters at 999; a kept
+            // turn set that large is unrealistic for a single session, but the
+            // check keeps the query construction honest.
+            if kept_turn_ids.len() > 900 {
+                return Err("history truncate turn set is unexpectedly large".to_string());
+            }
+            let placeholders = vec!["?"; kept_turn_ids.len()].join(", ");
+            let mut delete_events = transaction
+                .prepare(&format!(
+                    "DELETE FROM turn_events
+                     WHERE session_id = ?1 AND turn_id NOT IN ({placeholders})"
+                ))
+                .map_err(|error| format!("prepare orphan turn events: {error}"))?;
+            delete_events
+                .execute(rusqlite::params_from_iter(
+                    std::iter::once(session_id).chain(kept_turn_ids.iter().map(String::as_str)),
+                ))
+                .map_err(|error| format!("truncate orphan turn events: {error}"))?;
+            drop(delete_events);
+
+            let mut delete_calls = transaction
+                .prepare(&format!(
+                    "DELETE FROM tool_calls
+                     WHERE session_id = ?1 AND turn_id NOT IN ({placeholders})"
+                ))
+                .map_err(|error| format!("prepare orphan tool calls: {error}"))?;
+            delete_calls
+                .execute(rusqlite::params_from_iter(
+                    std::iter::once(session_id).chain(kept_turn_ids.iter().map(String::as_str)),
+                ))
+                .map_err(|error| format!("truncate orphan tool calls: {error}"))?;
+            drop(delete_calls);
+
+            let mut delete_permissions = transaction
+                .prepare(&format!(
+                    "DELETE FROM permission_requests
+                     WHERE session_id = ?1 AND turn_id NOT IN ({placeholders})"
+                ))
+                .map_err(|error| format!("prepare orphan permissions: {error}"))?;
+            delete_permissions
+                .execute(rusqlite::params_from_iter(
+                    std::iter::once(session_id).chain(kept_turn_ids.iter().map(String::as_str)),
+                ))
+                .map_err(|error| format!("truncate orphan permissions: {error}"))?;
+            drop(delete_permissions);
+
+            let mut delete_turns = transaction
+                .prepare(&format!(
+                    "DELETE FROM turns
+                     WHERE session_id = ?1 AND id NOT IN ({placeholders})"
+                ))
+                .map_err(|error| format!("prepare orphan turns: {error}"))?;
+            delete_turns
+                .execute(rusqlite::params_from_iter(
+                    std::iter::once(session_id).chain(kept_turn_ids.iter().map(String::as_str)),
+                ))
+                .map_err(|error| format!("truncate orphan turns: {error}"))?;
+            drop(delete_turns);
+        } else {
+            transaction
+                .execute(
+                    "DELETE FROM turn_events WHERE session_id = ?1",
+                    params![session_id],
+                )
+                .map_err(|error| format!("truncate turn events: {error}"))?;
+            transaction
+                .execute(
+                    "DELETE FROM tool_calls WHERE session_id = ?1",
+                    params![session_id],
+                )
+                .map_err(|error| format!("truncate tool calls: {error}"))?;
+            transaction
+                .execute(
+                    "DELETE FROM permission_requests WHERE session_id = ?1",
+                    params![session_id],
+                )
+                .map_err(|error| format!("truncate permissions: {error}"))?;
+            transaction
+                .execute(
+                    "DELETE FROM turns WHERE session_id = ?1",
+                    params![session_id],
+                )
+                .map_err(|error| format!("truncate turns: {error}"))?;
+        }
+
+        // The segmented checkpoint (if any) is a materialized projection of the
+        // full transcript; it is stale once the tail is removed.
+        transaction
+            .execute(
+                "DELETE FROM history_segment_headers WHERE conversation_id = ?1",
+                params![session_id],
+            )
+            .map_err(|error| format!("truncate segment headers: {error}"))?;
+        transaction
+            .execute(
+                "DELETE FROM history_segments WHERE conversation_id = ?1",
+                params![session_id],
+            )
+            .map_err(|error| format!("truncate history segments: {error}"))?;
+
+        // A manual context-compaction summary references removed messages;
+        // treat it as stale so the next run re-compacts from the real tail.
+        transaction
+            .execute(
+                "DELETE FROM session_context_compactions WHERE session_id = ?1",
+                params![session_id],
+            )
+            .map_err(|error| format!("truncate context compaction: {error}"))?;
+
+        transaction
+            .commit()
+            .map_err(|error| format!("commit session truncate: {error}"))?;
+        Ok(removed)
+    }
+
     /// Return the two transcript fields needed to validate a segmented
     /// checkpoint without reading or decrypting any message content.
     fn load_message_checkpoint(&self, session_id: &str) -> Result<(i64, Option<String>), String> {
@@ -884,22 +1061,6 @@ impl HistoryStore {
             .map_err(|error| format!("query history message counts: {error}"))?;
         rows.collect::<Result<HashMap<_, _>, _>>()
             .map_err(|error| format!("read history message counts: {error}"))
-    }
-
-    /// True when the session has at least one user-authored message.
-    pub fn has_user_message(&self, session_id: &str) -> Result<bool, String> {
-        let connection = self.open()?;
-        let found = connection
-            .query_row(
-                "SELECT 1 FROM messages
-                 WHERE session_id = ?1 AND role IN ('user', 'User')
-                 LIMIT 1",
-                params![session_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|error| format!("probe user message: {error}"))?;
-        Ok(found.is_some())
     }
 
     /// True when the durable message row is an assistant reply for the given turn.
@@ -5150,6 +5311,196 @@ mod tests {
     }
 
     #[test]
+    fn truncate_session_removes_anchor_and_tail_and_orphan_audit_rows() {
+        let (store, path) = test_store();
+        let session = sample_session("truncate-session", "Truncate");
+        // user(anchor) → assistant turn-a → user → assistant turn-b
+        let messages = vec![
+            StoredMessage {
+                id: "user-anchor".to_string(),
+                session_id: session.id.clone(),
+                role: "user".to_string(),
+                content: "first request (anchor)".to_string(),
+                created_at: 10,
+                turn_id: None,
+            },
+            StoredMessage {
+                id: "assistant-tail-a".to_string(),
+                session_id: session.id.clone(),
+                role: "assistant".to_string(),
+                content: "old answer".to_string(),
+                created_at: 20,
+                turn_id: Some("turn-a".to_string()),
+            },
+            StoredMessage {
+                id: "user-later".to_string(),
+                session_id: session.id.clone(),
+                role: "user".to_string(),
+                content: "second request".to_string(),
+                created_at: 30,
+                turn_id: None,
+            },
+            StoredMessage {
+                id: "assistant-tail-b".to_string(),
+                session_id: session.id.clone(),
+                role: "assistant".to_string(),
+                content: "second answer".to_string(),
+                created_at: 40,
+                turn_id: Some("turn-b".to_string()),
+            },
+        ];
+        store
+            .upsert_session_projection(&session, &messages)
+            .unwrap();
+        store.upsert_turn(
+            &session.id,
+            &session.id,
+            "turn-a",
+            "request-a",
+            "completed",
+            None,
+            None,
+            None,
+            None,
+            20,
+        )
+        .unwrap();
+        store.upsert_turn(
+            &session.id,
+            &session.id,
+            "turn-b",
+            "request-b",
+            "completed",
+            None,
+            None,
+            None,
+            None,
+            40,
+        )
+        .unwrap();
+
+        // Truncate at "user-anchor": that message and everything after goes.
+        let removed = store.truncate_session(&session.id, "user-anchor").unwrap();
+        assert!(removed >= 3, "anchor + tail should be removed, got {removed}");
+
+        let remaining = store.load_messages(&session.id).unwrap();
+        assert_eq!(remaining.len(), 0, "anchor itself is removed");
+
+        // All turns for the removed tail are gone.
+        let connection = store.open().unwrap();
+        let turn_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM turns WHERE session_id = ?1",
+                params![session.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(turn_count, 0, "orphan turns removed");
+
+        // Re-seed with a kept prefix and confirm truncation preserves it.
+        let prefix = vec![
+            StoredMessage {
+                id: "kept-user".to_string(),
+                session_id: session.id.clone(),
+                role: "user".to_string(),
+                content: "kept request".to_string(),
+                created_at: 5,
+                turn_id: None,
+            },
+            StoredMessage {
+                id: "kept-assistant".to_string(),
+                session_id: session.id.clone(),
+                role: "assistant".to_string(),
+                content: "kept answer".to_string(),
+                created_at: 6,
+                turn_id: Some("turn-kept".to_string()),
+            },
+            StoredMessage {
+                id: "tail-anchor".to_string(),
+                session_id: session.id.clone(),
+                role: "user".to_string(),
+                content: "anchor".to_string(),
+                created_at: 7,
+                turn_id: None,
+            },
+            StoredMessage {
+                id: "tail-after".to_string(),
+                session_id: session.id.clone(),
+                role: "assistant".to_string(),
+                content: "after anchor".to_string(),
+                created_at: 8,
+                turn_id: Some("turn-tail".to_string()),
+            },
+        ];
+        store
+            .upsert_session_projection(&session, &prefix)
+            .unwrap();
+        store
+            .upsert_turn(
+                &session.id,
+                &session.id,
+                "turn-kept",
+                "request-kept",
+                "completed",
+                None,
+                None,
+                None,
+                None,
+                6,
+            )
+            .unwrap();
+        store
+            .upsert_turn(
+                &session.id,
+                &session.id,
+                "turn-tail",
+                "request-tail",
+                "completed",
+                None,
+                None,
+                None,
+                None,
+                8,
+            )
+            .unwrap();
+
+        let _ = store
+            .truncate_session(&session.id, "tail-anchor")
+            .unwrap();
+        let remaining = store.load_messages(&session.id).unwrap();
+        let ids = remaining.iter().map(|m| m.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(ids, vec!["kept-user", "kept-assistant"]);
+
+        let turn_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM turns WHERE session_id = ?1",
+                params![session.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(turn_count, 1, "turn-kept survives, turn-tail removed");
+        let kept_turn: String = connection
+            .query_row(
+                "SELECT id FROM turns WHERE session_id = ?1",
+                params![session.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept_turn, "turn-kept");
+
+        // Truncating a nonexistent anchor leaves the transcript untouched.
+        let err = store
+            .truncate_session(&session.id, "does-not-exist")
+            .unwrap_err();
+        assert!(err.contains("anchor"));
+
+        drop(connection);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
     fn replace_snapshot_still_clears_empty_corpus() {
         let (store, path) = test_store();
         let session = sample_session("session-clear", "clear");
@@ -5225,8 +5576,6 @@ mod tests {
             store.load_message_checkpoint(&session_b.id).unwrap(),
             (1, Some("b-0".to_string()))
         );
-        assert!(store.has_user_message(&session_a.id).unwrap());
-        assert!(store.has_user_message(&session_b.id).unwrap());
 
         let recent = store.load_messages_recent(&session_a.id, 2).unwrap();
         assert_eq!(recent.total_count, 5);

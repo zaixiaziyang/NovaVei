@@ -250,6 +250,10 @@ export class PiRuntimeController implements PiRuntimePublicApi {
     return this.visibleState();
   }
 
+  getSessionState(sessionId?: string) {
+    return this.visibleState(sessionKey(sessionId));
+  }
+
   subscribe(listener: StateListener) {
     this.listeners.add(listener);
     listener(this.getState());

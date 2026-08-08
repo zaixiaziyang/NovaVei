@@ -2,8 +2,20 @@ type PortableStorageStatus = {
   portable: boolean;
   initialized: boolean;
   unlocked: boolean;
+  passwordRequired: boolean;
+  passwordConfigured: boolean;
   recoveryConfigured: boolean;
   recoveryQuestions: string[];
+};
+
+type AppSecurityStatus = {
+  portable: boolean;
+  passwordRequired: boolean;
+  passwordConfigured: boolean;
+  unlocked: boolean;
+  portableInitialized: boolean;
+  portableRecoveryConfigured: boolean;
+  portableRecoveryQuestions: string[];
 };
 
 type PortableRecoverySetup = {
@@ -11,7 +23,7 @@ type PortableRecoverySetup = {
   answers: string[];
 };
 
-type PortableFlow = "unlock" | "setup" | "recover";
+type PortableFlow = "choose" | "appUnlock" | "unlock" | "setup" | "recover";
 
 type Invoke = <T = unknown>(
   command: string,
@@ -28,6 +40,11 @@ const PORTABLE_STORAGE_ERROR_COPY: Readonly<Record<string, string>> = {
   "portable storage password cannot contain control characters":
     "便携库密码不能包含控制字符。",
   "portable storage password is incorrect": "便携库密码不正确，请重试。",
+  "portable storage password is required": "此便携库需要密码解锁。",
+  "portable storage password is not configured": "此便携库尚未设置可用密码。",
+  "new portable storage password is required": "请设置新的便携库密码。",
+  "current portable storage password is required before changing it":
+    "更改便携库密码设置前，请输入当前密码。",
   "portable storage password is incorrect or data is damaged":
     "便携库密码不正确，或便携数据已损坏。",
   "portable recovery answers are incorrect or data is damaged":
@@ -58,6 +75,17 @@ const PORTABLE_STORAGE_ERROR_COPY: Readonly<Record<string, string>> = {
     "当前版本不支持此便携数据配置。",
   "portable storage configuration is unavailable for recovery":
     "无法读取便携库恢复配置。",
+  "portable storage configuration is damaged": "便携数据配置已损坏。",
+  "application password is required": "请输入启动密码。",
+  "application password is incorrect": "启动密码不正确，请重试。",
+  "application password is not configured": "启动密码尚未设置。",
+  "current application password is required before changing it":
+    "更改启动密码前，请输入当前密码。",
+  "current application password is required before disabling it":
+    "关闭启动密码前，请输入当前密码。",
+  "application security configuration is invalid": "启动密码配置无效。",
+  "application security configuration version is unsupported":
+    "当前版本不支持此启动密码配置。",
 };
 
 function isEnglishInterface(): boolean {
@@ -159,6 +187,9 @@ export async function installPortableStorageGate(): Promise<boolean> {
   const visibility = document.getElementById(
     "portableStoragePasswordVisibility",
   ) as HTMLButtonElement | null;
+  const passwordWrap = password?.closest<HTMLElement>(
+    ".portable-storage-password",
+  );
   const recoveryFields = document.getElementById(
     "portableStorageRecoveryFields",
   );
@@ -196,8 +227,16 @@ export async function installPortableStorageGate(): Promise<boolean> {
   }
 
   let flow: PortableFlow = "unlock";
-  let status: PortableStorageStatus;
+  let status: AppSecurityStatus;
   let submitLabel = "继续";
+  let choiceButtons: HTMLButtonElement[] = [];
+  let resolveGate: ((value: boolean) => void) | undefined;
+  const finishGate = () => {
+    gate.hidden = true;
+    const resolve = resolveGate;
+    resolveGate = undefined;
+    resolve?.(true);
+  };
   const showError = (value: string) => {
     error.textContent = value;
     error.hidden = false;
@@ -209,7 +248,7 @@ export async function installPortableStorageGate(): Promise<boolean> {
   const setBusy = (busy: boolean) => {
     submit.disabled = busy;
     gate.setAttribute("aria-busy", String(busy));
-    submit.textContent = busy ? "正在解锁…" : submitLabel;
+    submit.textContent = busy ? "正在处理…" : submitLabel;
   };
   const clearSensitiveFields = () => {
     password.value = "";
@@ -218,6 +257,63 @@ export async function installPortableStorageGate(): Promise<boolean> {
       .forEach((input) => {
         input.value = "";
       });
+  };
+  const setPasswordVisible = (visible: boolean) => {
+    if (passwordLabel) passwordLabel.hidden = !visible;
+    if (passwordWrap) passwordWrap.hidden = !visible;
+    if (passwordHint) passwordHint.hidden = !visible;
+    if (visibility) visibility.hidden = !visible;
+  };
+  const setSubmitVisible = (visible: boolean) => {
+    submit.hidden = !visible;
+  };
+  const renderChoiceButtons = () => {
+    recoveryFields.replaceChildren();
+    recoveryFields.hidden = false;
+    const intro = document.createElement("p");
+    intro.textContent =
+      "你可以选择让便携版在启动时直接打开，或者继续使用密码。";
+    recoveryFields.appendChild(intro);
+
+    const createChoice = (label: string, hint: string, action: () => void) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "portable-storage-recovery-link";
+      button.textContent = label;
+      button.addEventListener("click", action);
+      const note = document.createElement("p");
+      note.textContent = hint;
+      note.style.marginTop = "0";
+      recoveryFields.append(button, note);
+      choiceButtons.push(button);
+      return button;
+    };
+
+    choiceButtons = [];
+    createChoice(
+      "不需要启动密码",
+      "便携数据将改为自动解锁；数据目录中会保留自动解锁材料。",
+      () => {
+        clearError();
+        setBusy(true);
+        void invoke<AppSecurityStatus>("app_security_unlock", {})
+          .then((next) => {
+            if (!next.unlocked) {
+              throw new Error("便携数据尚未解锁，请重试。");
+            }
+            finishGate();
+          })
+          .catch((unlockError) => {
+            showError(message(unlockError));
+            setBusy(false);
+          });
+      },
+    );
+    createChoice(
+      "设置启动密码",
+      "仍然可以在之后关闭密码，或在设置里重新修改。",
+      () => showFlow("setup"),
+    );
   };
   const setupFields = () => {
     recoveryFields.replaceChildren();
@@ -270,7 +366,7 @@ export async function installPortableStorageGate(): Promise<boolean> {
       minLength: 12,
       maxLength: 1024,
     });
-    status.recoveryQuestions.forEach((question, index) => {
+    status.portableRecoveryQuestions.forEach((question, index) => {
       appendInput(recoveryFields, {
         id: `portableStorageRecoveryAnswer${index + 1}`,
         label: `问题 ${index + 1}：${question}`,
@@ -313,6 +409,7 @@ export async function installPortableStorageGate(): Promise<boolean> {
     flow = next;
     clearSensitiveFields();
     clearError();
+    setBusy(false);
     password.type = "password";
     visibility?.setAttribute("aria-pressed", "false");
     if (visibility) visibility.textContent = "显示";
@@ -321,7 +418,26 @@ export async function installPortableStorageGate(): Promise<boolean> {
     recoveryFields.hidden = true;
     recoveryFields.replaceChildren();
 
-    if (next === "unlock") {
+    if (next === "choose") {
+      title.textContent = "选择便携启动密码";
+      description.textContent =
+        "便携版可以选择不输入密码直接启动，也可以继续使用密码保护。";
+      submitLabel = "继续";
+      setPasswordVisible(false);
+      setSubmitVisible(false);
+      renderChoiceButtons();
+      window.requestAnimationFrame(() => choiceButtons[0]?.focus());
+    } else if (next === "appUnlock") {
+      title.textContent = "输入启动密码";
+      description.textContent = "此密码用于打开本机版的 NovaVei。";
+      passwordLabel.textContent = "启动密码";
+      password.autocomplete = "current-password";
+      passwordHint.textContent = "密码至少 12 个字符。";
+      submitLabel = "解锁并继续";
+      setPasswordVisible(true);
+      setSubmitVisible(true);
+      window.requestAnimationFrame(() => password.focus());
+    } else if (next === "unlock") {
       title.textContent = "解锁便携数据";
       description.textContent =
         "此便携版的数据位于 EXE 同级 novavei 文件夹。输入密码后才会加载对话和设置。";
@@ -329,9 +445,12 @@ export async function installPortableStorageGate(): Promise<boolean> {
       password.autocomplete = "current-password";
       passwordHint.textContent = "密码至少 12 个字符；它不会写入便携盘。";
       submitLabel = "解锁并继续";
-      forgotPassword.hidden = !status.recoveryConfigured;
+      setPasswordVisible(true);
+      setSubmitVisible(true);
+      forgotPassword.hidden = !status.portableRecoveryConfigured;
+      window.requestAnimationFrame(() => password.focus());
     } else if (next === "setup") {
-      const isNewPortableStore = !status.initialized;
+      const isNewPortableStore = !status.portableInitialized;
       title.textContent = isNewPortableStore
         ? "创建便携数据密码"
         : "设置便携数据恢复方式";
@@ -347,7 +466,10 @@ export async function installPortableStorageGate(): Promise<boolean> {
       passwordHint.textContent =
         "密码至少 12 个字符；它不会写入便携盘。请妥善保存三题答案。";
       submitLabel = isNewPortableStore ? "创建并继续" : "设置恢复方式并继续";
+      setPasswordVisible(true);
+      setSubmitVisible(true);
       setupFields();
+      window.requestAnimationFrame(() => password.focus());
     } else {
       title.textContent = "通过安全问题恢复密码";
       description.textContent =
@@ -356,32 +478,54 @@ export async function installPortableStorageGate(): Promise<boolean> {
       password.autocomplete = "new-password";
       passwordHint.textContent = "新密码至少 12 个字符；它不会写入便携盘。";
       submitLabel = "恢复并解锁";
+      setPasswordVisible(true);
+      setSubmitVisible(true);
       recoveryBack.hidden = false;
       recoveryFieldsForConfiguredQuestions();
+      window.requestAnimationFrame(() => password.focus());
     }
     submit.textContent = submitLabel;
     form.hidden = false;
     gate.removeAttribute("aria-busy");
-    window.requestAnimationFrame(() => password.focus());
   };
 
   try {
-    status = await invoke<PortableStorageStatus>("portable_storage_status");
+    status = await invoke<AppSecurityStatus>("app_security_status");
   } catch (invokeError) {
-    title.textContent = "无法确认便携数据状态";
+    title.textContent = "无法确认启动安全状态";
     description.textContent = "请关闭应用，检查本机存储权限后重试。";
     showError(message(invokeError));
     gate.removeAttribute("aria-busy");
     return false;
   }
-  if (!status.portable || status.unlocked) {
+  if (!status.portable) {
+    if (!status.passwordRequired || status.unlocked) {
+      gate.hidden = true;
+      return true;
+    }
+    showFlow("appUnlock");
+  } else if (status.unlocked) {
     gate.hidden = true;
     return true;
+  } else if (!status.portableInitialized) {
+    showFlow("choose");
+  } else if (!status.passwordRequired) {
+    setBusy(true);
+    try {
+      const next = await invoke<AppSecurityStatus>("app_security_unlock", {});
+      if (!next.unlocked) {
+        throw new Error("便携数据尚未解锁，请重试。");
+      }
+      gate.hidden = true;
+      return true;
+    } catch (unlockError) {
+      setBusy(false);
+      showError(message(unlockError));
+      return false;
+    }
+  } else {
+    showFlow("unlock");
   }
-
-  showFlow(
-    !status.initialized || !status.recoveryConfigured ? "setup" : "unlock",
-  );
   visibility?.addEventListener("click", () => {
     const visible = password.type === "text";
     password.type = visible ? "password" : "text";
@@ -392,7 +536,10 @@ export async function installPortableStorageGate(): Promise<boolean> {
     password.focus();
   });
   forgotPassword.addEventListener("click", () => {
-    if (!status.recoveryConfigured || status.recoveryQuestions.length !== 3) {
+    if (
+      !status.portableRecoveryConfigured ||
+      status.portableRecoveryQuestions.length !== 3
+    ) {
       showError("此便携库尚未完成三道安全问题设置，无法恢复密码。");
       return;
     }
@@ -401,6 +548,7 @@ export async function installPortableStorageGate(): Promise<boolean> {
   recoveryBack.addEventListener("click", () => showFlow("unlock"));
 
   return new Promise<boolean>((resolve) => {
+    resolveGate = resolve;
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       if (submit.disabled) return;
@@ -424,22 +572,25 @@ export async function installPortableStorageGate(): Promise<boolean> {
       clearError();
       setBusy(true);
       const request =
-        flow === "recover"
-          ? invoke<PortableStorageStatus>("portable_storage_recover", {
-              answers,
-              newPassword: suppliedPassword,
-            })
-          : invoke<PortableStorageStatus>("portable_storage_unlock", {
+        flow === "appUnlock"
+          ? invoke<AppSecurityStatus>("app_security_unlock", {
               password: suppliedPassword,
-              recovery,
-            });
+            })
+          : flow === "recover"
+            ? invoke<PortableStorageStatus>("portable_storage_recover", {
+                answers,
+                newPassword: suppliedPassword,
+              })
+            : invoke<PortableStorageStatus>("portable_storage_unlock", {
+                password: suppliedPassword,
+                recovery,
+              });
       void request
         .then((next) => {
-          if (!next.portable || !next.unlocked) {
+          if (!("portable" in next) || !next.unlocked) {
             throw new Error("便携数据尚未解锁，请重试。");
           }
-          gate.hidden = true;
-          resolve(true);
+          finishGate();
         })
         .catch((unlockError) => {
           showError(message(unlockError));

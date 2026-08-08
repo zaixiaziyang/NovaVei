@@ -67,6 +67,10 @@
               <span data-i18n="shell.settings">设置</span>
               <kbd data-shortcut-hint>Ctrl ,</kbd>
             </button>
+            <button class="settings-link" type="button" id="btnTranslation">
+              <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12.87 15.07l-2.54-2.51.03-.03A17.52 17.52 0 0 0 14.07 6H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>
+              <span>翻译</span>
+            </button>
           </div>
           <div
             class="sidebar-resizer"
@@ -157,10 +161,6 @@
                       <button class="permission-option on" type="button" data-permission="ask">
                         <strong>请求批准</strong>
                         <small>敏感操作前先询问你是否允许</small>
-                      </button>
-                      <button class="permission-option" type="button" data-permission="auto-approve">
-                        <strong>替我审批</strong>
-                        <small>按策略自动批准常见安全操作</small>
                       </button>
                       <button class="permission-option" type="button" data-permission="full">
                         <strong>完全访问权限</strong>
@@ -476,6 +476,8 @@
           <div class="settings-layout">
             <nav class="settings-nav" aria-label="设置分区" data-i18n-aria="settings.navAria">
               <button type="button" class="on" data-settings="system" data-i18n="settings.nav.system">系统</button>
+              <button type="button" data-settings="security" data-i18n="settings.nav.security">安全</button>
+              <button type="button" data-settings="permissions" data-i18n="settings.nav.permissions">权限</button>
               <button type="button" data-settings="providers" data-i18n="settings.nav.providers">供应商</button>
               <button type="button" data-settings="tools" data-i18n="settings.nav.tools">工具</button>
               <button type="button" data-settings="cron" data-i18n="settings.nav.cron">定时任务</button>
@@ -491,6 +493,7 @@
                   <button type="button" class="on" id="systemTabAppearance" data-system-tab="appearance" role="tab" aria-selected="true" aria-controls="systemPanelAppearance" tabindex="0" data-i18n="settings.system.tabAppearance">外观</button>
                   <button type="button" id="systemTabBehavior" data-system-tab="behavior" role="tab" aria-selected="false" aria-controls="systemPanelBehavior" tabindex="-1" data-i18n="settings.system.tabBehavior">行为</button>
                   <button type="button" id="systemTabPortable" data-system-tab="portable" role="tab" aria-selected="false" aria-controls="portableModeSettings" tabindex="-1" data-i18n="settings.system.tabPortable">便携</button>
+                  <button type="button" id="systemTabAppSecurity" data-system-tab="appSecurity" role="tab" aria-selected="false" aria-controls="appSecuritySettings" tabindex="-1" data-i18n="settings.system.tabSecurity">安全</button>
                 </div>
                 <div class="settings-subpanel on" id="systemPanelAppearance" data-system-panel="appearance" role="tabpanel" aria-labelledby="systemTabAppearance">
                   <div class="field field-inline">
@@ -626,7 +629,7 @@
                     </button>
                     <button class="portable-mode-choice" type="button" data-storage-mode="portable" role="radio" aria-checked="false" aria-describedby="portableModeDataIsolation">
                       <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7V4h8v3"/><path d="M7 7h10l2 3v6a2 2 0 0 1-2 2h-2v2H9v-2H7a2 2 0 0 1-2-2v-6l2-3Z"/><path d="M9 11h6M10 15h4"/></svg>
-                      <span class="portable-mode-choice-copy"><strong data-i18n="settings.portable.portableTitle">便携版</strong><small data-i18n="settings.portable.portableDescription">数据保存在 EXE 同级的 novavei 文件夹中，并在启动时受密码保护。</small></span>
+                      <span class="portable-mode-choice-copy"><strong data-i18n="settings.portable.portableTitle">便携版</strong><small data-i18n="settings.portable.portableDescription">数据保存在 EXE 同级的 novavei 文件夹中，可在系统安全设置中决定是否需要启动密码。</small></span>
                     </button>
                   </div>
                   <p class="portable-mode-notice" id="portableModeNotice" role="status"></p>
@@ -634,6 +637,122 @@
                   <div class="row-actions">
                     <button class="btn primary" id="portableModeApply" type="button" disabled data-i18n="settings.portable.apply">切换运行模式</button>
                   </div>
+                </div>
+                <div class="settings-subpanel" data-system-panel="appSecurity" id="appSecuritySettings" role="tabpanel" aria-labelledby="systemTabAppSecurity" hidden>
+                  <div class="portable-mode-summary">
+                    <div>
+                      <h3 data-i18n="settings.appSecurity.title">启动密码</h3>
+                      <p data-i18n="settings.appSecurity.description">本机版和便携版都可以独立设置下次启动是否需要密码。</p>
+                    </div>
+                    <div class="portable-mode-state" aria-live="polite" aria-atomic="true">
+                      <strong id="appSecurityState">正在读取启动密码状态…</strong>
+                      <span id="appSecurityMode"></span>
+                    </div>
+                  </div>
+                  <form class="app-security-form" id="appSecurityForm" novalidate autocomplete="off">
+                    <div class="field">
+                      <label id="appSecurityRequirementLabel" data-i18n="settings.appSecurity.requirement">启动时需要密码</label>
+                      <div class="settings-seg" role="radiogroup" aria-labelledby="appSecurityRequirementLabel">
+                        <button type="button" data-app-security-required="false" role="radio" aria-checked="true" data-i18n="settings.appSecurity.off">关闭</button>
+                        <button type="button" data-app-security-required="true" role="radio" aria-checked="false" data-i18n="settings.appSecurity.on">开启</button>
+                      </div>
+                    </div>
+                    <div class="app-security-password-grid">
+                      <label class="app-security-field" id="appSecurityCurrentPasswordField" for="appSecurityCurrentPassword" hidden>
+                        <span data-i18n="settings.appSecurity.currentPassword">当前密码</span>
+                        <input id="appSecurityCurrentPassword" type="password" autocomplete="current-password" minlength="12" maxlength="1024" />
+                      </label>
+                      <label class="app-security-field" id="appSecurityNewPasswordField" for="appSecurityNewPassword" hidden>
+                        <span data-i18n="settings.appSecurity.newPassword">新密码</span>
+                        <input id="appSecurityNewPassword" type="password" autocomplete="new-password" minlength="12" maxlength="1024" />
+                      </label>
+                      <label class="app-security-field" id="appSecurityConfirmPasswordField" for="appSecurityConfirmPassword" hidden>
+                        <span data-i18n="settings.appSecurity.confirmPassword">确认新密码</span>
+                        <input id="appSecurityConfirmPassword" type="password" autocomplete="new-password" minlength="12" maxlength="1024" />
+                      </label>
+                    </div>
+                    <div class="app-security-recovery" id="appSecurityPortableRecovery" hidden>
+                      <p data-i18n="settings.appSecurity.recoveryIntro">便携版首次开启启动密码时，需要同时设置三组安全问题，忘记密码时可用于恢复当前便携数据。</p>
+                      <div class="app-security-recovery-grid">
+                        <label class="app-security-field" for="appSecurityRecoveryQuestion1">
+                          <span data-i18n="settings.appSecurity.recoveryQuestion1">安全问题 1</span>
+                          <input id="appSecurityRecoveryQuestion1" type="text" autocomplete="off" minlength="6" maxlength="240" />
+                        </label>
+                        <label class="app-security-field" for="appSecurityRecoveryAnswer1">
+                          <span data-i18n="settings.appSecurity.recoveryAnswer1">答案 1</span>
+                          <input id="appSecurityRecoveryAnswer1" type="password" autocomplete="off" minlength="4" maxlength="1024" />
+                        </label>
+                        <label class="app-security-field" for="appSecurityRecoveryQuestion2">
+                          <span data-i18n="settings.appSecurity.recoveryQuestion2">安全问题 2</span>
+                          <input id="appSecurityRecoveryQuestion2" type="text" autocomplete="off" minlength="6" maxlength="240" />
+                        </label>
+                        <label class="app-security-field" for="appSecurityRecoveryAnswer2">
+                          <span data-i18n="settings.appSecurity.recoveryAnswer2">答案 2</span>
+                          <input id="appSecurityRecoveryAnswer2" type="password" autocomplete="off" minlength="4" maxlength="1024" />
+                        </label>
+                        <label class="app-security-field" for="appSecurityRecoveryQuestion3">
+                          <span data-i18n="settings.appSecurity.recoveryQuestion3">安全问题 3</span>
+                          <input id="appSecurityRecoveryQuestion3" type="text" autocomplete="off" minlength="6" maxlength="240" />
+                        </label>
+                        <label class="app-security-field" for="appSecurityRecoveryAnswer3">
+                          <span data-i18n="settings.appSecurity.recoveryAnswer3">答案 3</span>
+                          <input id="appSecurityRecoveryAnswer3" type="password" autocomplete="off" minlength="4" maxlength="1024" />
+                        </label>
+                      </div>
+                    </div>
+                    <p class="hint" data-i18n="settings.appSecurity.passwordHelp">密码至少 12 个字符；关闭密码不会删除对话或设置。</p>
+                    <p class="app-security-notice" id="appSecurityNotice" role="status" aria-live="polite"></p>
+                    <div class="row-actions">
+                      <button class="btn" id="appSecurityRefresh" type="button" data-i18n="settings.appSecurity.refresh">刷新状态</button>
+                      <button class="btn primary" id="appSecuritySave" type="submit" disabled data-i18n="settings.appSecurity.save">保存启动密码</button>
+                    </div>
+                  </form>
+                </div>
+              </div>
+<div class="settings-panel" data-settings="security">
+                <div class="field">
+                  <label data-i18n="settings.security.title">安全设置</label>
+                  <p class="hint" data-i18n="settings.security.hint">这些选项控制 Agent 运行时的高风险边界。原生端仍会对文件、Shell、浏览器、MCP 和权限授权做最终校验。</p>
+                </div>
+                <div class="field field-inline">
+                  <label for="requirePlanForMutableTools" data-i18n="settings.security.requirePlan">高风险操作需要执行计划</label>
+                  <input class="shortcut-hints-toggle" id="requirePlanForMutableTools" data-security-setting="requirePlanForMutableTools" type="checkbox" checked />
+                  <p class="hint" data-i18n="settings.security.requirePlanHelp">写入、删除、Shell、MCP、浏览器操作和实现子任务会先展示结构化计划；执行后仍保留逐工具权限检查。</p>
+                </div>
+                <div class="field field-inline">
+                  <label for="allowSubagentGlobalRead" data-i18n="settings.security.allowGlobalRead">允许子任务请求项目外只读</label>
+                  <input class="shortcut-hints-toggle" id="allowSubagentGlobalRead" data-security-setting="allowSubagentGlobalRead" type="checkbox" />
+                  <p class="hint" data-i18n="settings.security.allowGlobalReadHelp">关闭时，子任务即使请求 GlobalRead 也会被拦截；开启后仍需要一次性权限批准，且只能读取单个文件，不能写入。</p>
+                </div>
+                <div class="field">
+                  <label data-i18n="settings.security.boundaries">当前边界</label>
+                  <ul class="settings-safety-list">
+                    <li data-i18n="settings.security.boundaryWorkspace">工作区文件、终端和 Git 操作绑定当前会话的项目根。</li>
+                    <li data-i18n="settings.security.boundaryFull">完全访问不会保存为默认值，只能生成当前运行的一次性授权。</li>
+                    <li data-i18n="settings.security.boundarySecrets">供应商密钥和 MCP 凭据由原生设置保存，界面只看到脱敏状态。</li>
+                  </ul>
+                </div>
+              </div>
+<div class="settings-panel" data-settings="permissions">
+                <div class="field">
+                  <label data-i18n="settings.permissions.title">权限设置</label>
+                  <p class="hint" data-i18n="settings.permissions.hint">设置默认交互权限。当前项目的权限优先于新项目默认值；完全访问只在发送栏为单次运行临时启用。</p>
+                </div>
+                <div class="field">
+                  <label id="projectPermissionTierLabel" data-i18n="settings.permissions.projectDefault">当前项目默认权限</label>
+                  <div class="settings-seg settings-seg-wrap" role="radiogroup" aria-labelledby="projectPermissionTierLabel" aria-describedby="projectPermissionRoot">
+                    <button type="button" data-project-permission-tier="readonly" role="radio" aria-checked="false" data-i18n="settings.permissions.readonly">只读</button>
+                    <button type="button" class="on" data-project-permission-tier="ask" role="radio" aria-checked="true" data-i18n="settings.permissions.ask">请求批准</button>
+                  </div>
+                  <p class="hint" id="projectPermissionRoot" aria-live="polite" data-i18n="settings.permissions.projectRootLoading">正在读取当前项目…</p>
+                </div>
+                <div class="field">
+                  <label id="defaultPermissionTierLabel" data-i18n="settings.permissions.newProjectDefault">新项目默认权限</label>
+                  <div class="settings-seg settings-seg-wrap" role="radiogroup" aria-labelledby="defaultPermissionTierLabel">
+                    <button type="button" data-default-permission-tier="readonly" role="radio" aria-checked="false" data-i18n="settings.permissions.readonly">只读</button>
+                    <button type="button" class="on" data-default-permission-tier="ask" role="radio" aria-checked="true" data-i18n="settings.permissions.ask">请求批准</button>
+                  </div>
+                  <p class="hint" data-i18n="settings.permissions.newProjectHelp">当项目尚未保存自己的权限偏好时使用此默认值。</p>
                 </div>
               </div>
 <div class="settings-panel" data-settings="providers">
@@ -1040,6 +1159,38 @@
           <div class="section">
             <div class="section-head"><h4>当前共识草案</h4></div>
             <p class="dock-note" style="margin:0">尚无会议数据</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Translation overlay -->
+      <section class="overlay" id="overlayTranslation" aria-label="AI 翻译">
+        <div class="overlay-head">
+          <h2>AI 翻译</h2>
+          <div class="row-actions">
+            <button class="btn ghost" type="button" data-close-overlay>关闭</button>
+          </div>
+        </div>
+        <div class="overlay-body">
+          <div class="translation-layout">
+            <div class="translation-pane">
+              <div class="translation-pane-head">
+                <label for="translationSource">原文</label>
+                <button class="btn btn-sm" type="button" id="btnTranslationClear">清空</button>
+              </div>
+              <textarea id="translationSource" class="translation-input" placeholder="在此输入原文（支持多行）" spellcheck="false"></textarea>
+            </div>
+            <div class="translation-pane">
+              <div class="translation-pane-head">
+                <label>中文翻译</label>
+                <button class="btn btn-sm" type="button" id="btnTranslationCopy">复制结果</button>
+              </div>
+              <div class="translation-output" id="translationOutput" role="log" aria-live="polite">中文翻译结果将在此显示</div>
+            </div>
+          </div>
+          <div class="translation-bar">
+            <span class="translation-status" id="translationStatus" aria-live="polite"></span>
+            <button class="btn primary" type="button" id="btnTranslationGo">AI 翻译为中文</button>
           </div>
         </div>
       </section>

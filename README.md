@@ -1,8 +1,6 @@
 # NovaVei
 
-NovaVei 是一个以本地数据边界为优先的桌面 AI 工作台，基于 Tauri 2、Rust、TypeScript 与嵌入式 Pi runtime 构建。主界面把会话、项目、运行状态和本机工具收在一个桌面窗口里，尽量让敏感数据留在本地。
-
-`NovaVei` 是项目、产品和 GitHub 仓库的正式名称。为避免破坏既有安装与便携版数据，Rust crate、bundle identifier 和现有可执行文件的内部兼容标识暂保留 `novavei-agent`；它们不是对外产品名称。
+NovaVei 是一个以本地数据边界为优先的桌面 AI 工作台，基于 Tauri 2、Rust、TypeScript 与嵌入式 Pi runtime 构建。主界面把会话、项目、运行状态和本机工具收在一个桌面窗口里，让敏感数据留在本地。
 
 ## 主要能力
 
@@ -63,16 +61,12 @@ scripts/             打包、审计与发布检查脚本
 
 ## 隐私与提交边界
 
-本仓库不会提交依赖缓存、构建产物、便携版数据、SQLite 数据库、WebView profile、日志、`.env`、证书、密钥、令牌、用户配置、设计稿或本地测试/诊断材料。完整规则见 [`.gitignore`](./.gitignore)。
-
-请勿将 API Key、Provider header、Cookie、MCP 凭据、签名证书或用户导出的诊断/聊天数据加入提交。若意外暴露过任何真实凭据，应立即在对应服务端轮换。
-
 前端优先使用显式模块 import；`withGlobalTauri` 仅为受限迁移兼容层，不能作为新增功能的默认接入方式。
 
 ## GitHub 准备状态
 
 - GitHub Actions 使用固定 SHA 的第三方 Action，并以最小 `contents: read` 权限运行。
 - Dependabot 覆盖 npm、Cargo 与 GitHub Actions，每周分组更新。
+- 我们禁止在不说明过期原因和修复计划的情况下忽略 npm advisory（advisory ignore 过期）。
 - 许可证为 [MIT](./LICENSE)。
 - 依赖安全工作流位于 [`.github/workflows/dependency-security.yml`](./.github/workflows/dependency-security.yml)：它在每个 PR、每周计划任务和手动触发时运行；检出步骤不持久化仓库凭据。该工作流需要联网以查询 npm 与 RustSec 漏洞数据库。
-- 不允许无说明地配置 `advisory ignore`；如确需临时忽略，必须记录原因、影响范围和过期日期，并在到期前移除或重新评估。

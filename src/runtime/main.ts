@@ -1,6 +1,7 @@
 import { PiRuntimeController } from "./controller";
 import { installOverlayAccessibility } from "./accessibility";
 import { installAppDialogs } from "./app-dialogs";
+import { installAppSecuritySettings } from "./app-security";
 import { installComposerAttachments } from "./attachments";
 import { installBrowser } from "./browser";
 import { installTranscriptNavigation } from "./chat-navigation";
@@ -16,7 +17,7 @@ import {
   getComposerModelLabel,
   getComposerPermissionLabel,
 } from "./shell-chrome";
-import type { PiRuntimePublicApi } from "./types";
+import type { PiReasoningLevel, PiRuntimePublicApi } from "./types";
 import { installWorkbench } from "./workbench";
 
 // Ownership map (TypeScript entry owns runtime wiring; HTML owns visual chrome):
@@ -67,6 +68,13 @@ function installDeferredRuntimeAfterFirstPaint(
       .catch((error) =>
         console.warn("[NovaVei] deferred feature initialization failed", error),
       );
+    void import("./translation")
+      .then(({ installTranslation }) => {
+        installTranslation();
+      })
+      .catch((error) =>
+        console.warn("[NovaVei] translation initialization failed", error),
+      );
   };
   window.requestAnimationFrame(() => {
     window.setTimeout(() => void load(), 0);
@@ -87,7 +95,59 @@ function installComposerSubmitBridge(runtime: PiRuntimePublicApi) {
   if (form.dataset.novaveiPiSubmitBound === "true") return;
   form.dataset.novaveiPiSubmitBound = "true";
   const commands = installComposerCommands({ form, input });
-  let commandPreparation: Promise<unknown> | undefined;
+  const commandPreparations = new Map<string, Promise<unknown>>();
+  const reasoningLevels: readonly PiReasoningLevel[] = [
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+  ];
+  const composerSubmitContext = () => {
+    const host = window.__novaveiHost;
+    const sessionId = host?.getSessionId?.()?.trim() || undefined;
+    const cwd = host?.getWorkdir?.()?.trim() || undefined;
+    const selectedModel =
+      document.querySelector<HTMLElement>(".model-option.on") ??
+      document.querySelector<HTMLElement>(".model-option");
+    const picker = document.getElementById("modelPickerName");
+    const providerId =
+      selectedModel?.dataset.providerId || picker?.dataset.providerId;
+    const model =
+      selectedModel?.dataset.modelId ||
+      picker?.dataset.modelId ||
+      getComposerModelLabel();
+    const permissionValue = window.__novaveiPermission?.get?.();
+    const permission =
+      permissionValue === "readonly" ||
+      permissionValue === "ask" ||
+      permissionValue === "full"
+        ? permissionValue
+        : getComposerPermissionLabel();
+    const reasoningIndex = Number(
+      (document.getElementById("reasoningSlider") as HTMLInputElement | null)
+        ?.value ??
+        document.querySelector<HTMLElement>(
+          ".reasoning-step.on[data-reasoning]",
+        )?.dataset.reasoning,
+    );
+    const reasoning = Number.isFinite(reasoningIndex)
+      ? reasoningLevels[
+          Math.max(0, Math.min(reasoningLevels.length - 1, reasoningIndex))
+        ]
+      : undefined;
+    return {
+      sessionId,
+      cwd,
+      providerId,
+      model,
+      permission,
+      reasoning,
+      key: sessionId ? `session:${sessionId}` : cwd ? `cwd:${cwd}` : "preview",
+    };
+  };
 
   form.addEventListener(
     "submit",
@@ -149,32 +209,49 @@ function installComposerSubmitBridge(runtime: PiRuntimePublicApi) {
         toast("先输入内容或添加附件");
         return;
       }
-      if (commandPreparation) return;
-      const preparation = commands
-        .prepare(text || "请分析所附文件。")
-        .then((command) => {
-          if (!command) return undefined;
-          if ("handled" in command) {
+      const submitContext = composerSubmitContext();
+      if (commandPreparations.has(submitContext.key)) {
+        toast("上一条消息仍在准备，请稍候");
+        return;
+      }
+      const preparation = commands.prepare(text || "请分析所附文件。");
+      commandPreparations.set(submitContext.key, preparation);
+      void (async () => {
+        let command: Awaited<ReturnType<typeof commands.prepare>>;
+        try {
+          command = await preparation;
+        } catch (error) {
+          toast(error instanceof Error ? error.message : String(error));
+          return;
+        } finally {
+          if (commandPreparations.get(submitContext.key) === preparation)
+            commandPreparations.delete(submitContext.key);
+        }
+        if (!command) return;
+        if ("handled" in command) {
+          if (input.value.trim() === text) {
             input.value = "";
             // Keep the slash-menu projection and its ARIA state in sync after
             // a local-only command completes without starting a Pi turn.
             input.dispatchEvent(new Event("input", { bubbles: true }));
-            toast(command.message);
-            return undefined;
           }
-          return runtime.submit({
+          toast(command.message);
+          return;
+        }
+        void runtime
+          .submit({
             ...command,
-            permission: getComposerPermissionLabel(),
-            model: getComposerModelLabel(),
-          });
-        })
-        .catch((error) =>
-          toast(error instanceof Error ? error.message : String(error)),
-        );
-      commandPreparation = preparation;
-      void preparation.finally(() => {
-        if (commandPreparation === preparation) commandPreparation = undefined;
-      });
+            sessionId: submitContext.sessionId,
+            cwd: submitContext.cwd,
+            providerId: submitContext.providerId,
+            model: submitContext.model,
+            permission: submitContext.permission,
+            reasoning: submitContext.reasoning,
+          })
+          .catch((error) =>
+            toast(error instanceof Error ? error.message : String(error)),
+          );
+      })();
     },
     true,
   );
@@ -215,6 +292,7 @@ async function install() {
   // surface that cannot import modules directly.
   installAppDialogs();
   installStorageModeSettings();
+  installAppSecuritySettings();
   // The permission picker owns its own popover interactions; Full
   // confirmation itself is deliberately performed by the native host
   // immediately before run.

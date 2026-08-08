@@ -14,10 +14,12 @@
     "dev:web": "vite --config vite.config.ts",
     "typecheck": "tsc --noEmit",
     "build:web": "vite build --config vite.config.ts",
+    "test:frontend": "vitest run --root . src/runtime",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib --no-default-features",
     "lint": "biome lint src scripts vite.config.ts package.json tsconfig.json --error-on-warnings",
     "format:check": "biome check --formatter-enabled=true --linter-enabled=false --assist-enabled=false src scripts vite.config.ts package.json tsconfig.json",
     "format": "biome format --write src scripts vite.config.ts package.json tsconfig.json",
-    "verify": "npm run typecheck && npm run lint && npm run audit:ipc-capabilities && npm run test:ci-supply-chain && npm run format:check && npm run build",
+    "verify": "npm run typecheck && npm run lint && npm run test:frontend && npm run test:rust && npm run audit:ipc-capabilities && npm run test:ci-supply-chain && npm run format:check && npm run build",
     "checklist:release-smoke": "node scripts/release-smoke-checklist.mjs",
     "audit:ipc-capabilities": "node scripts/ipc-capability-audit.mjs",
     "test:ci-supply-chain": "node scripts/ci-supply-chain-audit.mjs",
@@ -36,8 +38,8 @@
     "vitest": "4.1.10"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "0.83.0",
-    "@earendil-works/pi-ai": "0.83.0",
+    "@earendil-works/pi-agent-core": "0.84.1",
+    "@earendil-works/pi-ai": "0.84.1",
     "typebox": "1.3.8"
   }
 }

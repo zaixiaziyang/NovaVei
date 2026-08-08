@@ -8,7 +8,7 @@
 
 import type { FullPermissionGrantRequest } from "./types";
 
-type PermissionKey = "readonly" | "ask" | "auto-approve" | "full";
+type PermissionKey = "readonly" | "ask" | "full";
 
 type FullPermissionRunGrant = {
   grantToken?: unknown;
@@ -28,7 +28,6 @@ const PERMISSION_COPY: Record<PermissionKey, { label: string; toast: string }> =
   {
     readonly: { label: "只读", toast: "权限：只读" },
     ask: { label: "请求批准", toast: "权限：请求批准" },
-    "auto-approve": { label: "替我审批", toast: "权限：替我审批" },
     full: {
       label: "完全访问权限",
       toast: "权限：完全访问（仅当前运行）",
@@ -56,12 +55,11 @@ function getInvoke(): Invoke | undefined {
 
 function normalizePermissionKey(value: unknown): PermissionKey {
   if (value === "readonly" || value === "read_only") return "readonly";
-  if (value === "auto-approve" || value === "auto") return "auto-approve";
   if (value === "full") return "full";
   return "ask";
 }
 
-/** Only the three non-Full tiers are valid durable project preferences. */
+/** Only the two non-Full tiers are valid durable project preferences. */
 function projectPermissionKey(
   value: unknown,
 ): Exclude<PermissionKey, "full"> | undefined {
@@ -70,8 +68,6 @@ function projectPermissionKey(
   if (normalized === "readonly" || normalized === "read_only")
     return "readonly";
   if (normalized === "ask") return "ask";
-  if (normalized === "auto-approve" || normalized === "auto")
-    return "auto-approve";
   return undefined;
 }
 
@@ -196,8 +192,8 @@ export function installPermissionPicker() {
     }
     if (alwaysScope) {
       alwaysScope.textContent = isEnglish()
-        ? "Read-only, Ask, and Auto approve are saved for this project. Full access applies only to the current run."
-        : "只读、请求批准和替我审批会分别保存到当前项目；完全访问仅作用于当前运行。";
+        ? "Read-only and Ask are saved for this project. Full access applies only to the current run."
+        : "只读和请求批准会分别保存到当前项目；完全访问仅作用于当前运行。";
     }
     const fullOption = document.querySelector<HTMLButtonElement>(
       '.permission-option[data-permission="full"]',
@@ -419,6 +415,10 @@ export function installPermissionPicker() {
           option.dataset.permission,
         );
         const root = currentPermissionRoot();
+        if (nextPermission === permissionForCurrentRoot(root)) {
+          closePermissionPopover(true);
+          return;
+        }
         if (nextPermission === "full") {
           if (!root) {
             toast(
